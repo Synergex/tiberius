@@ -14,10 +14,10 @@ use enumflags2::{bitflags, BitFlags};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use tracing::{event, Level};
 
-use crate::client::rpc_response::{collect_rpc_outputs, OutputValue};
+use crate::client::rpc_response::{collect_metadata_only_rpc, collect_rpc_outputs, OutputValue};
 use crate::tds::codec::{ColumnData, RpcParam, RpcProcId, RpcStatus};
 use crate::tds::stream::{QueryStream, TokenStream};
-use crate::{Client, PreparedHandle, ToSql};
+use crate::{Client, Column, PreparedHandle, ToSql};
 
 /// Scroll options for `sp_cursoropen` (TDS §2.2.6.7).
 ///
@@ -272,6 +272,25 @@ impl PreparedCursor {
         cursor.fetch(client, fetch).await
     }
 
+    /// Fetch only result-set metadata for this cursor without consuming rows.
+    ///
+    /// This probes the server with `sp_cursorfetch @fetchtype = Next`,
+    /// `@rownum = 0`, and `@nrows = 0`, then drains the RPC response while
+    /// treating any returned row token as a protocol error.
+    pub async fn fetch_metadata<S>(&self, client: &mut Client<S>) -> crate::Result<Vec<Column>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let cursor = self.cursor.as_ref().ok_or_else(|| {
+            crate::Error::Protocol("prepared cursor: cursor is already closed".into())
+        })?;
+
+        client.connection.flush_stream().await?;
+        let rpc_params = build_cursorfetch_params(cursor.handle, Fetch::Next { count: 0 });
+        client.send_rpc(RpcProcId::CursorFetch, rpc_params).await?;
+        collect_metadata_only_rpc(&mut client.connection).await
+    }
+
     /// Close the cursor if it is still open.
     ///
     /// This is idempotent at the wrapper level.
@@ -378,31 +397,8 @@ impl Cursor {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let (fetch_bits, row_num, count) = fetch.encode();
-
         client.connection.flush_stream().await?;
-        let rpc_params = vec![
-            RpcParam {
-                name: Cow::Borrowed(""),
-                flags: BitFlags::empty(),
-                value: ColumnData::I32(Some(self.handle.as_i32())),
-            },
-            RpcParam {
-                name: Cow::Borrowed(""),
-                flags: BitFlags::empty(),
-                value: ColumnData::I32(Some(fetch_bits)),
-            },
-            RpcParam {
-                name: Cow::Borrowed(""),
-                flags: BitFlags::empty(),
-                value: ColumnData::I32(Some(row_num)),
-            },
-            RpcParam {
-                name: Cow::Borrowed(""),
-                flags: BitFlags::empty(),
-                value: ColumnData::I32(Some(count)),
-            },
-        ];
+        let rpc_params = build_cursorfetch_params(self.handle, fetch);
         client.send_rpc(RpcProcId::CursorFetch, rpc_params).await?;
 
         let ts = TokenStream::new(&mut client.connection);
@@ -435,6 +431,36 @@ impl Cursor {
         collect_rpc_outputs(&mut client.connection).await?;
         Ok(())
     }
+}
+
+pub(crate) fn build_cursorfetch_params(
+    handle: CursorHandle,
+    fetch: Fetch,
+) -> Vec<RpcParam<'static>> {
+    let (fetch_bits, row_num, count) = fetch.encode();
+
+    vec![
+        RpcParam {
+            name: Cow::Borrowed(""),
+            flags: BitFlags::empty(),
+            value: ColumnData::I32(Some(handle.as_i32())),
+        },
+        RpcParam {
+            name: Cow::Borrowed(""),
+            flags: BitFlags::empty(),
+            value: ColumnData::I32(Some(fetch_bits)),
+        },
+        RpcParam {
+            name: Cow::Borrowed(""),
+            flags: BitFlags::empty(),
+            value: ColumnData::I32(Some(row_num)),
+        },
+        RpcParam {
+            name: Cow::Borrowed(""),
+            flags: BitFlags::empty(),
+            value: ColumnData::I32(Some(count)),
+        },
+    ]
 }
 
 impl Drop for Cursor {
@@ -705,6 +731,20 @@ mod tests {
     #[test]
     fn fetch_encodes_refresh_ignores_row_num() {
         assert_eq!(Fetch::Refresh { count: 1 }.encode(), (0x0080, 0, 1));
+    }
+
+    #[test]
+    fn cursorfetch_params_encode_metadata_probe() {
+        let params = build_cursorfetch_params(CursorHandle(1234), Fetch::Next { count: 0 });
+        let values: Vec<_> = params
+            .iter()
+            .map(|p| match &p.value {
+                ColumnData::I32(Some(v)) => *v,
+                other => panic!("expected i32 cursorfetch param, got {:?}", other),
+            })
+            .collect();
+
+        assert_eq!(values, vec![1234, 0x0002, 0, 0]);
     }
 
     #[test]

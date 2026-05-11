@@ -30,7 +30,7 @@ use tiberius::server::{
 };
 use tiberius::{
     BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions, EncryptionLevel,
-    FixedLenType, MetaDataColumn, RpcProcId, TokenDone, TypeInfo,
+    FixedLenType, MetaDataColumn, RpcProcId, TokenColMetaData, TokenDone, TypeInfo,
 };
 
 // =============================================================================
@@ -139,6 +139,7 @@ struct SharedState {
     /// observed. Tests assert on this to prove the client's wire encoding
     /// of (fetch_type, row_num, n_rows) actually reaches the server.
     cursor_fetch_log: Mutex<Vec<(i32, i32, i32)>>,
+    cursorprepexec_param_defs_log: Mutex<Vec<String>>,
     rpc_log: Mutex<Vec<RpcProcId>>,
 }
 
@@ -149,6 +150,7 @@ impl SharedState {
             cursors: Mutex::new(CursorCache::new(1)),
             cursor_rows: Mutex::new(HashMap::new()),
             cursor_fetch_log: Mutex::new(Vec::new()),
+            cursorprepexec_param_defs_log: Mutex::new(Vec::new()),
             rpc_log: Mutex::new(Vec::new()),
         }
     }
@@ -494,11 +496,30 @@ impl SpCursorFetchHandler for TestCursorFetch {
                 store.get(&request.handle).cloned().unwrap_or_default()
             };
 
-            write_int_result_set(client, &rows, FinalDone::InProc).await?;
+            if request.n_rows == 0 {
+                client
+                    .send(TdsBackendMessage::TokenPartial(BackendToken::ColMetaData(
+                        TokenColMetaData {
+                            columns: vec![int_int_column()],
+                        },
+                    )))
+                    .await?;
+                client
+                    .send(TdsBackendMessage::TokenPartial(BackendToken::DoneInProc(
+                        TokenDone::with_rows(0),
+                    )))
+                    .await?;
+            } else {
+                write_int_result_set(client, &rows, FinalDone::InProc).await?;
+            }
             send_return_status(client, 0).await?;
             client
                 .send(TdsBackendMessage::Token(BackendToken::DoneProc(
-                    TokenDone::with_rows(rows.len() as u64),
+                    TokenDone::with_rows(if request.n_rows == 0 {
+                        0
+                    } else {
+                        rows.len() as u64
+                    }),
                 )))
                 .await?;
             Ok(())
@@ -598,6 +619,16 @@ impl RpcHandler for SpecialRpc {
                     assert!(all[4].is_output());
                     assert!(all[5].is_output());
                     assert!(all[6].is_output());
+                    match &all[2].value {
+                        ColumnData::String(Some(s)) => {
+                            self.0
+                                .cursorprepexec_param_defs_log
+                                .lock()
+                                .unwrap()
+                                .push(s.to_string());
+                        }
+                        other => panic!("sp_cursorprepexec @params was not a string: {:?}", other),
+                    }
 
                     let sql = match &all[3].value {
                         ColumnData::String(Some(s)) => s.to_string(),
@@ -1038,6 +1069,56 @@ fn cursor_prep_exec_fetch_close_unprepare() {
             assert_eq!(seen_fetches, vec![(0x0002, 0, 142)]);
 
             cursor.close_cursor(&mut client).await.unwrap();
+            cursor.close_cursor(&mut client).await.unwrap();
+            cursor.unprepare(&mut client).await.unwrap();
+
+            let seen_rpcs = state.rpc_log.lock().unwrap().clone();
+            assert_eq!(
+                seen_rpcs,
+                vec![
+                    RpcProcId::CursorPrepExec,
+                    RpcProcId::CursorFetch,
+                    RpcProcId::CursorClose,
+                    RpcProcId::CursorUnprepare,
+                ]
+            );
+        })
+        .await;
+    });
+}
+
+#[test]
+fn cursor_prep_exec_fetch_metadata_close_unprepare() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let mut cursor = client
+                .cursor_prep_exec(
+                    "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
+                    CursorOpenOptions::default(),
+                    "",
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            let columns = cursor.fetch_metadata(&mut client).await.unwrap();
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns[0].name(), "v");
+            assert_eq!(columns[0].ordinal(), Some(0));
+            assert_eq!(
+                columns[0].type_info(),
+                Some(&TypeInfo::FixedLen(FixedLenType::Int4))
+            );
+            assert!(columns[0].flags().contains(ColumnFlag::Nullable));
+
+            let seen_fetches = state.cursor_fetch_log.lock().unwrap().clone();
+            assert_eq!(seen_fetches, vec![(0x0002, 0, 0)]);
+
+            let param_defs = state.cursorprepexec_param_defs_log.lock().unwrap().clone();
+            assert_eq!(param_defs, vec!["".to_string()]);
+
             cursor.close_cursor(&mut client).await.unwrap();
             cursor.unprepare(&mut client).await.unwrap();
 

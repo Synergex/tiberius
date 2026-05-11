@@ -7,11 +7,16 @@
 //! every new helper.
 
 use crate::client::Connection;
-use crate::tds::codec::{ColumnData, DoneStatus, TokenReturnValue};
+use crate::tds::codec::{
+    ColumnData, DoneStatus, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
+    TokenEnvChange, TokenError, TokenInfo, TokenOrder, TokenReturnValue, TokenSessionState,
+    TokenTabName,
+};
 use crate::tds::stream::{ReceivedToken, TokenStream};
-use crate::FromSql;
+use crate::{Column, FromSql, SqlReadBytes, TokenType};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::{Stream, TryStreamExt};
+use std::convert::TryFrom;
 
 /// A single `RETURNVALUE` token surfaced to the client.
 ///
@@ -144,6 +149,98 @@ where
     }
 
     Ok((outputs, status))
+}
+
+/// Drain a metadata-only cursor-fetch RPC response without constructing a
+/// [`TokenStream`]. `TokenStream` eagerly decodes ROW/NBCROW tokens; metadata
+/// probing deliberately avoids that path because `sp_cursorfetch` with
+/// `nrows = 0` should not contain row payloads.
+pub(crate) async fn collect_metadata_only_rpc<S>(
+    conn: &mut Connection<S>,
+) -> crate::Result<Vec<Column>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let mut columns = None;
+    let mut last_error = None;
+
+    loop {
+        let ty_byte = conn.read_u8().await?;
+        let ty = TokenType::try_from(ty_byte).map_err(|_| {
+            crate::Error::Protocol(format!("invalid token type {:x}", ty_byte).into())
+        })?;
+
+        match ty {
+            TokenType::ColMetaData => {
+                let metadata = TokenColMetaData::decode(conn).await?;
+                columns = Some(metadata.columns().collect());
+            }
+            TokenType::ReturnStatus => {
+                let _ = conn.read_u32_le().await?;
+            }
+            TokenType::ReturnValue => {
+                let _ = TokenReturnValue::decode(conn).await?;
+            }
+            TokenType::DoneInProc => {
+                let _ = TokenDone::decode(conn).await?;
+            }
+            TokenType::DoneProc | TokenType::Done => {
+                let done = TokenDone::decode(conn).await?;
+                if !done.status().contains(DoneStatus::More) {
+                    break;
+                }
+            }
+            TokenType::Error => {
+                let err = TokenError::decode(conn).await?;
+                if last_error.is_none() {
+                    last_error = Some(crate::Error::Server(err));
+                }
+            }
+            TokenType::Info => {
+                let _ = TokenInfo::decode(conn).await?;
+            }
+            TokenType::Order => {
+                let _ = TokenOrder::decode(conn).await?;
+            }
+            TokenType::ColName => {
+                let _ = TokenColName::decode(conn).await?;
+            }
+            TokenType::ColInfo => {
+                let _ = TokenColInfo::decode(conn).await?;
+            }
+            TokenType::TabName => {
+                let _ = TokenTabName::decode(conn).await?;
+            }
+            TokenType::EnvChange => {
+                let _ = TokenEnvChange::decode(conn).await?;
+            }
+            TokenType::SessionState => {
+                let _ = TokenSessionState::decode(conn).await?;
+            }
+            TokenType::Row | TokenType::NbcRow => {
+                return Err(crate::Error::Protocol(
+                    "metadata-only cursor fetch returned row data".into(),
+                ));
+            }
+            other => {
+                return Err(crate::Error::Protocol(
+                    format!(
+                        "metadata-only cursor fetch returned unexpected token {:?}",
+                        other
+                    )
+                    .into(),
+                ));
+            }
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(err);
+    }
+
+    columns.ok_or_else(|| {
+        crate::Error::Protocol("metadata-only cursor fetch returned no COLMETADATA".into())
+    })
 }
 
 #[cfg(test)]
