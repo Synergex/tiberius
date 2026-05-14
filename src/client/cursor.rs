@@ -276,7 +276,7 @@ impl PreparedCursor {
     /// Fetch only result-set metadata for this cursor without consuming rows.
     ///
     /// This probes the server with the legacy-compatible
-    /// `sp_cursorfetch @fetchtype = Next`, `@rownum = 0`, and `@nrows = 1424`
+    /// `sp_cursorfetch @fetchtype = Next`, `@rownum = 0`, and `@nrows = 0`
     /// shape, captures the first non-empty `COLMETADATA`, then cleans the
     /// response without exposing fetched rows.
     pub async fn fetch_metadata<S>(&self, client: &mut Client<S>) -> crate::Result<Vec<Column>>
@@ -292,7 +292,7 @@ impl PreparedCursor {
         }
 
         client.connection.flush_stream().await?;
-        let rpc_params = build_cursorfetch_params(cursor.handle, Fetch::Next { count: 1424 });
+        let rpc_params = build_cursorfetch_params(cursor.handle, Fetch::Next { count: 0 });
         client.send_rpc(RpcProcId::CursorFetch, rpc_params).await?;
         collect_metadata_only_rpc(&mut client.connection).await
     }
