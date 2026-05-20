@@ -19,7 +19,7 @@ use crate::tds::codec::{ColumnData, RpcParam, RpcProcId, RpcStatus};
 use crate::tds::stream::{QueryStream, TokenStream};
 use crate::{Client, Column, PreparedHandle, ToSql};
 
-/// Scroll options for `sp_cursoropen` (TDS §2.2.6.7).
+/// Scroll options for `sp_cursoropen` / `sp_cursorprepexec` (TDS §2.2.6.7).
 ///
 /// These are bitflags — values may be `OR`'d together (e.g. `Fast |
 /// ForwardOnly`). Use [`BitFlags`] from `enumflags2` to combine them.
@@ -37,6 +37,8 @@ pub enum CursorScrollOptions {
     Static = 0x0008,
     /// Keyset cursor with parameterized open.
     Fast = 0x0010,
+    /// Statement has bound parameters.
+    ParameterizedStmt = 0x1000,
     /// Server-pregenerated parameterized auto-open.
     AutoFetch = 0x2000,
     /// Client caches results (advisory — negotiated).
@@ -762,11 +764,11 @@ mod tests {
     #[test]
     fn open_options_combine_scroll_flags() {
         let opts = CursorOpenOptions::new(
-            CursorScrollOptions::Fast | CursorScrollOptions::ForwardOnly,
+            CursorScrollOptions::ParameterizedStmt | CursorScrollOptions::ForwardOnly,
             CursorConcurrencyOptions::ReadOnly,
         );
         let bits = opts.scroll().bits();
-        assert!(bits & (CursorScrollOptions::Fast as u32) != 0);
+        assert!(bits & (CursorScrollOptions::ParameterizedStmt as u32) != 0);
         assert!(bits & (CursorScrollOptions::ForwardOnly as u32) != 0);
     }
 
@@ -822,6 +824,27 @@ mod tests {
         assert!(params[5].flags.contains(RpcStatus::ByRefValue));
         assert!(params[6].flags.contains(RpcStatus::ByRefValue));
         assert_eq!(params[7].name, "@P1");
+    }
+
+    #[test]
+    fn cursorprepexec_params_encode_parameterized_stmt_scroll_option() {
+        let p1: &dyn ToSql = &42i32;
+        let params = build_cursorprepexec_params(
+            Cow::Borrowed("SELECT @P1"),
+            CursorOpenOptions::new(
+                CursorScrollOptions::ParameterizedStmt | CursorScrollOptions::ForwardOnly,
+                CursorConcurrencyOptions::ReadOnly,
+            ),
+            Cow::Borrowed("@P1 int"),
+            &[p1],
+        );
+
+        assert!(matches!(
+            params[4].value,
+            ColumnData::I32(Some(v))
+                if v == (CursorScrollOptions::ParameterizedStmt as i32
+                    | CursorScrollOptions::ForwardOnly as i32)
+        ));
     }
 
     #[test]

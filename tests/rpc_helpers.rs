@@ -29,8 +29,9 @@ use tiberius::server::{
     TdsAuthHandler, TdsBackendMessage, TdsClient, TdsServerHandlers,
 };
 use tiberius::{
-    BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions, EncryptionLevel,
-    FixedLenType, MetaDataColumn, RpcProcId, TokenColMetaData, TokenDone, TypeInfo,
+    BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions,
+    CursorScrollOptions, EncryptionLevel, FixedLenType, MetaDataColumn, RpcProcId,
+    TokenColMetaData, TokenDone, TypeInfo,
 };
 
 // =============================================================================
@@ -1050,7 +1051,10 @@ fn cursor_prep_exec_fetch_close_unprepare() {
             let mut cursor = client
                 .cursor_prep_exec(
                     "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
-                    CursorOpenOptions::default(),
+                    CursorOpenOptions::new(
+                        CursorScrollOptions::ParameterizedStmt | CursorScrollOptions::ForwardOnly,
+                        tiberius::CursorConcurrencyOptions::ReadOnly,
+                    ),
                     "",
                     &[],
                 )
@@ -1059,6 +1063,9 @@ fn cursor_prep_exec_fetch_close_unprepare() {
             assert_ne!(cursor.prepared_handle().as_i32(), 0);
             assert_ne!(cursor.cursor_handle().as_i32(), 0);
             assert_eq!(cursor.row_count(), 3);
+            assert!(cursor
+                .scroll_options()
+                .contains(CursorScrollOptions::ParameterizedStmt));
 
             let mut stream = cursor
                 .fetch(&mut client, tiberius::Fetch::Next { count: 142 })
