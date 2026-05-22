@@ -93,13 +93,13 @@
 //! - `server-rustls`: Enables rustls-based TLS
 //! - `integrated-auth-gssapi`: Enables GSSAPI/Kerberos authentication (Unix only)
 
-pub mod backend;
 pub mod auth;
+pub mod backend;
 pub mod builder;
 pub mod codec;
 pub mod connection;
-pub mod handler;
 mod handle_macro;
+pub mod handler;
 pub mod messages;
 pub mod prepared;
 pub mod query;
@@ -113,14 +113,15 @@ pub mod sp_prepexec;
 pub mod state;
 pub mod tls;
 
-pub use backend::{NetBackend, NetListener, NetStream, NetStreamExt};
-pub use builder::{BuiltTdsServer, NotSet, Set, TdsServerBuilder};
+#[cfg(all(unix, feature = "integrated-auth-gssapi"))]
+pub use auth::gssapi::GssapiAcceptor;
 pub use auth::{
     AuthBuilder, AuthError, AuthResult, AuthSuccess, DefaultEnvChangeProvider, EnvChangeProvider,
     FedAuthValidator, LoginInfo, SqlAuthSource, SspiAcceptor, SspiSession, SspiStart, SspiStep,
-    TdsAuthHandler,
-    METADATA_APPLICATION, METADATA_DATABASE, METADATA_SERVER, METADATA_USER,
+    TdsAuthHandler, METADATA_APPLICATION, METADATA_DATABASE, METADATA_SERVER, METADATA_USER,
 };
+pub use backend::{NetBackend, NetListener, NetStream, NetStreamExt};
+pub use builder::{BuiltTdsServer, NotSet, Set, TdsServerBuilder};
 pub use codec::{decode_rpc_params, DecodedRpcParam, RpcParamSet, TdsCodec};
 pub use connection::TdsConnection;
 pub use handler::{
@@ -133,11 +134,19 @@ pub use messages::{
     TdsFrontendMessage, TransactionDescriptor,
 };
 pub use prepared::{PreparedHandle, PreparedStatement, ProcedureCache, ProcedureCacheConfig};
+pub use query::{QueryColumn, QueryColumnType, QueryHandler, QueryOutput, SimpleQueryAdapter};
 pub use response::{
     finish_proc, finish_proc_more, infer_type_info, send_output_param, send_output_params,
     send_return_status, OutputParameter, ResultSetWriter,
 };
+pub use router::{RejectUnknownProc, SystemProcRouter, SystemProcRouterBuilder};
 pub use server::process_connection;
+pub use sp_cursor::{
+    parse_cursor_close, parse_cursor_fetch, parse_cursor_open, CursorCache, CursorCacheConfig,
+    CursorEntry, CursorHandle, ParsedCursorClose, ParsedCursorFetch, ParsedCursorOpen,
+    SpCursorCloseHandler, SpCursorCloseRpcHandler, SpCursorFetchHandler, SpCursorFetchRpcHandler,
+    SpCursorOpenHandler, SpCursorOpenRpcHandler,
+};
 pub use sp_executesql::{
     parse_executesql, ExecuteSqlParam, ParsedExecuteSql, SpExecuteSqlHandler,
     SpExecuteSqlRpcHandler,
@@ -147,20 +156,8 @@ pub use sp_prepare::{
     PreparedStatementRpcHandler, SpExecuteHandler, SpExecuteRpcHandler, SpPrepareHandler,
     SpPrepareRpcHandler, SpUnprepareHandler, SpUnprepareRpcHandler,
 };
-pub use sp_prepexec::{
-    parse_prepexec, ParsedPrepExec, SpPrepExecHandler, SpPrepExecRpcHandler,
-};
-pub use sp_cursor::{
-    parse_cursor_close, parse_cursor_fetch, parse_cursor_open, CursorCache, CursorCacheConfig,
-    CursorEntry, CursorHandle, ParsedCursorClose, ParsedCursorFetch, ParsedCursorOpen,
-    SpCursorCloseHandler, SpCursorCloseRpcHandler, SpCursorFetchHandler, SpCursorFetchRpcHandler,
-    SpCursorOpenHandler, SpCursorOpenRpcHandler,
-};
-pub use query::{QueryColumn, QueryColumnType, QueryHandler, QueryOutput, SimpleQueryAdapter};
-pub use router::{RejectUnknownProc, SystemProcRouter, SystemProcRouterBuilder};
+pub use sp_prepexec::{parse_prepexec, ParsedPrepExec, SpPrepExecHandler, SpPrepExecRpcHandler};
 pub use state::TdsConnectionState;
-pub use tls::{NoTls, TlsAccept, TlsStream};
 #[cfg(feature = "server-rustls")]
 pub use tls::RustlsAcceptor;
-#[cfg(all(unix, feature = "integrated-auth-gssapi"))]
-pub use auth::gssapi::GssapiAcceptor;
+pub use tls::{NoTls, TlsAccept, TlsStream};

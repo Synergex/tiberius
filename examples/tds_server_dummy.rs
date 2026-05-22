@@ -27,10 +27,10 @@ mod server {
     use tiberius::server::codec::{decode_rpc_params, DecodedRpcParam};
     use tiberius::server::{
         process_connection, AttentionHandler, AuthBuilder, AuthError, AuthHandler, AuthSuccess,
-        BulkLoadHandler, DefaultEnvChangeProvider, EnvChangeProvider, ErrorHandler, FedAuthValidator,
-        LoginInfo, ResultSetWriter, RpcHandler, SqlAuthSource, SqlBatchHandler, SspiAcceptor,
-        SspiStart, SspiStep, TdsAuthHandler, TdsBackendMessage, TdsConnectionContext, TdsConnectionState,
-        TdsServerHandlers,
+        BulkLoadHandler, DefaultEnvChangeProvider, EnvChangeProvider, ErrorHandler,
+        FedAuthValidator, LoginInfo, ResultSetWriter, RpcHandler, SqlAuthSource, SqlBatchHandler,
+        SspiAcceptor, SspiStart, SspiStep, TdsAuthHandler, TdsBackendMessage, TdsConnectionContext,
+        TdsConnectionState, TdsServerHandlers,
     };
     use tiberius::{
         numeric::Numeric,
@@ -39,10 +39,10 @@ mod server {
         AltMetaDataColumn, BaseMetaDataColumn, Collation, ColumnData, ColumnFlag, DoneStatus,
         FedAuthInfoOption, FixedLenType, LoginMessage, MetaDataColumn, PreloginMessage, RpcStatus,
         SessionStateEntry, SsVariantInfo, TokenAltMetaData, TokenAltRow, TokenColInfo,
-        TokenColMetaData, TokenColName, TokenDone, TokenEnvChange, TokenError, TokenFedAuthInfo,
-        TokenFeatureExtAck, TokenInfo, TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
-        TokenSessionState, TokenTabName, TvpColumn, TvpData, TvpInfo, TypeInfo, UdtInfo,
-        VariantData, Uuid, VarLenContext, VarLenType,
+        TokenColMetaData, TokenColName, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck,
+        TokenFedAuthInfo, TokenInfo, TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
+        TokenSessionState, TokenTabName, TvpColumn, TvpData, TvpInfo, TypeInfo, UdtInfo, Uuid,
+        VarLenContext, VarLenType, VariantData,
     };
     use tiberius::{EncryptionLevel, Result};
 
@@ -220,8 +220,7 @@ mod server {
         collation: Option<Collation>,
         flags: enumflags2::BitFlags<ColumnFlag>,
     ) -> MetaDataColumn<'static> {
-        let table_name = if matches!(ty, VarLenType::Text | VarLenType::NText | VarLenType::Image)
-        {
+        let table_name = if matches!(ty, VarLenType::Text | VarLenType::NText | VarLenType::Image) {
             Some(vec!["dummy_table".into()])
         } else {
             None
@@ -501,7 +500,9 @@ mod server {
         fn feature_ext_ack(&self, login: &LoginMessage<'_>) -> Option<TokenFeatureExtAck> {
             if self.force_feature_ack && !login.has_feature_ext() {
                 log_event("login: sending FeatureExtAck (forced)");
-                return Some(TokenFeatureExtAck { features: Vec::new() });
+                return Some(TokenFeatureExtAck {
+                    features: Vec::new(),
+                });
             }
 
             let ack = self.inner.feature_ext_ack(login);
@@ -521,7 +522,8 @@ mod server {
         {
             let force_fedauth =
                 std::env::var("TDS_DUMMY_FORCE_FEDAUTH").ok().as_deref() == Some("1");
-            let wants_fedauth = login.fed_auth_token().is_some() || login.fed_auth_nonce().is_some();
+            let wants_fedauth =
+                login.fed_auth_token().is_some() || login.fed_auth_nonce().is_some();
 
             if !force_fedauth && !wants_fedauth {
                 return None;
@@ -693,7 +695,11 @@ mod server {
         {
             Box::pin(async move {
                 let db_name = message.db_name_ref();
-                let db_name = if db_name.is_empty() { "master" } else { db_name };
+                let db_name = if db_name.is_empty() {
+                    "master"
+                } else {
+                    db_name
+                };
 
                 log_event(&format!(
                     "login from={} user={} app={} db={} tds_version={:?} packet_size={}",
@@ -765,19 +771,12 @@ mod server {
 
                 if lower.contains("tds_info") {
                     log_event("sql_batch: tds_info");
-                    let info = TokenInfo::new(
-                        5701,
-                        0,
-                        0,
-                        "dummy info token",
-                        "tiberius",
-                        "tds_dummy",
-                        1,
-                    );
+                    let info =
+                        TokenInfo::new(5701, 0, 0, "dummy info token", "tiberius", "tds_dummy", 1);
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Info(
-                            info,
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Info(info),
+                        ))
                         .await?;
                 }
 
@@ -805,9 +804,10 @@ mod server {
                     ];
                     let mut writer = ResultSetWriter::start(client, columns).await?;
                     writer
-                        .send_row_iter([ColumnData::I32(Some(100)), ColumnData::String(Some(
-                            "gamma".into(),
-                        ))])
+                        .send_row_iter([
+                            ColumnData::I32(Some(100)),
+                            ColumnData::String(Some("gamma".into())),
+                        ])
                         .await?;
                     writer.finish(1).await?;
                     return Ok(());
@@ -891,12 +891,7 @@ mod server {
                             16,
                             None,
                         ));
-                        columns.push(meta_var(
-                            "binary_legacy_col",
-                            VarLenType::Binary,
-                            16,
-                            None,
-                        ));
+                        columns.push(meta_var("binary_legacy_col", VarLenType::Binary, 16, None));
 
                         let num1 = Numeric::new_with_scale(1234, 1);
                         let dec1 = Numeric::new_with_scale(5678, 2);
@@ -1064,7 +1059,12 @@ mod server {
                         meta_var("char_big_col", VarLenType::BigChar, 20, collation),
                     ];
                     if include_legacy {
-                        columns.push(meta_var("varchar_short_col", VarLenType::VarChar, 50, collation));
+                        columns.push(meta_var(
+                            "varchar_short_col",
+                            VarLenType::VarChar,
+                            50,
+                            collation,
+                        ));
                         columns.push(meta_var("char_short_col", VarLenType::Char, 20, collation));
                     }
                     let mut writer = ResultSetWriter::start(client, columns).await?;
@@ -1167,9 +1167,7 @@ mod server {
                         }),
                     )];
                     let mut writer = ResultSetWriter::start(client, columns).await?;
-                    writer
-                        .send_row_iter([ColumnData::Tvp(Some(tvp))])
-                        .await?;
+                    writer.send_row_iter([ColumnData::Tvp(Some(tvp))]).await?;
                     writer.finish(1).await?;
                     return Ok(());
                 }
@@ -1304,15 +1302,13 @@ mod server {
                         columns: columns.clone(),
                     };
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::ColMetaData(
-                            col_meta,
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::ColMetaData(col_meta),
+                        ))
                         .await?;
 
-                    let force_colname = std::env::var("TDS_DUMMY_FORCE_COLNAME")
-                        .ok()
-                        .as_deref()
-                        == Some("1");
+                    let force_colname =
+                        std::env::var("TDS_DUMMY_FORCE_COLNAME").ok().as_deref() == Some("1");
                     let legacy_colname = (client.tds_version() as u32) < TDS_VER_70;
                     if force_colname || legacy_colname {
                         client
@@ -1327,11 +1323,11 @@ mod server {
                     }
 
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::TabName(
-                            TokenTabName {
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::TabName(TokenTabName {
                                 tables: vec![vec!["dummy_table".into()]],
-                            },
-                        )))
+                            }),
+                        ))
                         .await?;
 
                     let mut colinfo = BytesMut::with_capacity(3);
@@ -1339,27 +1335,29 @@ mod server {
                     colinfo.put_u8(0); // table #0 (expression)
                     colinfo.put_u8(0x04); // EXPRESSION status
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::ColInfo(
-                            TokenColInfo { data: colinfo },
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::ColInfo(TokenColInfo { data: colinfo }),
+                        ))
                         .await?;
 
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Order(
-                            TokenOrder::new(vec![1]),
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Order(TokenOrder::new(vec![1])),
+                        ))
                         .await?;
 
                     let mut row = TokenRow::with_capacity(1);
                     row.push(ColumnData::I32(Some(66)));
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Row(row)))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Row(row),
+                        ))
                         .await?;
 
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Done(
-                            TokenDone::with_rows(1),
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Done(TokenDone::with_rows(1)),
+                        ))
                         .await?;
                     return Ok(());
                 }
@@ -1371,9 +1369,9 @@ mod server {
                         columns: columns.clone(),
                     };
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::ColMetaData(
-                            col_meta,
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::ColMetaData(col_meta),
+                        ))
                         .await?;
 
                     let alt_column = meta_fixed("alt_value", FixedLenType::Int4);
@@ -1396,7 +1394,9 @@ mod server {
                     let mut row = TokenRow::with_capacity(1);
                     row.push(ColumnData::I32(Some(10)));
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Row(row)))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Row(row),
+                        ))
                         .await?;
 
                     let mut alt_row = TokenAltRow::with_capacity(1, 1);
@@ -1409,9 +1409,9 @@ mod server {
                         .await?;
 
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Done(
-                            TokenDone::with_rows(1),
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Done(TokenDone::with_rows(1)),
+                        ))
                         .await?;
                     return Ok(());
                 }
@@ -1432,9 +1432,9 @@ mod server {
                         ))
                         .await?;
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Done(
-                            TokenDone::default(),
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Done(TokenDone::default()),
+                        ))
                         .await?;
                     return Ok(());
                 }
@@ -1443,9 +1443,9 @@ mod server {
                     log_event("sql_batch: tds_fedauth");
                     log_event("tds_fedauth: FedAuthInfo is login-only; skipping in batch");
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Done(
-                            TokenDone::default(),
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Done(TokenDone::default()),
+                        ))
                         .await?;
                     return Ok(());
                 }
@@ -1457,17 +1457,17 @@ mod server {
                         columns: columns.clone(),
                     };
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::ColMetaData(
-                            col_meta,
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::ColMetaData(col_meta),
+                        ))
                         .await?;
 
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::TabName(
-                            TokenTabName {
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::TabName(TokenTabName {
                                 tables: vec![vec!["dummy_table".into()]],
-                            },
-                        )))
+                            }),
+                        ))
                         .await?;
 
                     let mut colinfo = BytesMut::with_capacity(3);
@@ -1475,26 +1475,28 @@ mod server {
                     colinfo.put_u8(1); // table #1
                     colinfo.put_u8(0x00); // no flags
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::ColInfo(
-                            TokenColInfo { data: colinfo },
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::ColInfo(TokenColInfo { data: colinfo }),
+                        ))
                         .await?;
 
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Order(
-                            TokenOrder::new(vec![1]),
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Order(TokenOrder::new(vec![1])),
+                        ))
                         .await?;
 
                     let mut row = TokenRow::with_capacity(1);
                     row.push(ColumnData::I32(Some(55)));
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Row(row)))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Row(row),
+                        ))
                         .await?;
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Done(
-                            TokenDone::with_rows(1),
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Done(TokenDone::with_rows(1)),
+                        ))
                         .await?;
                     return Ok(());
                 }
@@ -1521,20 +1523,13 @@ mod server {
                             "iso-8859-1".into(),
                         )),
                         tiberius::server::BackendToken::EnvChange(TokenEnvChange::PacketSize(
-                            8192,
-                            4096,
+                            8192, 4096,
                         )),
                         tiberius::server::BackendToken::EnvChange(
-                            TokenEnvChange::UnicodeDataSortingLID(
-                                "0x0409".into(),
-                                "0x0000".into(),
-                            ),
+                            TokenEnvChange::UnicodeDataSortingLID("0x0409".into(), "0x0000".into()),
                         ),
                         tiberius::server::BackendToken::EnvChange(
-                            TokenEnvChange::UnicodeDataSortingCFL(
-                                "0x0001".into(),
-                                "0x0000".into(),
-                            ),
+                            TokenEnvChange::UnicodeDataSortingCFL("0x0001".into(), "0x0000".into()),
                         ),
                         tiberius::server::BackendToken::EnvChange(TokenEnvChange::SqlCollation {
                             old: collation_old,
@@ -1582,9 +1577,7 @@ mod server {
                                 new: tx_desc_new.clone(),
                             },
                         ),
-                        tiberius::server::BackendToken::EnvChange(
-                            TokenEnvChange::ResetConnection,
-                        ),
+                        tiberius::server::BackendToken::EnvChange(TokenEnvChange::ResetConnection),
                         tiberius::server::BackendToken::EnvChange(TokenEnvChange::UserName(
                             "dummy_user".into(),
                             "old_user".into(),
@@ -1724,24 +1717,20 @@ mod server {
 
                 if lower.contains("tds_error") {
                     log_event("sql_batch: tds_error");
-                    let err = TokenError::new(
-                        50000,
-                        1,
-                        16,
-                        "dummy error",
-                        "tiberius",
-                        "tds_error",
-                        1,
-                    );
+                    let err =
+                        TokenError::new(50000, 1, 16, "dummy error", "tiberius", "tds_error", 1);
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Error(
-                            err,
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Error(err),
+                        ))
                         .await?;
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Done(
-                            TokenDone::with_status(DoneStatus::Error.into(), 0),
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Done(TokenDone::with_status(
+                                DoneStatus::Error.into(),
+                                0,
+                            )),
+                        ))
                         .await?;
                     return Ok(());
                 }
@@ -1786,9 +1775,9 @@ mod server {
                 if !lower.contains("select") {
                     log_event("sql_batch: non-select done");
                     client
-                        .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Done(
-                            TokenDone::default(),
-                        )))
+                        .send(TdsBackendMessage::Token(
+                            tiberius::server::BackendToken::Done(TokenDone::default()),
+                        ))
                         .await?;
                     return Ok(());
                 }
@@ -1860,8 +1849,7 @@ mod server {
                 let is_execute = proc_name.eq_ignore_ascii_case("sp_execute");
                 let is_prepexec = proc_name.eq_ignore_ascii_case("sp_prepexec");
                 let is_exec_family = is_executesql || is_execute || is_prepexec;
-                let suppress_param_echo =
-                    is_executesql || is_prepare || is_execute || is_prepexec;
+                let suppress_param_echo = is_executesql || is_prepare || is_execute || is_prepexec;
                 if is_prepare {
                     output_only = true;
                 }
@@ -1907,19 +1895,11 @@ mod server {
                     }
                 }
 
-                let info = TokenInfo::new(
-                    8127,
-                    0,
-                    0,
-                    "dummy rpc info",
-                    "tiberius",
-                    "tds_rpc",
-                    1,
-                );
+                let info = TokenInfo::new(8127, 0, 0, "dummy rpc info", "tiberius", "tds_rpc", 1);
                 client
-                    .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Info(
-                        info,
-                    )))
+                    .send(TdsBackendMessage::Token(
+                        tiberius::server::BackendToken::Info(info),
+                    ))
                     .await?;
 
                 let mut pending_return_tokens = {
@@ -2035,9 +2015,9 @@ mod server {
                 }
 
                 client
-                    .send(TdsBackendMessage::Token(tiberius::server::BackendToken::DoneProc(
-                        TokenDone::with_rows(1),
-                    )))
+                    .send(TdsBackendMessage::Token(
+                        tiberius::server::BackendToken::DoneProc(TokenDone::with_rows(1)),
+                    ))
                     .await
             })
         }
@@ -2060,9 +2040,9 @@ mod server {
         {
             Box::pin(async move {
                 client
-                    .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Done(
-                        TokenDone::default(),
-                    )))
+                    .send(TdsBackendMessage::Token(
+                        tiberius::server::BackendToken::Done(TokenDone::default()),
+                    ))
                     .await
             })
         }
@@ -2086,9 +2066,12 @@ mod server {
                 client.clear_attention();
                 let status = DoneStatus::Attention;
                 client
-                    .send(TdsBackendMessage::Token(tiberius::server::BackendToken::Done(
-                        TokenDone::with_status(status.into(), 0),
-                    )))
+                    .send(TdsBackendMessage::Token(
+                        tiberius::server::BackendToken::Done(TokenDone::with_status(
+                            status.into(),
+                            0,
+                        )),
+                    ))
                     .await?;
                 client.set_state(TdsConnectionState::ReadyForQuery);
                 Ok(())
@@ -2138,14 +2121,8 @@ mod server {
     fn load_tls_acceptor() -> Option<RustlsAcceptor> {
         let cert_path = std::env::var("TDS_DUMMY_TLS_CERT").ok()?;
         let key_path = std::env::var("TDS_DUMMY_TLS_KEY").ok()?;
-        let tls12_only = std::env::var("TDS_DUMMY_TLS12_ONLY")
-            .ok()
-            .as_deref()
-            == Some("1");
-        let tls13_only = std::env::var("TDS_DUMMY_TLS13_ONLY")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let tls12_only = std::env::var("TDS_DUMMY_TLS12_ONLY").ok().as_deref() == Some("1");
+        let tls13_only = std::env::var("TDS_DUMMY_TLS13_ONLY").ok().as_deref() == Some("1");
 
         if tls12_only && tls13_only {
             log_event("TLS config: both TLS12_ONLY and TLS13_ONLY set; using TLS 1.3");
@@ -2241,7 +2218,11 @@ mod server {
             #[cfg(feature = "server-rustls")]
             log_event(&format!(
                 "TLS acceptor: {}",
-                if tls_acceptor.is_some() { "enabled" } else { "disabled" }
+                if tls_acceptor.is_some() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             ));
 
             loop {

@@ -15,8 +15,8 @@ use crate::server::messages::{AllHeaders, BackendToken, TdsBackendMessage, TdsFr
 use crate::server::state::TdsConnectionState;
 use crate::server::tls::{MaybeTlsStream, NoTls, TlsAccept};
 use crate::tds::codec::{DoneStatus, TokenDone};
-use crate::Error;
 use crate::EncryptionLevel;
+use crate::Error;
 
 /// Default startup timeout (60 seconds).
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -211,8 +211,7 @@ fn apply_request_headers<S, T>(
     conn: &mut TdsConnection<ServerStream<S, T>>,
     headers: &AllHeaders,
     request_flags: crate::server::messages::RequestFlags,
-)
-where
+) where
     S: NetStream,
     T: TlsAccept,
 {
@@ -237,7 +236,9 @@ where
         EncryptionLevel::NotSupported => Ok(()),
         _ => {
             let Some(acceptor) = tls_acceptor.as_ref() else {
-                return Err(Error::Protocol("TLS requested but no acceptor configured".into()));
+                return Err(Error::Protocol(
+                    "TLS requested but no acceptor configured".into(),
+                ));
             };
 
             if conn.is_secure() {

@@ -1,6 +1,6 @@
+use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 use crate::{tds::codec::Encode, tds::codec::FeatureLevel, SqlReadBytes, TokenType};
 use bytes::{BufMut, BytesMut};
-use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

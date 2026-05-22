@@ -4,7 +4,7 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 
-use crate::tds::codec::{TokenEnvChange, TokenFedAuthInfo, TokenFeatureExtAck, TokenLoginAck};
+use crate::tds::codec::{TokenEnvChange, TokenFeatureExtAck, TokenFedAuthInfo, TokenLoginAck};
 use crate::LoginMessage;
 
 use super::error::{AuthResult, AuthSuccess};

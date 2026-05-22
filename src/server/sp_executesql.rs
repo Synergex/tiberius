@@ -407,7 +407,7 @@ pub fn parse_executesql(params: RpcParamSet) -> Result<ParsedExecuteSql<'static>
             ColumnData::String(None) => None,    // NULL
             ColumnData::I32(Some(0)) => None,    // Special marker for no params
             ColumnData::I32(None) => None,       // NULL as I32
-            _ => None, // Other types treated as no param defs
+            _ => None,                           // Other types treated as no param defs
         }
     } else {
         None
@@ -534,11 +534,7 @@ impl<H> RpcHandler for SpExecuteSqlRpcHandler<H>
 where
     H: SpExecuteSqlHandler,
 {
-    fn on_rpc<'a, C>(
-        &'a self,
-        client: &'a mut C,
-        message: RpcMessage,
-    ) -> BoxFuture<'a, Result<()>>
+    fn on_rpc<'a, C>(&'a self, client: &'a mut C, message: RpcMessage) -> BoxFuture<'a, Result<()>>
     where
         C: TdsClient + 'a,
     {
@@ -634,10 +630,7 @@ mod tests {
 
     #[test]
     fn test_parse_executesql_empty_param_defs() {
-        let params = vec![
-            make_string_param("", "SELECT 1"),
-            make_string_param("", ""),
-        ];
+        let params = vec![make_string_param("", "SELECT 1"), make_string_param("", "")];
 
         let param_set = RpcParamSet::new(params);
         let parsed = parse_executesql(param_set).unwrap();

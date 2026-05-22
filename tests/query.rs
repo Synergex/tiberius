@@ -3121,11 +3121,8 @@ where
 
     let table = random_table().await;
 
-    conn.execute(
-        format!("CREATE TABLE ##{} (v sql_variant)", table),
-        &[],
-    )
-    .await?;
+    conn.execute(format!("CREATE TABLE ##{} (v sql_variant)", table), &[])
+        .await?;
 
     conn.execute(
         format!("INSERT INTO ##{} (v) VALUES (@P1)", table),
@@ -3134,7 +3131,7 @@ where
     .await?;
 
     let row = conn
-        .query(format!("SELECT v FROM ##{}",table), &[])
+        .query(format!("SELECT v FROM ##{}", table), &[])
         .await?
         .into_row()
         .await?
@@ -3224,11 +3221,7 @@ where
                 name: std::borrow::Cow::Borrowed("label"),
                 user_type: 0,
                 flags: ColumnFlag::Nullable.into(),
-                ty: TypeInfo::VarLenSized(VarLenContext::new(
-                    VarLenType::NVarchar,
-                    100,
-                    collation,
-                )),
+                ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::NVarchar, 100, collation)),
             },
         ])
         .rows(vec![
@@ -3248,10 +3241,7 @@ where
 
     // Execute the proc with TVP parameter
     let stream = conn
-        .query(
-            format!("EXEC {proc_name} @tvp = @P1"),
-            &[&tvp],
-        )
+        .query(format!("EXEC {proc_name} @tvp = @P1"), &[&tvp])
         .await?;
 
     let rows: Vec<_> = stream.into_first_result().await?;
@@ -3292,12 +3282,10 @@ where
     .into_results()
     .await?;
 
-    conn.simple_query(format!(
-        "CREATE TYPE dbo.{type_name} AS TABLE (id INT)",
-    ))
-    .await?
-    .into_results()
-    .await?;
+    conn.simple_query(format!("CREATE TYPE dbo.{type_name} AS TABLE (id INT)",))
+        .await?
+        .into_results()
+        .await?;
 
     conn.simple_query(format!(
         "CREATE PROCEDURE {proc_name} @tvp dbo.{type_name} READONLY AS SELECT COUNT(*) AS cnt FROM @tvp",
@@ -3318,10 +3306,7 @@ where
         .rows(vec![]);
 
     let row = conn
-        .query(
-            format!("EXEC {proc_name} @tvp = @P1"),
-            &[&tvp],
-        )
+        .query(format!("EXEC {proc_name} @tvp = @P1"), &[&tvp])
         .await?
         .into_row()
         .await?

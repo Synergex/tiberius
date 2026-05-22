@@ -45,7 +45,10 @@ impl<S> TlsPreloginWrapper<S> {
 
     pub fn handshake_complete(&mut self) {
         self.pending_handshake = false;
-        debug_assert!(self.pending_len == 0, "pending TLS handshake data not flushed");
+        debug_assert!(
+            self.pending_len == 0,
+            "pending TLS handshake data not flushed"
+        );
         self.wr_buf.clear();
         self.wr_pos = 0;
         self.pending_len = 0;
@@ -191,10 +194,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
                     inner.wr_buf.len() - inner.wr_pos,
                 );
 
-                let written = ready!(
-                    Pin::new(&mut inner.stream.as_mut().unwrap())
-                        .poll_write(cx, &inner.wr_buf[inner.wr_pos..])
-                )?;
+                let written = ready!(Pin::new(&mut inner.stream.as_mut().unwrap())
+                    .poll_write(cx, &inner.wr_buf[inner.wr_pos..]))?;
 
                 if written == 0 {
                     return Poll::Ready(Err(io::Error::new(

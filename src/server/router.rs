@@ -52,11 +52,7 @@ use crate::{Error, Result};
 pub struct RejectUnknownProc;
 
 impl RpcHandler for RejectUnknownProc {
-    fn on_rpc<'a, C>(
-        &'a self,
-        _client: &'a mut C,
-        message: RpcMessage,
-    ) -> BoxFuture<'a, Result<()>>
+    fn on_rpc<'a, C>(&'a self, _client: &'a mut C, message: RpcMessage) -> BoxFuture<'a, Result<()>>
     where
         C: TdsClient + 'a,
     {
@@ -213,8 +209,7 @@ impl<ES, P, E, U, PE, CO, CF, CC, F> std::fmt::Debug
     }
 }
 
-impl<ES, P, E, U, PE, CO, CF, CC, F> RpcHandler
-    for SystemProcRouter<ES, P, E, U, PE, CO, CF, CC, F>
+impl<ES, P, E, U, PE, CO, CF, CC, F> RpcHandler for SystemProcRouter<ES, P, E, U, PE, CO, CF, CC, F>
 where
     ES: SpExecuteSqlHandler,
     P: SpPrepareHandler,
@@ -226,11 +221,7 @@ where
     CC: SpCursorCloseHandler,
     F: RpcHandler,
 {
-    fn on_rpc<'a, C>(
-        &'a self,
-        client: &'a mut C,
-        message: RpcMessage,
-    ) -> BoxFuture<'a, Result<()>>
+    fn on_rpc<'a, C>(&'a self, client: &'a mut C, message: RpcMessage) -> BoxFuture<'a, Result<()>>
     where
         C: TdsClient + 'a,
     {
@@ -327,9 +318,7 @@ pub struct SystemProcRouterBuilder<ES, P, E, U, PE, CO, CF, CC, F> {
     fallback: F,
 }
 
-impl Default
-    for SystemProcRouterBuilder<(), (), (), (), (), (), (), (), RejectUnknownProc>
-{
+impl Default for SystemProcRouterBuilder<(), (), (), (), (), (), (), (), RejectUnknownProc> {
     fn default() -> Self {
         Self::new()
     }

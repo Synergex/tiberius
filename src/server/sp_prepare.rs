@@ -609,11 +609,7 @@ impl<H> RpcHandler for SpPrepareRpcHandler<H>
 where
     H: SpPrepareHandler,
 {
-    fn on_rpc<'a, C>(
-        &'a self,
-        client: &'a mut C,
-        message: RpcMessage,
-    ) -> BoxFuture<'a, Result<()>>
+    fn on_rpc<'a, C>(&'a self, client: &'a mut C, message: RpcMessage) -> BoxFuture<'a, Result<()>>
     where
         C: TdsClient + 'a,
     {
@@ -631,20 +627,12 @@ where
                     Ok(())
                 }
                 Some(other) => Err(Error::Protocol(
-                    format!(
-                        "SpPrepareRpcHandler: unsupported RPC proc ID {:?}",
-                        other
-                    )
-                    .into(),
+                    format!("SpPrepareRpcHandler: unsupported RPC proc ID {:?}", other).into(),
                 )),
                 None => {
                     let name = message.proc_name.as_deref().unwrap_or("<unknown>");
                     Err(Error::Protocol(
-                        format!(
-                            "SpPrepareRpcHandler: unsupported RPC procedure '{}'",
-                            name
-                        )
-                        .into(),
+                        format!("SpPrepareRpcHandler: unsupported RPC procedure '{}'", name).into(),
                     ))
                 }
             }
@@ -700,11 +688,7 @@ impl<H> RpcHandler for SpExecuteRpcHandler<H>
 where
     H: SpExecuteHandler,
 {
-    fn on_rpc<'a, C>(
-        &'a self,
-        client: &'a mut C,
-        message: RpcMessage,
-    ) -> BoxFuture<'a, Result<()>>
+    fn on_rpc<'a, C>(&'a self, client: &'a mut C, message: RpcMessage) -> BoxFuture<'a, Result<()>>
     where
         C: TdsClient + 'a,
     {
@@ -718,20 +702,12 @@ where
                     self.inner.execute(client, request).await
                 }
                 Some(other) => Err(Error::Protocol(
-                    format!(
-                        "SpExecuteRpcHandler: unsupported RPC proc ID {:?}",
-                        other
-                    )
-                    .into(),
+                    format!("SpExecuteRpcHandler: unsupported RPC proc ID {:?}", other).into(),
                 )),
                 None => {
                     let name = message.proc_name.as_deref().unwrap_or("<unknown>");
                     Err(Error::Protocol(
-                        format!(
-                            "SpExecuteRpcHandler: unsupported RPC procedure '{}'",
-                            name
-                        )
-                        .into(),
+                        format!("SpExecuteRpcHandler: unsupported RPC procedure '{}'", name).into(),
                     ))
                 }
             }
@@ -787,11 +763,7 @@ impl<H> RpcHandler for SpUnprepareRpcHandler<H>
 where
     H: SpUnprepareHandler,
 {
-    fn on_rpc<'a, C>(
-        &'a self,
-        client: &'a mut C,
-        message: RpcMessage,
-    ) -> BoxFuture<'a, Result<()>>
+    fn on_rpc<'a, C>(&'a self, client: &'a mut C, message: RpcMessage) -> BoxFuture<'a, Result<()>>
     where
         C: TdsClient + 'a,
     {
@@ -805,11 +777,7 @@ where
                     self.inner.unprepare(client, request).await
                 }
                 Some(other) => Err(Error::Protocol(
-                    format!(
-                        "SpUnprepareRpcHandler: unsupported RPC proc ID {:?}",
-                        other
-                    )
-                    .into(),
+                    format!("SpUnprepareRpcHandler: unsupported RPC proc ID {:?}", other).into(),
                 )),
                 None => {
                     let name = message.proc_name.as_deref().unwrap_or("<unknown>");
@@ -914,11 +882,7 @@ where
     E: SpExecuteHandler,
     U: SpUnprepareHandler,
 {
-    fn on_rpc<'a, C>(
-        &'a self,
-        client: &'a mut C,
-        message: RpcMessage,
-    ) -> BoxFuture<'a, Result<()>>
+    fn on_rpc<'a, C>(&'a self, client: &'a mut C, message: RpcMessage) -> BoxFuture<'a, Result<()>>
     where
         C: TdsClient + 'a,
     {
@@ -1061,7 +1025,10 @@ mod tests {
         let result = parse_prepare(param_set);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("expected at least 3"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected at least 3"));
     }
 
     // -------------------------------------------------------------------------
@@ -1070,10 +1037,7 @@ mod tests {
 
     #[test]
     fn test_parse_execute_basic() {
-        let params = vec![
-            make_i32_param("@handle", 42),
-            make_i32_param("@id", 100),
-        ];
+        let params = vec![make_i32_param("@handle", 42), make_i32_param("@id", 100)];
 
         let param_set = RpcParamSet::new(params);
         let parsed = parse_execute(param_set).unwrap();
@@ -1207,15 +1171,15 @@ mod tests {
         assert_eq!(parsed.param_defs(), Some("@a int, @b varchar(50)"));
         assert_eq!(parsed.options(), 5);
         // Check that handle_type_info is preserved
-        assert!(matches!(parsed.handle_type_info(), TypeInfo::FixedLen(FixedLenType::Int4)));
+        assert!(matches!(
+            parsed.handle_type_info(),
+            TypeInfo::FixedLen(FixedLenType::Int4)
+        ));
     }
 
     #[test]
     fn test_parsed_execute_into_params() {
-        let params = vec![
-            make_i32_param("@handle", 1),
-            make_i32_param("@id", 42),
-        ];
+        let params = vec![make_i32_param("@handle", 1), make_i32_param("@id", 42)];
 
         let param_set = RpcParamSet::new(params);
         let parsed = parse_execute(param_set).unwrap();

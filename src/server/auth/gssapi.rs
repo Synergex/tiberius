@@ -51,9 +51,7 @@ impl SspiAcceptor for GssapiAcceptor {
 
         let complete = ctx.is_complete();
         let session_user = if complete {
-            ctx.source_name()
-                .ok()
-                .map(|name| name.to_string())
+            ctx.source_name().ok().map(|name| name.to_string())
         } else {
             None
         };
@@ -89,10 +87,7 @@ impl SspiSession for GssapiSession {
         })?;
         let complete = self.ctx.is_complete();
         let session_user = if complete {
-            self.ctx
-                .source_name()
-                .ok()
-                .map(|name| name.to_string())
+            self.ctx.source_name().ok().map(|name| name.to_string())
         } else {
             None
         };

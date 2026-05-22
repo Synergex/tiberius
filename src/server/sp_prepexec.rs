@@ -194,11 +194,7 @@ impl<H> RpcHandler for SpPrepExecRpcHandler<H>
 where
     H: SpPrepExecHandler,
 {
-    fn on_rpc<'a, C>(
-        &'a self,
-        client: &'a mut C,
-        message: RpcMessage,
-    ) -> BoxFuture<'a, Result<()>>
+    fn on_rpc<'a, C>(&'a self, client: &'a mut C, message: RpcMessage) -> BoxFuture<'a, Result<()>>
     where
         C: TdsClient + 'a,
     {
@@ -211,20 +207,13 @@ where
                     Ok(())
                 }
                 Some(other) => Err(Error::Protocol(
-                    format!(
-                        "SpPrepExecRpcHandler: unsupported RPC proc ID {:?}",
-                        other
-                    )
-                    .into(),
+                    format!("SpPrepExecRpcHandler: unsupported RPC proc ID {:?}", other).into(),
                 )),
                 None => {
                     let name = message.proc_name.as_deref().unwrap_or("<unknown>");
                     Err(Error::Protocol(
-                        format!(
-                            "SpPrepExecRpcHandler: unsupported RPC procedure '{}'",
-                            name
-                        )
-                        .into(),
+                        format!("SpPrepExecRpcHandler: unsupported RPC procedure '{}'", name)
+                            .into(),
                     ))
                 }
             }

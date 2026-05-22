@@ -30,7 +30,12 @@ impl Default for DefaultEnvChangeProvider {
 
 impl DefaultEnvChangeProvider {
     pub fn login_ack(&self, login: &LoginMessage<'_>) -> TokenLoginAck {
-        TokenLoginAck::new(1, login.tds_version(), &self.program_name, self.server_version)
+        TokenLoginAck::new(
+            1,
+            login.tds_version(),
+            &self.program_name,
+            self.server_version,
+        )
     }
 
     pub fn env_changes<C>(&self, client: &C, login: &LoginMessage<'_>) -> Vec<TokenEnvChange>

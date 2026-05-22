@@ -11,7 +11,10 @@ pub(crate) struct BytesMutWithDataColumns<'a, 'c> {
 
 impl<'a, 'c> BytesMutWithDataColumns<'a, 'c> {
     pub fn new(bytes: &'a mut BytesMut, data_columns: &'c [MetaDataColumn<'c>]) -> Self {
-        BytesMutWithDataColumns { bytes, data_columns }
+        BytesMutWithDataColumns {
+            bytes,
+            data_columns,
+        }
     }
 
     pub fn data_columns(&self) -> &'c [MetaDataColumn<'c>] {

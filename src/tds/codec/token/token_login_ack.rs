@@ -1,7 +1,7 @@
-use crate::{tds::codec::Encode, Error, FeatureLevel, SqlReadBytes, TokenType};
-use bytes::BytesMut;
-use bytes::BufMut;
 use crate::tds::codec::token::write_b_varchar;
+use crate::{tds::codec::Encode, Error, FeatureLevel, SqlReadBytes, TokenType};
+use bytes::BufMut;
+use bytes::BytesMut;
 use std::convert::TryFrom;
 
 #[allow(dead_code)] // we might want to debug the values

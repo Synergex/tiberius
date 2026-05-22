@@ -93,11 +93,7 @@ impl TokenDone {
         }
     }
 
-    pub(crate) fn encode_with_type(
-        self,
-        dst: &mut BytesMut,
-        ty: TokenType,
-    ) -> crate::Result<()> {
+    pub(crate) fn encode_with_type(self, dst: &mut BytesMut, ty: TokenType) -> crate::Result<()> {
         self.encode_with_type_and_count_bytes(dst, ty, 8)
     }
 
@@ -120,11 +116,7 @@ impl TokenDone {
                 }
                 dst.put_u32_le(self.done_rows as u32);
             }
-            _ => {
-                return Err(Error::Protocol(
-                    "done: invalid row count width".into(),
-                ))
-            }
+            _ => return Err(Error::Protocol("done: invalid row count width".into())),
         }
         Ok(())
     }

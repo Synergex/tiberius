@@ -70,7 +70,8 @@ where
 
     match ty {
         VarLenType::Char | VarLenType::VarChar => {
-            let collation = collation.ok_or_else(|| Error::Protocol("varchar: missing collation".into()))?;
+            let collation =
+                collation.ok_or_else(|| Error::Protocol("varchar: missing collation".into()))?;
             let encoder = collation.encoding()?;
             let s = encoder
                 .decode_without_bom_handling_and_without_replacement(buf.as_ref())

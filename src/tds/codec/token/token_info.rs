@@ -1,6 +1,6 @@
+use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 use crate::{tds::codec::Encode, SqlReadBytes, TokenType};
 use bytes::{BufMut, BytesMut};
-use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 
 #[allow(dead_code)] // we might want to debug the values
 #[derive(Debug)]

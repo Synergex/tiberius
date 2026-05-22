@@ -119,7 +119,10 @@ impl<'a> OutputParameter<'a> {
     /// let output = OutputParameter::from_input(input_param, ColumnData::I32(Some(42)));
     /// writer.send_output_param(output).await?;
     /// ```
-    pub fn from_input(input: &crate::server::codec::DecodedRpcParam, value: ColumnData<'a>) -> Self {
+    pub fn from_input(
+        input: &crate::server::codec::DecodedRpcParam,
+        value: ColumnData<'a>,
+    ) -> Self {
         Self {
             name: Cow::Owned(input.name.clone()),
             value,
@@ -186,29 +189,19 @@ fn column_data_into_static(value: ColumnData<'_>) -> ColumnData<'static> {
         ColumnData::DateTimeOffset(v) => ColumnData::DateTimeOffset(v),
 
         // Cow types - convert to owned
-        ColumnData::String(s) => {
-            ColumnData::String(s.map(|cow| Cow::Owned(cow.into_owned())))
-        }
-        ColumnData::Binary(b) => {
-            ColumnData::Binary(b.map(|cow| Cow::Owned(cow.into_owned())))
-        }
-        ColumnData::Xml(x) => {
-            ColumnData::Xml(x.map(|cow| Cow::Owned(cow.into_owned())))
-        }
-        ColumnData::Udt(u) => {
-            ColumnData::Udt(u.map(|cow| Cow::Owned(cow.into_owned())))
-        }
-        ColumnData::Variant(v) => {
-            ColumnData::Variant(v.map(|var| var.into_owned()))
-        }
-        ColumnData::Tvp(t) => {
-            ColumnData::Tvp(t.map(|tvp| tvp_data_into_static(tvp)))
-        }
+        ColumnData::String(s) => ColumnData::String(s.map(|cow| Cow::Owned(cow.into_owned()))),
+        ColumnData::Binary(b) => ColumnData::Binary(b.map(|cow| Cow::Owned(cow.into_owned()))),
+        ColumnData::Xml(x) => ColumnData::Xml(x.map(|cow| Cow::Owned(cow.into_owned()))),
+        ColumnData::Udt(u) => ColumnData::Udt(u.map(|cow| Cow::Owned(cow.into_owned()))),
+        ColumnData::Variant(v) => ColumnData::Variant(v.map(|var| var.into_owned())),
+        ColumnData::Tvp(t) => ColumnData::Tvp(t.map(|tvp| tvp_data_into_static(tvp))),
     }
 }
 
 /// Convert TvpData to a 'static version.
-fn tvp_data_into_static(tvp: crate::tds::codec::TvpData<'_>) -> crate::tds::codec::TvpData<'static> {
+fn tvp_data_into_static(
+    tvp: crate::tds::codec::TvpData<'_>,
+) -> crate::tds::codec::TvpData<'static> {
     crate::tds::codec::TvpData {
         db_name: Cow::Owned(tvp.db_name.into_owned()),
         schema: Cow::Owned(tvp.schema.into_owned()),
@@ -251,8 +244,12 @@ pub fn infer_type_info(value: &ColumnData<'_>, collation: Collation) -> TypeInfo
         ColumnData::I16(_) => TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 2, None)),
         ColumnData::I32(_) => TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
         ColumnData::I64(_) => TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 8, None)),
-        ColumnData::F32(_) => TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Floatn, 4, None)),
-        ColumnData::F64(_) => TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Floatn, 8, None)),
+        ColumnData::F32(_) => {
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Floatn, 4, None))
+        }
+        ColumnData::F64(_) => {
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Floatn, 8, None))
+        }
         ColumnData::Bit(_) => TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Bitn, 1, None)),
         ColumnData::String(s) => {
             // Use NVARCHAR with appropriate length
@@ -262,7 +259,11 @@ pub fn infer_type_info(value: &ColumnData<'_>, collation: Collation) -> TypeInfo
                 .map(|s| s.len().saturating_mul(2)) // UTF-16 encoding
                 .unwrap_or(0);
             // Use max if > 4000 chars (8000 bytes), otherwise use actual length or default
-            let type_len = if len > 8000 { 0xFFFF } else { std::cmp::max(len, 8000) };
+            let type_len = if len > 8000 {
+                0xFFFF
+            } else {
+                std::cmp::max(len, 8000)
+            };
             TypeInfo::VarLenSized(VarLenContext::new(
                 VarLenType::NVarchar,
                 type_len,
@@ -275,7 +276,11 @@ pub fn infer_type_info(value: &ColumnData<'_>, collation: Collation) -> TypeInfo
         ColumnData::Binary(b) => {
             let len = b.as_ref().map(|b| b.len()).unwrap_or(0);
             // Use max if > 8000, otherwise use actual length or default
-            let type_len = if len > 8000 { 0xFFFF } else { std::cmp::max(len, 8000) };
+            let type_len = if len > 8000 {
+                0xFFFF
+            } else {
+                std::cmp::max(len, 8000)
+            };
             TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, type_len, None))
         }
         ColumnData::Numeric(n) => {
@@ -334,10 +339,16 @@ pub fn infer_type_info(value: &ColumnData<'_>, collation: Collation) -> TypeInfo
         }
         ColumnData::Udt(u) => {
             let len = u.as_ref().map(|b| b.len()).unwrap_or(0);
-            let type_len = if len > 8000 { 0xFFFF } else { std::cmp::max(len, 8000) };
+            let type_len = if len > 8000 {
+                0xFFFF
+            } else {
+                std::cmp::max(len, 8000)
+            };
             TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, type_len, None))
         }
-        ColumnData::Variant(_) => TypeInfo::SsVariant(crate::tds::codec::SsVariantInfo { max_len: 8016 }),
+        ColumnData::Variant(_) => {
+            TypeInfo::SsVariant(crate::tds::codec::SsVariantInfo { max_len: 8016 })
+        }
         ColumnData::Tvp(_) => TypeInfo::Tvp(crate::tds::codec::TvpInfo {
             db_name: String::new(),
             schema: String::new(),
@@ -365,7 +376,9 @@ where
             columns: columns.clone(),
         };
         client
-            .send(TdsBackendMessage::TokenPartial(BackendToken::ColMetaData(token)))
+            .send(TdsBackendMessage::TokenPartial(BackendToken::ColMetaData(
+                token,
+            )))
             .await?;
 
         Ok(Self { client, columns })
@@ -537,7 +550,8 @@ where
                     .into(),
                 )
             })?;
-            let mut dst_ti = BytesMutWithTypeInfo::new(&mut payload).with_type_info(&column.base.ty);
+            let mut dst_ti =
+                BytesMutWithTypeInfo::new(&mut payload).with_type_info(&column.base.ty);
             value.encode(&mut dst_ti)?;
             while payload.len() >= chunk_size {
                 let chunk = payload.split_to(chunk_size);
@@ -571,11 +585,7 @@ where
     /// Send a batch of rows using a columnar accessor.
     ///
     /// The accessor should provide a value for each (row, col) pair.
-    pub async fn send_batch_rows<'b, F>(
-        &mut self,
-        rows: usize,
-        mut value_at: F,
-    ) -> Result<()>
+    pub async fn send_batch_rows<'b, F>(&mut self, rows: usize, mut value_at: F) -> Result<()>
     where
         F: FnMut(usize, usize) -> ColumnData<'b>,
     {
@@ -629,11 +639,7 @@ where
     }
 
     /// Send a batch of rows using NBCROW encoding.
-    pub async fn send_batch_rows_nbc<'b, F>(
-        &mut self,
-        rows: usize,
-        mut value_at: F,
-    ) -> Result<()>
+    pub async fn send_batch_rows_nbc<'b, F>(&mut self, rows: usize, mut value_at: F) -> Result<()>
     where
         F: FnMut(usize, usize) -> ColumnData<'b>,
     {

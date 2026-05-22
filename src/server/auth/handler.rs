@@ -17,7 +17,9 @@ use super::builder::AuthBuilder;
 use super::env_provider::DefaultEnvChangeProvider;
 use super::error::AuthError;
 use super::login_info::LoginInfo;
-use super::traits::{EnvChangeProvider, FedAuthValidator, SqlAuthSource, SspiAcceptor, SspiSession, SspiStep};
+use super::traits::{
+    EnvChangeProvider, FedAuthValidator, SqlAuthSource, SspiAcceptor, SspiSession, SspiStep,
+};
 
 /// Maximum number of concurrent pending SSPI authentication sessions.
 const MAX_PENDING_SSPI_SESSIONS: usize = 1000;
@@ -117,15 +119,8 @@ where
             .and_then(|info| info.server())
             .map(|s| s.to_string())
             .unwrap_or_else(|| client.socket_addr().ip().to_string());
-        let token = crate::TokenError::new(
-            err.code,
-            err.state,
-            err.class,
-            err.message,
-            server,
-            "",
-            1,
-        );
+        let token =
+            crate::TokenError::new(err.code, err.state, err.class, err.message, server, "", 1);
         let done = TokenDone::with_status(DoneStatus::Error.into(), 0);
 
         client
@@ -247,23 +242,14 @@ where
             if let Some(token) = message.fed_auth_token() {
                 let Some(validator) = self.fed_auth.as_ref() else {
                     return self
-                        .send_login_error(
-                            client,
-                            Some(&info),
-                            AuthError::login_failed(info.user()),
-                        )
+                        .send_login_error(client, Some(&info), AuthError::login_failed(info.user()))
                         .await;
                 };
 
                 match validator.validate(&info, token).await {
                     Ok(success) => {
                         return self
-                            .finish_login(
-                                client,
-                                &message,
-                                &info,
-                                success.session_user.as_deref(),
-                            )
+                            .finish_login(client, &message, &info, success.session_user.as_deref())
                             .await;
                     }
                     Err(err) => {
@@ -275,11 +261,7 @@ where
             if let Some(initial) = message.integrated_security_bytes() {
                 let Some(acceptor) = self.sspi.as_ref() else {
                     return self
-                        .send_login_error(
-                            client,
-                            Some(&info),
-                            AuthError::login_failed(info.user()),
-                        )
+                        .send_login_error(client, Some(&info), AuthError::login_failed(info.user()))
                         .await;
                 };
 
@@ -333,12 +315,7 @@ where
                 match sql_auth.authenticate(&info, password).await {
                     Ok(success) => {
                         return self
-                            .finish_login(
-                                client,
-                                &message,
-                                &info,
-                                success.session_user.as_deref(),
-                            )
+                            .finish_login(client, &message, &info, success.session_user.as_deref())
                             .await;
                     }
                     Err(err) => {
@@ -348,7 +325,9 @@ where
             }
 
             if self.allow_trust {
-                return self.finish_login(client, &message, &info, info.user()).await;
+                return self
+                    .finish_login(client, &message, &info, info.user())
+                    .await;
             }
 
             self.send_login_error(client, Some(&info), AuthError::login_failed(info.user()))
@@ -373,18 +352,16 @@ where
 
             let Some(mut session) = session else {
                 return self
-                    .send_login_error(
-                        client,
-                        None,
-                        AuthError::login_failed(None),
-                    )
+                    .send_login_error(client, None, AuthError::login_failed(None))
                     .await;
             };
 
             let step = match session.sspi.step(token.as_ref()) {
                 Ok(step) => step,
                 Err(err) => {
-                    return self.send_login_error(client, Some(&session.info), err).await;
+                    return self
+                        .send_login_error(client, Some(&session.info), err)
+                        .await;
                 }
             };
 
@@ -397,8 +374,7 @@ where
                 sessions.insert(addr, session);
             }
 
-            self.handle_sspi_step(client, &login, &info, step)
-                .await
+            self.handle_sspi_step(client, &login, &info, step).await
         })
     }
 }

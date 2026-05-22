@@ -224,11 +224,9 @@ impl QueryColumnType {
             QueryColumnType::Date => {
                 TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Daten, 3, None))
             }
-            QueryColumnType::Time(scale) => TypeInfo::VarLenSized(VarLenContext::new(
-                VarLenType::Timen,
-                scale as usize,
-                None,
-            )),
+            QueryColumnType::Time(scale) => {
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Timen, scale as usize, None))
+            }
             QueryColumnType::DateTime2(scale) => TypeInfo::VarLenSized(VarLenContext::new(
                 VarLenType::Datetime2,
                 scale as usize,
@@ -639,7 +637,7 @@ where
     pub async fn error_message(&mut self, number: u32, message: impl Into<String>) -> Result<()> {
         let error = TokenError::new(
             number,
-            0, // state
+            0,  // state
             16, // class (severity) - 16 is "user error"
             message.into(),
             String::new(), // server

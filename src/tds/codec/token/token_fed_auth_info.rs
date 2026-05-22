@@ -1,6 +1,6 @@
 use crate::{Error, SqlReadBytes, TokenType};
-use bytes::{BufMut, BytesMut};
 use byteorder::{LittleEndian, ReadBytesExt};
+use bytes::{BufMut, BytesMut};
 use futures_util::io::AsyncReadExt;
 use std::io::Cursor;
 

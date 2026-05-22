@@ -7,9 +7,8 @@ use bytes::{Buf, BytesMut};
 const MAX_PENDING_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
 use crate::server::messages::{
-    AllHeaders, RequestFlags, RpcMessage, SqlBatchMessage, TdsBackendMessage,
-    TdsFrontendMessage, TraceActivityHeader, TransactionDescriptor, TransactionDescriptorHeader,
-    UnknownHeader,
+    AllHeaders, RequestFlags, RpcMessage, SqlBatchMessage, TdsBackendMessage, TdsFrontendMessage,
+    TraceActivityHeader, TransactionDescriptor, TransactionDescriptorHeader, UnknownHeader,
 };
 use crate::server::state::TdsConnectionState;
 use crate::tds::codec::{
@@ -18,8 +17,8 @@ use crate::tds::codec::{
 };
 use crate::tds::Context;
 use crate::SqlReadBytes;
-use asynchronous_codec::Decoder;
 use crate::{Error, Result};
+use asynchronous_codec::Decoder;
 use byteorder::{LittleEndian, ReadBytesExt};
 use enumflags2::BitFlags;
 use futures_util::io::AsyncRead;
@@ -81,8 +80,7 @@ impl TdsCodec {
 
         if self.pending_discard {
             if let Some(pending) = self.pending_type {
-                let starts_new_message =
-                    header.r#type() != pending || header.id() == 1;
+                let starts_new_message = header.r#type() != pending || header.id() == 1;
                 if starts_new_message {
                     self.pending_type = None;
                     self.pending_payload.clear();
@@ -107,9 +105,7 @@ impl TdsCodec {
             None => {
                 // Check initial payload size
                 if payload.len() > MAX_PENDING_PAYLOAD_SIZE {
-                    return Err(Error::Protocol(
-                        "tds: payload exceeded maximum size".into(),
-                    ));
+                    return Err(Error::Protocol("tds: payload exceeded maximum size".into()));
                 }
                 self.pending_type = Some(header.r#type());
                 self.pending_payload = payload;
@@ -372,9 +368,8 @@ fn decode_all_headers(bytes: &[u8]) -> Result<AllHeaders> {
                 }
                 let mut desc_bytes = [0u8; 8];
                 desc_bytes.copy_from_slice(&data[..8]);
-                let outstanding_requests = u32::from_le_bytes([
-                    data[8], data[9], data[10], data[11],
-                ]);
+                let outstanding_requests =
+                    u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
                 headers.transaction_descriptor = Some(TransactionDescriptorHeader {
                     descriptor: TransactionDescriptor::new(desc_bytes),
                     outstanding_requests,
@@ -388,18 +383,14 @@ fn decode_all_headers(bytes: &[u8]) -> Result<AllHeaders> {
                 }
                 let mut activity_id = [0u8; 16];
                 activity_id.copy_from_slice(&data[..16]);
-                let sequence_number =
-                    u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+                let sequence_number = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
                 headers.trace_activity = Some(TraceActivityHeader {
                     activity_id,
                     sequence_number,
                 });
             }
             _ => {
-                headers.unknown.push(UnknownHeader {
-                    header_type,
-                    data,
-                });
+                headers.unknown.push(UnknownHeader { header_type, data });
             }
         }
     }
@@ -695,24 +686,30 @@ mod tests {
             offset = end;
         }
 
-        let attention_packet =
-            encode_packet(PacketType::AttentionSignal, PacketStatus::EndOfMessage, id, BytesMut::new());
+        let attention_packet = encode_packet(
+            PacketType::AttentionSignal,
+            PacketStatus::EndOfMessage,
+            id,
+            BytesMut::new(),
+        );
         id = id.wrapping_add(1);
 
         let mut payload2 = BytesMut::new();
         BatchRequest::new("SELECT 1", [0; 8])
             .encode(&mut payload2)
             .expect("batch encode");
-        let followup_packet =
-            encode_packet(PacketType::SQLBatch, PacketStatus::EndOfMessage, id, payload2);
+        let followup_packet = encode_packet(
+            PacketType::SQLBatch,
+            PacketStatus::EndOfMessage,
+            id,
+            payload2,
+        );
 
         buf.extend_from_slice(&batch_packets[0]);
-        assert!(
-            codec
-                .decode(&mut buf, TdsConnectionState::ReadyForQuery)
-                .expect("decode")
-                .is_none()
-        );
+        assert!(codec
+            .decode(&mut buf, TdsConnectionState::ReadyForQuery)
+            .expect("decode")
+            .is_none());
 
         buf.extend_from_slice(&attention_packet);
         let msg = codec
@@ -759,19 +756,25 @@ mod tests {
 
         let payload_bytes = payload.freeze();
         let first_chunk = BytesMut::from(&payload_bytes[..chunk_size]);
-        let first_packet =
-            encode_packet(PacketType::SQLBatch, PacketStatus::NormalMessage, 1, first_chunk);
-
-        buf.extend_from_slice(&first_packet);
-        assert!(
-            codec
-                .decode(&mut buf, TdsConnectionState::ReadyForQuery)
-                .expect("decode")
-                .is_none()
+        let first_packet = encode_packet(
+            PacketType::SQLBatch,
+            PacketStatus::NormalMessage,
+            1,
+            first_chunk,
         );
 
-        let attention_packet =
-            encode_packet(PacketType::AttentionSignal, PacketStatus::EndOfMessage, 2, BytesMut::new());
+        buf.extend_from_slice(&first_packet);
+        assert!(codec
+            .decode(&mut buf, TdsConnectionState::ReadyForQuery)
+            .expect("decode")
+            .is_none());
+
+        let attention_packet = encode_packet(
+            PacketType::AttentionSignal,
+            PacketStatus::EndOfMessage,
+            2,
+            BytesMut::new(),
+        );
         buf.extend_from_slice(&attention_packet);
         let msg = codec
             .decode(&mut buf, TdsConnectionState::ReadyForQuery)
@@ -782,8 +785,12 @@ mod tests {
         BatchRequest::new("SELECT 1", [0; 8])
             .encode(&mut payload2)
             .expect("batch encode");
-        let followup_packet =
-            encode_packet(PacketType::SQLBatch, PacketStatus::EndOfMessage, 1, payload2);
+        let followup_packet = encode_packet(
+            PacketType::SQLBatch,
+            PacketStatus::EndOfMessage,
+            1,
+            payload2,
+        );
 
         buf.extend_from_slice(&followup_packet);
         let msg = codec

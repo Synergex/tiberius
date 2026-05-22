@@ -20,20 +20,20 @@ mod xml;
 
 use super::{Encode, FixedLenType, TypeInfo, VarLenContext, VarLenType};
 use crate::tds::time::{Date, DateTime2, DateTimeOffset, Time};
+use crate::tds::Context;
 use crate::{
     tds::{time::DateTime, time::SmallDateTime, xml::XmlData, Collation, Numeric},
     SqlReadBytes,
 };
-use enumflags2::BitFlags;
 use bytes::{Buf, BufMut, BytesMut};
 pub(crate) use bytes_mut_with_type_info::BytesMutWithTypeInfo;
+use enumflags2::BitFlags;
+use futures_util::io::{AsyncRead, AsyncReadExt};
 use std::borrow::{BorrowMut, Cow};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 use uuid::Uuid;
-use crate::tds::Context;
-use futures_util::io::{AsyncRead, AsyncReadExt};
 
 const MAX_NVARCHAR_SIZE: usize = 1 << 30;
 
@@ -258,10 +258,7 @@ impl<'a> VariantData<'a> {
     }
 
     /// Build a typed sql_variant payload from a base type and value.
-    pub fn from_typed(
-        ty: TypeInfo,
-        value: ColumnData<'_>,
-    ) -> crate::Result<VariantData<'static>> {
+    pub fn from_typed(ty: TypeInfo, value: ColumnData<'_>) -> crate::Result<VariantData<'static>> {
         let payload = encode_variant_payload(ty, value)?;
         Ok(VariantData::new(payload))
     }
@@ -414,9 +411,10 @@ fn encode_variant_money_bytes(value: f64, len: usize) -> crate::Result<Vec<u8>> 
 
 fn encode_variant_numeric_bytes(value: Numeric) -> crate::Result<Vec<u8>> {
     let raw = value.value();
-    let abs = raw.checked_abs().ok_or_else(|| {
-        crate::Error::BulkInput("sql_variant: numeric overflow".into())
-    })? as u128;
+    let abs = raw
+        .checked_abs()
+        .ok_or_else(|| crate::Error::BulkInput("sql_variant: numeric overflow".into()))?
+        as u128;
     let mut buf = BytesMut::with_capacity(17);
     buf.put_u8(if raw < 0 { 0 } else { 1 });
     buf.put_u128_le(abs);
@@ -433,11 +431,7 @@ fn encode_variant_non_unicode(
         .max_buffer_length_from_utf8_without_replacement(value.len())
         .unwrap();
     let mut bytes = Vec::with_capacity(len);
-    let (res, _) = encoder.encode_from_utf8_to_vec_without_replacement(
-        value,
-        &mut bytes,
-        true,
-    );
+    let (res, _) = encoder.encode_from_utf8_to_vec_without_replacement(value, &mut bytes, true);
     if let encoding_rs::EncoderResult::Unmappable(_) = res {
         return Err(crate::Error::Encoding(
             "sql_variant: unrepresentable character".into(),
@@ -638,7 +632,8 @@ fn encode_variant_payload(ty: TypeInfo, value: ColumnData<'_>) -> crate::Result<
         ) if matches!(
             ty,
             VarLenType::Decimaln | VarLenType::Numericn | VarLenType::Decimal | VarLenType::Numeric
-        ) => {
+        ) =>
+        {
             if num.scale() != scale {
                 return Err(crate::Error::BulkInput(
                     format!(
@@ -678,9 +673,9 @@ fn encode_variant_payload(ty: TypeInfo, value: ColumnData<'_>) -> crate::Result<
                     "sql_variant: char length exceeds u16".into(),
                 ));
             }
-            let collation = ctx.collation().ok_or_else(|| {
-                crate::Error::BulkInput("sql_variant: missing collation".into())
-            })?;
+            let collation = ctx
+                .collation()
+                .ok_or_else(|| crate::Error::BulkInput("sql_variant: missing collation".into()))?;
             let bytes = encode_variant_non_unicode(value.as_ref(), collation, max_len)?;
             prop_bytes.put_u32_le(collation.info());
             prop_bytes.put_u8(collation.sort_id());
@@ -697,9 +692,9 @@ fn encode_variant_payload(ty: TypeInfo, value: ColumnData<'_>) -> crate::Result<
                     "sql_variant: nchar length exceeds u16".into(),
                 ));
             }
-            let collation = ctx.collation().ok_or_else(|| {
-                crate::Error::BulkInput("sql_variant: missing collation".into())
-            })?;
+            let collation = ctx
+                .collation()
+                .ok_or_else(|| crate::Error::BulkInput("sql_variant: missing collation".into()))?;
             let bytes = encode_variant_unicode(value.as_ref(), max_len)?;
             prop_bytes.put_u32_le(collation.info());
             prop_bytes.put_u8(collation.sort_id());
@@ -751,9 +746,7 @@ fn encode_variant_payload(ty: TypeInfo, value: ColumnData<'_>) -> crate::Result<
     Ok(payload.to_vec())
 }
 
-async fn decode_variant_payload(
-    payload: &[u8],
-) -> crate::Result<(TypeInfo, ColumnData<'static>)> {
+async fn decode_variant_payload(payload: &[u8]) -> crate::Result<(TypeInfo, ColumnData<'static>)> {
     let (base_type, prop_bytes, value_bytes) = split_variant_payload(payload)?;
     let mut reader = VariantReader::new(BytesMut::from(value_bytes));
 
@@ -778,7 +771,9 @@ async fn decode_variant_payload(
             FixedLenType::Float8 => ColumnData::F64(Some(reader.read_f64_le().await?)),
             FixedLenType::Money => money::decode(&mut reader, 8).await?,
             FixedLenType::Money4 => money::decode(&mut reader, 4).await?,
-            FixedLenType::Datetime => ColumnData::DateTime(Some(DateTime::decode(&mut reader).await?)),
+            FixedLenType::Datetime => {
+                ColumnData::DateTime(Some(DateTime::decode(&mut reader).await?))
+            }
             FixedLenType::Datetime4 => {
                 ColumnData::SmallDateTime(Some(SmallDateTime::decode(&mut reader).await?))
             }
@@ -846,11 +841,8 @@ async fn decode_variant_payload(
                     "sql_variant payload has trailing bytes".into(),
                 ));
             }
-            let ty = TypeInfo::VarLenSized(VarLenContext::new(
-                VarLenType::Timen,
-                scale as usize,
-                None,
-            ));
+            let ty =
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Timen, scale as usize, None));
             Ok((ty, value))
         }
         VarLenType::Datetime2 => {
@@ -936,9 +928,7 @@ async fn decode_variant_payload(
             let mut numeric_reader = VariantReader::new(buf);
             let numeric = Numeric::decode(&mut numeric_reader, scale)
                 .await?
-                .ok_or_else(|| {
-                    crate::Error::Protocol("sql_variant: numeric null".into())
-                })?;
+                .ok_or_else(|| crate::Error::Protocol("sql_variant: numeric null".into()))?;
             if numeric_reader.remaining() != 0 {
                 return Err(crate::Error::Protocol(
                     "sql_variant payload has trailing bytes".into(),
@@ -1156,9 +1146,8 @@ async fn decode_variant_payload(
                 ));
             }
             let len = value_bytes.len();
-            let len_u8 = u8::try_from(len).map_err(|_| {
-                crate::Error::Protocol("sql_variant: money length overflow".into())
-            })?;
+            let len_u8 = u8::try_from(len)
+                .map_err(|_| crate::Error::Protocol("sql_variant: money length overflow".into()))?;
             let value = money::decode(&mut reader, len_u8).await?;
             if reader.remaining() != 0 {
                 return Err(crate::Error::Protocol(
@@ -1189,11 +1178,7 @@ async fn decode_variant_payload(
                     "sql_variant payload has trailing bytes".into(),
                 ));
             }
-            let ty = TypeInfo::VarLenSized(VarLenContext::new(
-                VarLenType::Datetimen,
-                len,
-                None,
-            ));
+            let ty = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Datetimen, len, None));
             Ok((ty, value))
         }
         _ => Err(crate::Error::Protocol(
@@ -1286,9 +1271,7 @@ impl<'a> ColumnData<'a> {
                 VarLenType::Decimaln
                 | VarLenType::Numericn
                 | VarLenType::Decimal
-                | VarLenType::Numeric => {
-                    ColumnData::Numeric(Numeric::decode(src, *scale).await?)
-                }
+                | VarLenType::Numeric => ColumnData::Numeric(Numeric::decode(src, *scale).await?),
                 _ => {
                     return Err(crate::Error::Protocol(
                         format!("unexpected precision type {:?}", ty).into(),
@@ -2112,11 +2095,7 @@ where
                     }
                     rows.push(row);
                 }
-                _ => {
-                    return Err(crate::Error::Protocol(
-                        "tvp: invalid row token".into(),
-                    ))
-                }
+                _ => return Err(crate::Error::Protocol("tvp: invalid row token".into())),
             }
         }
 
@@ -2165,9 +2144,7 @@ fn encode_tvp_value<'a>(
 
     for row in rows {
         if row.len() != columns.len() {
-            return Err(crate::Error::BulkInput(
-                "tvp: row length mismatch".into(),
-            ));
+            return Err(crate::Error::BulkInput("tvp: row length mismatch".into()));
         }
         dst.put_u8(TVP_ROW_TOKEN);
         for (value, column) in row.into_iter().zip(columns.iter()) {
@@ -2228,19 +2205,15 @@ fn encode_text_value<'a>(
 
     let bytes = match ty {
         VarLenType::Text => {
-            let collation = collation.ok_or_else(|| {
-                crate::Error::BulkInput("text: missing collation".into())
-            })?;
+            let collation = collation
+                .ok_or_else(|| crate::Error::BulkInput("text: missing collation".into()))?;
             let mut encoder = collation.encoding()?.new_encoder();
             let len = encoder
                 .max_buffer_length_from_utf8_without_replacement(value.len())
                 .unwrap();
             let mut buf = Vec::with_capacity(len);
-            let (res, _) = encoder.encode_from_utf8_to_vec_without_replacement(
-                value,
-                &mut buf,
-                true,
-            );
+            let (res, _) =
+                encoder.encode_from_utf8_to_vec_without_replacement(value, &mut buf, true);
             if let encoding_rs::EncoderResult::Unmappable(_) = res {
                 return Err(crate::Error::Encoding(
                     "text: unrepresentable character".into(),
@@ -2255,11 +2228,7 @@ fn encode_text_value<'a>(
             }
             buf
         }
-        _ => {
-            return Err(crate::Error::Protocol(
-                "text: unsupported type".into(),
-            ))
-        }
+        _ => return Err(crate::Error::Protocol("text: unsupported type".into())),
     };
 
     if bytes.len() > u32::MAX as usize {
@@ -2311,16 +2280,14 @@ fn encode_short_len_string<'a>(
         ));
     }
 
-    let collation = collation.ok_or_else(|| {
-        crate::Error::BulkInput("char/varchar: missing collation".into())
-    })?;
+    let collation = collation
+        .ok_or_else(|| crate::Error::BulkInput("char/varchar: missing collation".into()))?;
     let mut encoder = collation.encoding()?.new_encoder();
     let len = encoder
         .max_buffer_length_from_utf8_without_replacement(value.len())
         .unwrap();
     let mut bytes = Vec::with_capacity(len);
-    let (res, _) =
-        encoder.encode_from_utf8_to_vec_without_replacement(value, &mut bytes, true);
+    let (res, _) = encoder.encode_from_utf8_to_vec_without_replacement(value, &mut bytes, true);
     if let encoding_rs::EncoderResult::Unmappable(_) = res {
         return Err(crate::Error::Encoding(
             "char/varchar: unrepresentable character".into(),
@@ -2437,11 +2404,7 @@ mod tests {
                 name: "label".into(),
                 user_type: 0,
                 flags: ColumnFlag::Nullable.into(),
-                ty: TypeInfo::VarLenSized(VarLenContext::new(
-                    VarLenType::NVarchar,
-                    40,
-                    collation,
-                )),
+                ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::NVarchar, 40, collation)),
             },
         ];
         let rows = vec![
@@ -2453,9 +2416,7 @@ mod tests {
         ];
         // Type name/schema/db_name live in the TypeInfo header, not the TVP data
         // payload, so round-tripped TvpData always has empty names.
-        let tvp = TvpData::new("")
-            .columns(columns)
-            .rows(rows);
+        let tvp = TvpData::new("").columns(columns).rows(rows);
         test_round_trip(
             TypeInfo::Tvp(TvpInfo {
                 db_name: "db".into(),
@@ -3147,12 +3108,10 @@ mod tests {
     async fn ssvariant_typed_payload_round_trip() {
         let ty = TypeInfo::FixedLen(FixedLenType::Int4);
         let value = ColumnData::I32(Some(42));
-        let payload = VariantData::from_typed(ty.clone(), value.clone())
-            .expect("typed variant payload");
-        let (decoded_ty, decoded_value) = payload
-            .decode_typed()
-            .await
-            .expect("decode typed variant");
+        let payload =
+            VariantData::from_typed(ty.clone(), value.clone()).expect("typed variant payload");
+        let (decoded_ty, decoded_value) =
+            payload.decode_typed().await.expect("decode typed variant");
         assert_eq!(decoded_ty, ty);
         assert_eq!(decoded_value, value);
     }
@@ -3231,7 +3190,10 @@ mod tests {
         // Decode: first read the TypeInfo header, then decode the value
         let reader = &mut buf.into_sql_read_bytes();
         let ti = TypeInfo::decode(reader).await.expect("TypeInfo decode");
-        assert!(matches!(ti, TypeInfo::SsVariant(SsVariantInfo { max_len: 8016 })));
+        assert!(matches!(
+            ti,
+            TypeInfo::SsVariant(SsVariantInfo { max_len: 8016 })
+        ));
 
         let decoded = ColumnData::decode(reader, &ti)
             .await
@@ -3283,12 +3245,10 @@ mod tests {
                     )),
                 },
             ])
-            .rows(vec![
-                vec![
-                    ColumnData::I32(Some(1)),
-                    ColumnData::String(Some("hello".into())),
-                ],
-            ]);
+            .rows(vec![vec![
+                ColumnData::I32(Some(1)),
+                ColumnData::String(Some("hello".into())),
+            ]]);
 
         let mut buf = BytesMut::new();
         let mut dst = BytesMutWithTypeInfo::new(&mut buf);
@@ -3429,14 +3389,12 @@ mod tests {
         let cd = ColumnData::Variant(Some(variant.clone()));
 
         // FromSql (borrowed)
-        let result: Option<&VariantData<'static>> =
-            <&VariantData<'static>>::from_sql(&cd).unwrap();
+        let result: Option<&VariantData<'static>> = <&VariantData<'static>>::from_sql(&cd).unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().payload(), variant.payload());
 
         // FromSqlOwned
-        let result: Option<VariantData<'static>> =
-            VariantData::from_sql_owned(cd).unwrap();
+        let result: Option<VariantData<'static>> = VariantData::from_sql_owned(cd).unwrap();
         assert!(result.is_some());
     }
 
@@ -3457,14 +3415,12 @@ mod tests {
         let cd = ColumnData::Tvp(Some(tvp));
 
         // FromSql (borrowed)
-        let result: Option<&TvpData<'static>> =
-            <&TvpData<'static>>::from_sql(&cd).unwrap();
+        let result: Option<&TvpData<'static>> = <&TvpData<'static>>::from_sql(&cd).unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().rows.len(), 1);
 
         // FromSqlOwned
-        let result: Option<TvpData<'static>> =
-            TvpData::from_sql_owned(cd).unwrap();
+        let result: Option<TvpData<'static>> = TvpData::from_sql_owned(cd).unwrap();
         assert!(result.is_some());
     }
 }

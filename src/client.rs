@@ -642,9 +642,7 @@ where
             ReceivedToken::Error(e) => {
                 last_error.get_or_insert(crate::Error::Server(e));
             }
-            ReceivedToken::DoneInProc(ref done)
-                if !done.status().contains(DoneStatus::More) =>
-            {
+            ReceivedToken::DoneInProc(ref done) if !done.status().contains(DoneStatus::More) => {
                 if columns.is_some() {
                     results.push(std::mem::take(&mut current));
                     columns = None;

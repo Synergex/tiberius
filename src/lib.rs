@@ -266,8 +266,8 @@ mod result;
 mod row;
 mod tds;
 
-mod sql_browser;
 pub mod server;
+mod sql_browser;
 
 pub use client::{
     AuthMethod, CancellationToken, Client, Config, Cursor, CursorConcurrencyOptions, CursorHandle,
@@ -281,14 +281,14 @@ pub use result::*;
 pub use row::{Column, ColumnType, Row};
 pub use sql_browser::SqlBrowser;
 pub use tds::{
-        codec::{
-        AltMetaDataColumn, BaseMetaDataColumn, BulkLoadRequest, ColumnData, ColumnFlag, Encode,
-        FedAuthInfoOption, FixedLenType, IntoRow, LoginMessage, MetaDataColumn, PreloginMessage,
-        RpcOption, RpcProcId, RpcStatus, DoneStatus, SessionStateEntry, SsVariantInfo,
+    codec::{
+        AltMetaDataColumn, BaseMetaDataColumn, BulkLoadRequest, ColumnData, ColumnFlag, DoneStatus,
+        Encode, FedAuthInfoOption, FixedLenType, IntoRow, LoginMessage, MetaDataColumn,
+        PreloginMessage, RpcOption, RpcProcId, RpcStatus, SessionStateEntry, SsVariantInfo,
         TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
-        TokenEnvChange, TokenError, TokenFedAuthInfo, TokenFeatureExtAck, TokenInfo, TokenLoginAck,
+        TokenEnvChange, TokenError, TokenFeatureExtAck, TokenFedAuthInfo, TokenInfo, TokenLoginAck,
         TokenOrder, TokenReturnValue, TokenRow, TokenSessionState, TokenSspi, TokenTabName,
-        TypeInfo, TypeLength, TvpColumn, TvpData, TvpInfo, UdtData, UdtInfo, VarLenContext,
+        TvpColumn, TvpData, TvpInfo, TypeInfo, TypeLength, UdtData, UdtInfo, VarLenContext,
         VarLenType, VariantData,
     },
     numeric,

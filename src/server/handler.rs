@@ -66,10 +66,10 @@ use std::net::SocketAddr;
 
 use futures_util::sink::Sink;
 
-use crate::EncryptionLevel;
 use crate::server::messages::{AllHeaders, TdsBackendMessage, TransactionDescriptor};
 use crate::server::state::TdsConnectionState;
 use crate::tds::codec::FeatureLevel;
+use crate::EncryptionLevel;
 use crate::Result;
 
 /// Well-known connection metadata fields.

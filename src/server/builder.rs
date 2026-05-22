@@ -138,7 +138,9 @@ pub struct TdsServerBuilder<A, S, R, B, AT, E> {
     error: E,
 }
 
-impl Default for TdsServerBuilder<NotSet, NotSet, RejectRpc, RejectBulkLoad, NoOpAttention, NoOpError> {
+impl Default
+    for TdsServerBuilder<NotSet, NotSet, RejectRpc, RejectBulkLoad, NoOpAttention, NoOpError>
+{
     fn default() -> Self {
         Self::new()
     }
@@ -233,7 +235,10 @@ impl<A, S, R, B, AT, E> TdsServerBuilder<A, S, R, B, AT, E> {
     ///     .auth(my_auth_handler)
     ///     .query(my_query_handler);
     /// ```
-    pub fn query<H>(self, handler: H) -> TdsServerBuilder<A, Set<SimpleQueryAdapter<H>>, R, B, AT, E>
+    pub fn query<H>(
+        self,
+        handler: H,
+    ) -> TdsServerBuilder<A, Set<SimpleQueryAdapter<H>>, R, B, AT, E>
     where
         H: QueryHandler,
     {

@@ -176,10 +176,7 @@ impl Drop for PreparedStatement {
 }
 
 /// Build the RPC parameter list for `sp_execute`: `[@handle, @P1, @P2, ...]`.
-fn build_execute_params<'a>(
-    handle: PreparedHandle,
-    params: &[&'a dyn ToSql],
-) -> Vec<RpcParam<'a>> {
+fn build_execute_params<'a>(handle: PreparedHandle, params: &[&'a dyn ToSql]) -> Vec<RpcParam<'a>> {
     let mut rpc_params: Vec<RpcParam<'a>> = Vec::with_capacity(params.len() + 1);
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),

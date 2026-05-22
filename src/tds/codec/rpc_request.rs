@@ -180,11 +180,7 @@ mod tests {
 
     #[test]
     fn encode_named_proc_writes_utf16_length_prefixed() {
-        let req = TokenRpcRequest::new(
-            Cow::Borrowed("my_sp"),
-            Vec::new(),
-            [0; 8],
-        );
+        let req = TokenRpcRequest::new(Cow::Borrowed("my_sp"), Vec::new(), [0; 8]);
         let mut buf = BytesMut::new();
         req.encode(&mut buf).unwrap();
 

@@ -411,8 +411,9 @@ mod tests {
             mk_done_proc_final(),
         ]);
 
-        let (outputs, status, metadata) =
-            collect_rpc_outputs_with_metadata_from_stream(s).await.unwrap();
+        let (outputs, status, metadata) = collect_rpc_outputs_with_metadata_from_stream(s)
+            .await
+            .unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].get::<i32>().unwrap(), Some(42));

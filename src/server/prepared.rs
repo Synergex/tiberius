@@ -154,7 +154,7 @@ impl Default for ProcedureCacheConfig {
     fn default() -> Self {
         Self {
             max_capacity: 1000,
-            max_age: Duration::from_secs(60 * 60),      // 1 hour
+            max_age: Duration::from_secs(60 * 60), // 1 hour
             idle_timeout: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
@@ -475,11 +475,7 @@ mod tests {
     fn procedure_cache_prepare_and_get() {
         let mut cache = ProcedureCache::new(1);
 
-        let handle = cache.prepare(
-            "SELECT 1".to_string(),
-            vec![],
-            vec![],
-        );
+        let handle = cache.prepare("SELECT 1".to_string(), vec![], vec![]);
 
         assert!(cache.contains(&handle));
         assert_eq!(cache.len(), 1);
@@ -495,7 +491,11 @@ mod tests {
 
         let handle = cache.prepare(
             "SELECT @p1".to_string(),
-            vec![TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None))],
+            vec![TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::Intn,
+                4,
+                None,
+            ))],
             vec!["@p1".to_string()],
         );
 
@@ -590,11 +590,7 @@ mod tests {
 
     #[test]
     fn prepared_statement_record_execution() {
-        let mut stmt = PreparedStatement::new(
-            "SELECT 1".to_string(),
-            vec![],
-            vec![],
-        );
+        let mut stmt = PreparedStatement::new("SELECT 1".to_string(), vec![], vec![]);
 
         assert_eq!(stmt.execution_count, 0);
 

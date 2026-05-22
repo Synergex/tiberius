@@ -603,7 +603,11 @@ mod tests {
         use crate::tds::codec::RpcStatus;
         DecodedRpcParam {
             name: name.to_string(),
-            flags: if output { RpcStatus::ByRefValue.into() } else { BitFlags::empty() },
+            flags: if output {
+                RpcStatus::ByRefValue.into()
+            } else {
+                BitFlags::empty()
+            },
             ty: TypeInfo::FixedLen(FixedLenType::Int4),
             value: ColumnData::I32(value),
         }

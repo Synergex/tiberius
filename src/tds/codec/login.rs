@@ -480,8 +480,7 @@ impl<'a> Decode<BytesMut> for LoginMessage<'a> {
             BitFlags::from_bits(cursor.read_u8()?).expect("option_flags_1 verification");
         ret.option_flags_2 =
             BitFlags::from_bits(cursor.read_u8()?).expect("option_flags_2 verification");
-        ret.type_flags =
-            BitFlags::from_bits(cursor.read_u8()?).expect("type_flags verification");
+        ret.type_flags = BitFlags::from_bits(cursor.read_u8()?).expect("type_flags verification");
         ret.option_flags_3 =
             BitFlags::from_bits(cursor.read_u8()?).expect("option_flags_3 verification");
 

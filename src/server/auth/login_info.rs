@@ -30,7 +30,11 @@ impl LoginInfo {
         let hostname = login.hostname_ref().trim();
 
         Self {
-            user: if user.is_empty() { None } else { Some(user.to_string()) },
+            user: if user.is_empty() {
+                None
+            } else {
+                Some(user.to_string())
+            },
             database: if database.is_empty() {
                 None
             } else {

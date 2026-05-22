@@ -1,6 +1,6 @@
 use crate::{tds::codec::Encode, tds::Collation, Error, SqlReadBytes, TokenType};
-use bytes::{BufMut, BytesMut};
 use byteorder::{LittleEndian, ReadBytesExt};
+use bytes::{BufMut, BytesMut};
 use fmt::Debug;
 use futures_util::io::AsyncReadExt;
 use std::{
@@ -502,7 +502,9 @@ fn read_b_varbyte(buf: &mut Cursor<Vec<u8>>) -> crate::Result<Vec<u8>> {
 
 fn parse_tx_descriptor(bytes: Vec<u8>) -> crate::Result<[u8; 8]> {
     if bytes.len() != 8 {
-        return Err(Error::Protocol("invalid transaction descriptor length".into()));
+        return Err(Error::Protocol(
+            "invalid transaction descriptor length".into(),
+        ));
     }
     let mut desc = [0u8; 8];
     desc.copy_from_slice(&bytes);

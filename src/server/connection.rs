@@ -22,10 +22,10 @@ use crate::tds::codec::{
     DoneStatus, Encode, FeatureLevel, Packet, PacketHeader, PacketStatus, PacketType, TokenDone,
     TokenEnvChange,
 };
-use std::sync::Arc;
 use crate::tds::Context as TdsContext;
-use crate::Error;
 use crate::EncryptionLevel;
+use crate::Error;
+use std::sync::Arc;
 
 /// Buffer size for read/write operations.
 const BUFFER_SIZE: usize = 8192;
@@ -292,7 +292,11 @@ impl<S: NetStream> TdsConnection<S> {
             TdsBackendMessage::Prelogin(message) => {
                 let mut payload = BytesMut::new();
                 message.encode(&mut payload)?;
-                let packet_type = match self.metadata.custom.get("prelogin_packet_type").map(String::as_str)
+                let packet_type = match self
+                    .metadata
+                    .custom
+                    .get("prelogin_packet_type")
+                    .map(String::as_str)
                 {
                     Some("tabular") => PacketType::TabularResult,
                     _ => PacketType::PreLogin,
@@ -320,7 +324,9 @@ impl<S: NetStream> TdsConnection<S> {
                 self.write_payload_as_packets(PacketType::TabularResult, payload, false)?;
                 Ok(())
             }
-            TdsBackendMessage::Packet(packet) => self.codec.encode(TdsBackendMessage::Packet(packet), &mut self.write_buf),
+            TdsBackendMessage::Packet(packet) => self
+                .codec
+                .encode(TdsBackendMessage::Packet(packet), &mut self.write_buf),
         }
     }
 
@@ -433,30 +439,24 @@ impl<S: NetStream> TdsConnection<S> {
                 token.encode_with_columns(payload, &meta.columns)
             }
             BackendToken::Order(token) => token.encode(payload),
-            BackendToken::Done(token) => {
-                self.encode_done_token(
-                    token,
-                    crate::tds::codec::TokenType::Done,
-                    payload,
-                    done_row_count_bytes,
-                )
-            }
-            BackendToken::DoneProc(token) => {
-                self.encode_done_token(
-                    token,
-                    crate::tds::codec::TokenType::DoneProc,
-                    payload,
-                    done_row_count_bytes,
-                )
-            }
-            BackendToken::DoneInProc(token) => {
-                self.encode_done_token(
-                    token,
-                    crate::tds::codec::TokenType::DoneInProc,
-                    payload,
-                    done_row_count_bytes,
-                )
-            }
+            BackendToken::Done(token) => self.encode_done_token(
+                token,
+                crate::tds::codec::TokenType::Done,
+                payload,
+                done_row_count_bytes,
+            ),
+            BackendToken::DoneProc(token) => self.encode_done_token(
+                token,
+                crate::tds::codec::TokenType::DoneProc,
+                payload,
+                done_row_count_bytes,
+            ),
+            BackendToken::DoneInProc(token) => self.encode_done_token(
+                token,
+                crate::tds::codec::TokenType::DoneInProc,
+                payload,
+                done_row_count_bytes,
+            ),
             BackendToken::ReturnStatus(status) => {
                 payload.put_u8(crate::tds::codec::TokenType::ReturnStatus as u8);
                 payload.put_u32_le(status);
@@ -478,8 +478,8 @@ impl<S: NetStream> TdsConnection<S> {
         if !self.message_in_progress {
             self.context.reset_packet_id();
         }
-        let packet_size = (self.context.packet_size() as usize)
-            .saturating_sub(crate::tds::codec::HEADER_BYTES);
+        let packet_size =
+            (self.context.packet_size() as usize).saturating_sub(crate::tds::codec::HEADER_BYTES);
 
         if packet_size == 0 {
             return Err(Error::Protocol("invalid packet size".into()));
@@ -585,7 +585,9 @@ impl<S: NetStream> TdsConnectionContext for TdsConnection<S> {
         TdsConnection::clear_attention(self);
     }
 
-    fn poll_attention<'a>(&'a mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Error>> + Send + 'a>>
+    fn poll_attention<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Error>> + Send + 'a>>
     where
         Self: Sized,
     {
@@ -637,9 +639,7 @@ impl<S: NetStream> Sink<TdsBackendMessage> for TdsConnection<S> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.get_mut()
-            .poll_flush_buf(cx)
-            .map_err(Into::into)
+        self.get_mut().poll_flush_buf(cx).map_err(Into::into)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

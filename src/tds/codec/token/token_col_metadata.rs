@@ -264,7 +264,10 @@ impl Encode<BytesMut> for BaseMetaDataColumn {
         dst.put_u16_le(BitFlags::bits(self.flags));
         let table_parts = match &self.ty {
             TypeInfo::VarLenSized(cx)
-                if matches!(cx.r#type(), VarLenType::Text | VarLenType::NText | VarLenType::Image) =>
+                if matches!(
+                    cx.r#type(),
+                    VarLenType::Text | VarLenType::NText | VarLenType::Image
+                ) =>
             {
                 Some(self.table_name.as_deref().unwrap_or(&[]))
             }
