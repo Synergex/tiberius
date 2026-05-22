@@ -6,7 +6,7 @@ use std::{
 use crate::{
     error::Error,
     tds::codec::{Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
-    Column, ColumnData, ColumnType, SqlReadBytes,
+    Column, ColumnData, SqlReadBytes,
 };
 use asynchronous_codec::BytesMut;
 use bytes::BufMut;
@@ -45,14 +45,10 @@ impl<'a> Display for MetaDataColumn<'a> {
             TypeInfo::VarLenSized(ctx) => match ctx.r#type() {
                 VarLenType::Bitn => write!(f, "bit")?,
                 VarLenType::Guid => write!(f, "uniqueidentifier")?,
-                #[cfg(feature = "tds73")]
                 VarLenType::Daten => write!(f, "date")?,
-                #[cfg(feature = "tds73")]
                 VarLenType::Timen => write!(f, "time")?,
-                #[cfg(feature = "tds73")]
                 VarLenType::Datetime2 => write!(f, "datetime2({})", ctx.len())?,
                 VarLenType::Datetimen => write!(f, "datetime")?,
-                #[cfg(feature = "tds73")]
                 VarLenType::DatetimeOffsetn => write!(f, "datetimeoffset")?,
                 VarLenType::BigVarBin => {
                     if ctx.len() <= 8000 {
@@ -61,6 +57,7 @@ impl<'a> Display for MetaDataColumn<'a> {
                         write!(f, "varbinary(max)")?
                     }
                 }
+                VarLenType::VarBinary => write!(f, "varbinary({})", ctx.len())?,
                 VarLenType::BigVarChar => {
                     if ctx.len() <= 8000 {
                         write!(f, "varchar({})", ctx.len())?
@@ -68,8 +65,11 @@ impl<'a> Display for MetaDataColumn<'a> {
                         write!(f, "varchar(max)")?
                     }
                 }
+                VarLenType::VarChar => write!(f, "varchar({})", ctx.len())?,
                 VarLenType::BigBinary => write!(f, "binary({})", ctx.len())?,
                 VarLenType::BigChar => write!(f, "char({})", ctx.len())?,
+                VarLenType::Binary => write!(f, "binary({})", ctx.len())?,
+                VarLenType::Char => write!(f, "char({})", ctx.len())?,
                 VarLenType::NVarchar => {
                     if ctx.len() <= 4000 {
                         write!(f, "nvarchar({})", ctx.len())?
@@ -101,11 +101,16 @@ impl<'a> Display for MetaDataColumn<'a> {
                 precision,
                 scale,
             } => match ty {
+                VarLenType::Decimal => write!(f, "decimal({},{})", precision, scale)?,
                 VarLenType::Decimaln => write!(f, "decimal({},{})", precision, scale)?,
+                VarLenType::Numeric => write!(f, "numeric({},{})", precision, scale)?,
                 VarLenType::Numericn => write!(f, "numeric({},{})", precision, scale)?,
                 _ => unreachable!(),
             },
             TypeInfo::Xml { .. } => write!(f, "xml")?,
+            TypeInfo::Udt(_) => write!(f, "udt")?,
+            TypeInfo::SsVariant(_) => write!(f, "sql_variant")?,
+            TypeInfo::Tvp(_) => write!(f, "tvp")?,
         }
 
         Ok(())
@@ -114,8 +119,10 @@ impl<'a> Display for MetaDataColumn<'a> {
 
 #[derive(Debug, Clone)]
 pub struct BaseMetaDataColumn {
+    pub user_type: u32,
     pub flags: BitFlags<ColumnFlag>,
     pub ty: TypeInfo,
+    pub table_name: Option<Vec<String>>,
 }
 
 impl BaseMetaDataColumn {
@@ -144,7 +151,9 @@ impl BaseMetaDataColumn {
                     _ => ColumnData::I64(None),
                 },
                 VarLenType::Bitn => ColumnData::Bit(None),
+                VarLenType::Decimal => ColumnData::Numeric(None),
                 VarLenType::Decimaln => ColumnData::Numeric(None),
+                VarLenType::Numeric => ColumnData::Numeric(None),
                 VarLenType::Numericn => ColumnData::Numeric(None),
                 VarLenType::Floatn => match cx.len() {
                     4 => ColumnData::F32(None),
@@ -152,43 +161,42 @@ impl BaseMetaDataColumn {
                 },
                 VarLenType::Money => ColumnData::F64(None),
                 VarLenType::Datetimen => ColumnData::DateTime(None),
-                #[cfg(feature = "tds73")]
                 VarLenType::Daten => ColumnData::Date(None),
-                #[cfg(feature = "tds73")]
                 VarLenType::Timen => ColumnData::Time(None),
-                #[cfg(feature = "tds73")]
                 VarLenType::Datetime2 => ColumnData::DateTime2(None),
-                #[cfg(feature = "tds73")]
                 VarLenType::DatetimeOffsetn => ColumnData::DateTimeOffset(None),
                 VarLenType::BigVarBin => ColumnData::Binary(None),
                 VarLenType::BigVarChar => ColumnData::String(None),
+                VarLenType::VarBinary => ColumnData::Binary(None),
+                VarLenType::VarChar => ColumnData::String(None),
                 VarLenType::BigBinary => ColumnData::Binary(None),
                 VarLenType::BigChar => ColumnData::String(None),
+                VarLenType::Binary => ColumnData::Binary(None),
+                VarLenType::Char => ColumnData::String(None),
                 VarLenType::NVarchar => ColumnData::String(None),
                 VarLenType::NChar => ColumnData::String(None),
                 VarLenType::Xml => ColumnData::Xml(None),
-                VarLenType::Udt => todo!("User-defined types not supported"),
+                VarLenType::Udt => ColumnData::Udt(None),
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
                 VarLenType::NText => ColumnData::String(None),
-                VarLenType::SSVariant => todo!(),
+                VarLenType::SSVariant => ColumnData::Variant(None),
+                VarLenType::Tvp => ColumnData::Tvp(None),
             },
             TypeInfo::VarLenSizedPrecision { ty, .. } => match ty {
                 VarLenType::Guid => ColumnData::Guid(None),
                 VarLenType::Intn => ColumnData::I32(None),
                 VarLenType::Bitn => ColumnData::Bit(None),
+                VarLenType::Decimal => ColumnData::Numeric(None),
                 VarLenType::Decimaln => ColumnData::Numeric(None),
+                VarLenType::Numeric => ColumnData::Numeric(None),
                 VarLenType::Numericn => ColumnData::Numeric(None),
                 VarLenType::Floatn => ColumnData::F32(None),
                 VarLenType::Money => ColumnData::F64(None),
                 VarLenType::Datetimen => ColumnData::DateTime(None),
-                #[cfg(feature = "tds73")]
                 VarLenType::Daten => ColumnData::Date(None),
-                #[cfg(feature = "tds73")]
                 VarLenType::Timen => ColumnData::Time(None),
-                #[cfg(feature = "tds73")]
                 VarLenType::Datetime2 => ColumnData::DateTime2(None),
-                #[cfg(feature = "tds73")]
                 VarLenType::DatetimeOffsetn => ColumnData::DateTimeOffset(None),
                 VarLenType::BigVarBin => ColumnData::Binary(None),
                 VarLenType::BigVarChar => ColumnData::String(None),
@@ -197,13 +205,21 @@ impl BaseMetaDataColumn {
                 VarLenType::NVarchar => ColumnData::String(None),
                 VarLenType::NChar => ColumnData::String(None),
                 VarLenType::Xml => ColumnData::Xml(None),
-                VarLenType::Udt => todo!("User-defined types not supported"),
+                VarLenType::Udt => ColumnData::Udt(None),
                 VarLenType::Text => ColumnData::String(None),
                 VarLenType::Image => ColumnData::Binary(None),
                 VarLenType::NText => ColumnData::String(None),
-                VarLenType::SSVariant => todo!(),
+                VarLenType::SSVariant => ColumnData::Variant(None),
+                VarLenType::Tvp => ColumnData::Tvp(None),
+                VarLenType::VarBinary => ColumnData::Binary(None),
+                VarLenType::VarChar => ColumnData::String(None),
+                VarLenType::Binary => ColumnData::Binary(None),
+                VarLenType::Char => ColumnData::String(None),
             },
             TypeInfo::Xml { .. } => ColumnData::Xml(None),
+            TypeInfo::Udt(_) => ColumnData::Udt(None),
+            TypeInfo::SsVariant(_) => ColumnData::Variant(None),
+            TypeInfo::Tvp(_) => ColumnData::Tvp(None),
         }
     }
 }
@@ -223,7 +239,6 @@ impl<'a> Encode<BytesMut> for TokenColMetaData<'a> {
 
 impl<'a> Encode<BytesMut> for MetaDataColumn<'a> {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
-        dst.put_u32_le(0);
         self.base.encode(dst)?;
 
         let len_pos = dst.len();
@@ -245,8 +260,28 @@ impl<'a> Encode<BytesMut> for MetaDataColumn<'a> {
 
 impl Encode<BytesMut> for BaseMetaDataColumn {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+        dst.put_u32_le(self.user_type);
         dst.put_u16_le(BitFlags::bits(self.flags));
+        let table_parts = match &self.ty {
+            TypeInfo::VarLenSized(cx)
+                if matches!(cx.r#type(), VarLenType::Text | VarLenType::NText | VarLenType::Image) =>
+            {
+                Some(self.table_name.as_deref().unwrap_or(&[]))
+            }
+            _ => None,
+        };
+
         self.ty.encode(dst)?;
+
+        if let Some(parts) = table_parts {
+            if parts.len() > u8::MAX as usize {
+                return Err(Error::Protocol("table name has too many components".into()));
+            }
+            dst.put_u8(parts.len() as u8);
+            for part in parts {
+                crate::tds::codec::write_us_varchar(dst, part)?;
+            }
+        }
 
         Ok(())
     }
@@ -312,10 +347,10 @@ impl TokenColMetaData<'static> {
 
 impl<'a> TokenColMetaData<'a> {
     pub(crate) fn columns(&self) -> impl Iterator<Item = Column> + '_ {
-        self.columns.iter().map(|x| Column {
-            name: x.col_name.to_string(),
-            column_type: ColumnType::from(&x.base.ty),
-        })
+        self.columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, column)| Column::from_metadata(ordinal, column))
     }
 }
 
@@ -326,24 +361,34 @@ impl BaseMetaDataColumn {
     {
         use VarLenType::*;
 
-        let _user_ty = src.read_u32_le().await?;
+        let user_type = src.read_u32_le().await?;
 
         let flags = BitFlags::from_bits(src.read_u16_le().await?)
             .map_err(|_| Error::Protocol("column metadata: invalid flags".into()))?;
 
         let ty = TypeInfo::decode(src).await?;
+        let mut table_name = None;
 
-        if let TypeInfo::VarLenSized(cx) = ty {
+        if let TypeInfo::VarLenSized(cx) = &ty {
             if let Text | NText | Image = cx.r#type() {
                 let num_of_parts = src.read_u8().await?;
-
-                // table name
-                for _ in 0..num_of_parts {
-                    src.read_us_varchar().await?;
+                if num_of_parts > 0 {
+                    let mut parts = Vec::with_capacity(num_of_parts as usize);
+                    for _ in 0..num_of_parts {
+                        parts.push(src.read_us_varchar().await?);
+                    }
+                    table_name = Some(parts);
+                } else {
+                    table_name = Some(Vec::new());
                 }
             };
         };
 
-        Ok(BaseMetaDataColumn { flags, ty })
+        Ok(BaseMetaDataColumn {
+            user_type,
+            flags,
+            ty,
+            table_name,
+        })
     }
 }

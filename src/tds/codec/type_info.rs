@@ -30,6 +30,30 @@ pub enum TypeInfo {
         schema: Option<Arc<XmlSchema>>,
         size: usize,
     },
+    Udt(UdtInfo),
+    SsVariant(SsVariantInfo),
+    Tvp(TvpInfo),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdtInfo {
+    pub max_len: u16,
+    pub db_name: String,
+    pub schema: String,
+    pub type_name: String,
+    pub assembly_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsVariantInfo {
+    pub max_len: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TvpInfo {
+    pub db_name: String,
+    pub schema: String,
+    pub type_name: String,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -68,23 +92,46 @@ impl Encode<BytesMut> for VarLenContext {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
         dst.put_u8(self.r#type() as u8);
 
+        let requires_collation = matches!(
+            self.r#type,
+            VarLenType::Text
+                | VarLenType::NText
+                | VarLenType::Char
+                | VarLenType::VarChar
+                | VarLenType::BigChar
+                | VarLenType::NChar
+                | VarLenType::NVarchar
+                | VarLenType::BigVarChar
+        );
+        if requires_collation && self.collation().is_none() {
+            return Err(Error::Protocol(
+                format!("type info missing collation for {:?}", self.r#type).into(),
+            ));
+        }
+
         // length
         match self.r#type {
-            #[cfg(feature = "tds73")]
-            VarLenType::Daten
-            | VarLenType::Timen
-            | VarLenType::DatetimeOffsetn
-            | VarLenType::Datetime2 => {
+            VarLenType::Daten => (),
+            VarLenType::Timen | VarLenType::DatetimeOffsetn | VarLenType::Datetime2 => {
                 dst.put_u8(self.len() as u8);
             }
             VarLenType::Bitn
             | VarLenType::Intn
             | VarLenType::Floatn
+            | VarLenType::VarBinary
+            | VarLenType::VarChar
+            | VarLenType::Binary
+            | VarLenType::Char
             | VarLenType::Decimaln
             | VarLenType::Numericn
             | VarLenType::Guid
             | VarLenType::Money
             | VarLenType::Datetimen => {
+                if self.len() > u8::MAX as usize {
+                    return Err(Error::Protocol(
+                        format!("type info length {} exceeds 1-byte limit", self.len()).into(),
+                    ));
+                }
                 dst.put_u8(self.len() as u8);
             }
             VarLenType::NChar
@@ -99,7 +146,11 @@ impl Encode<BytesMut> for VarLenContext {
                 dst.put_u32_le(self.len() as u32);
             }
             VarLenType::Xml => (),
-            typ => todo!("encoding {:?} is not supported yet", typ),
+            typ => {
+                return Err(Error::Protocol(
+                    format!("type info encoding unsupported for {:?}", typ).into(),
+                ))
+            }
         }
 
         if let Some(collation) = self.collation() {
@@ -129,52 +180,19 @@ uint_enum! {
     }
 }
 
-#[cfg(not(feature = "tds73"))]
 uint_enum! {
     /// 2.2.5.4.2
     #[repr(u8)]
     pub enum VarLenType {
         Guid = 0x24,
+        VarBinary = 0x25,
         Intn = 0x26,
+        VarChar = 0x27,
         Bitn = 0x68,
+        Decimal = 0x37,
         Decimaln = 0x6A,
         Numericn = 0x6C,
-        Floatn = 0x6D,
-        Money = 0x6E,
-        Datetimen = 0x6F,
-        BigVarBin = 0xA5,
-        BigVarChar = 0xA7,
-        BigBinary = 0xAD,
-        BigChar = 0xAF,
-        NVarchar = 0xE7,
-        NChar = 0xEF,
-        Xml = 0xF1,
-        // not supported yet
-        Udt = 0xF0,
-        Text = 0x23,
-        Image = 0x22,
-        NText = 0x63,
-        // not supported yet
-        SSVariant = 0x62, // legacy types (not supported since post-7.2):
-                          // Char = 0x2F,
-                          // Binary = 0x2D,
-                          // VarBinary = 0x25,
-                          // VarChar = 0x27,
-                          // Numeric = 0x3F,
-                          // Decimal = 0x37
-    }
-}
-
-#[cfg(feature = "tds73")]
-uint_enum! {
-    /// 2.2.5.4.2
-    #[repr(u8)]
-    pub enum VarLenType {
-        Guid = 0x24,
-        Intn = 0x26,
-        Bitn = 0x68,
-        Decimaln = 0x6A,
-        Numericn = 0x6C,
+        Numeric = 0x3F,
         Floatn = 0x6D,
         Money = 0x6E,
         Datetimen = 0x6F,
@@ -182,6 +200,8 @@ uint_enum! {
         Timen = 0x29,
         Datetime2 = 0x2A,
         DatetimeOffsetn = 0x2B,
+        Binary = 0x2D,
+        Char = 0x2F,
         BigVarBin = 0xA5,
         BigVarChar = 0xA7,
         BigBinary = 0xAD,
@@ -190,19 +210,14 @@ uint_enum! {
         NChar = 0xEF,
         Xml = 0xF1,
         // not supported yet
-        Udt = 0xF0,
-        Text = 0x23,
-        Image = 0x22,
-        NText = 0x63,
-        // not supported yet
-        SSVariant = 0x62, // legacy types (not supported since post-7.2):
-                          // Char = 0x2F,
-                          // Binary = 0x2D,
-                          // VarBinary = 0x25,
-                          // VarChar = 0x27,
-                          // Numeric = 0x3F,
-                          // Decimal = 0x37
-    }
+    Udt = 0xF0,
+    Text = 0x23,
+    Image = 0x22,
+    NText = 0x63,
+    // not supported yet
+    SSVariant = 0x62,
+    Tvp = 0xF3,
+}
 }
 
 impl Encode<BytesMut> for TypeInfo {
@@ -250,6 +265,24 @@ impl Encode<BytesMut> for TypeInfo {
                     dst.put_u8(0);
                 }
             }
+            TypeInfo::Udt(info) => {
+                dst.put_u8(VarLenType::Udt as u8);
+                dst.put_u16_le(info.max_len);
+                crate::tds::codec::token::write_b_varchar(dst, &info.db_name)?;
+                crate::tds::codec::token::write_b_varchar(dst, &info.schema)?;
+                crate::tds::codec::token::write_b_varchar(dst, &info.type_name)?;
+                crate::tds::codec::token::write_us_varchar(dst, &info.assembly_name)?;
+            }
+            TypeInfo::SsVariant(info) => {
+                dst.put_u8(VarLenType::SSVariant as u8);
+                dst.put_u32_le(info.max_len);
+            }
+            TypeInfo::Tvp(info) => {
+                dst.put_u8(VarLenType::Tvp as u8);
+                crate::tds::codec::token::write_b_varchar(dst, &info.db_name)?;
+                crate::tds::codec::token::write_b_varchar(dst, &info.schema)?;
+                crate::tds::codec::token::write_b_varchar(dst, &info.type_name)?;
+            }
         }
 
         Ok(())
@@ -289,17 +322,51 @@ impl TypeInfo {
                     size: 0xfffffffffffffffe_usize,
                 })
             }
+            Ok(VarLenType::Udt) => {
+                let max_len = src.read_u16_le().await?;
+                let db_name = src.read_b_varchar().await?;
+                let schema = src.read_b_varchar().await?;
+                let type_name = src.read_b_varchar().await?;
+                let assembly_name = src.read_us_varchar().await?;
+
+                Ok(TypeInfo::Udt(UdtInfo {
+                    max_len,
+                    db_name,
+                    schema,
+                    type_name,
+                    assembly_name,
+                }))
+            }
+            Ok(VarLenType::SSVariant) => {
+                let max_len = src.read_u32_le().await?;
+                Ok(TypeInfo::SsVariant(SsVariantInfo { max_len }))
+            }
+            Ok(VarLenType::Tvp) => {
+                let db_name = src.read_b_varchar().await?;
+                let schema = src.read_b_varchar().await?;
+                let type_name = src.read_b_varchar().await?;
+
+                Ok(TypeInfo::Tvp(TvpInfo {
+                    db_name,
+                    schema,
+                    type_name,
+                }))
+            }
             Ok(ty) => {
                 let len = match ty {
-                    #[cfg(feature = "tds73")]
                     VarLenType::Timen | VarLenType::DatetimeOffsetn | VarLenType::Datetime2 => {
                         src.read_u8().await? as usize
                     }
-                    #[cfg(feature = "tds73")]
                     VarLenType::Daten => 3,
                     VarLenType::Bitn
                     | VarLenType::Intn
                     | VarLenType::Floatn
+                    | VarLenType::VarBinary
+                    | VarLenType::VarChar
+                    | VarLenType::Binary
+                    | VarLenType::Char
+                    | VarLenType::Decimal
+                    | VarLenType::Numeric
                     | VarLenType::Decimaln
                     | VarLenType::Numericn
                     | VarLenType::Guid
@@ -314,12 +381,18 @@ impl TypeInfo {
                     VarLenType::Image | VarLenType::Text | VarLenType::NText => {
                         src.read_u32_le().await? as usize
                     }
-                    _ => todo!("not yet implemented for {:?}", ty),
+                    _ => {
+                        return Err(Error::Protocol(
+                            format!("type info decode unsupported for {:?}", ty).into(),
+                        ))
+                    }
                 };
 
                 let collation = match ty {
                     VarLenType::NText
                     | VarLenType::Text
+                    | VarLenType::Char
+                    | VarLenType::VarChar
                     | VarLenType::BigChar
                     | VarLenType::NChar
                     | VarLenType::NVarchar
@@ -333,7 +406,10 @@ impl TypeInfo {
                 };
 
                 let vty = match ty {
-                    VarLenType::Decimaln | VarLenType::Numericn => {
+                    VarLenType::Decimaln
+                    | VarLenType::Numericn
+                    | VarLenType::Decimal
+                    | VarLenType::Numeric => {
                         let precision = src.read_u8().await?;
                         let scale = src.read_u8().await?;
 
@@ -374,12 +450,37 @@ mod tests {
                 schema: None,
                 size: 0xfffffffffffffffe_usize,
             },
+            TypeInfo::Udt(UdtInfo {
+                max_len: 1024,
+                db_name: "db".into(),
+                schema: "dbo".into(),
+                type_name: "udt_type".into(),
+                assembly_name: "udt_assembly".into(),
+            }),
+            TypeInfo::SsVariant(SsVariantInfo { max_len: 8016 }),
+            TypeInfo::Tvp(TvpInfo {
+                db_name: "db".into(),
+                schema: "dbo".into(),
+                type_name: "udt_table".into(),
+            }),
             TypeInfo::FixedLen(FixedLenType::Int4),
             TypeInfo::VarLenSized(VarLenContext::new(
                 VarLenType::NChar,
                 40,
                 Some(Collation::new(13632521, 52)),
             )),
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::VarChar,
+                32,
+                Some(Collation::new(13632521, 52)),
+            )),
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::VarBinary, 32, None)),
+            TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Decimal,
+                size: 5,
+                precision: 9,
+                scale: 2,
+            },
         ];
 
         for ti in types {

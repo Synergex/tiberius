@@ -1,5 +1,5 @@
-use crate::{sql_read_bytes::SqlReadBytes, tds::codec::Encode};
-use bytes::BytesMut;
+use crate::{sql_read_bytes::SqlReadBytes, tds::codec::Encode, Error, TokenType};
+use bytes::{BufMut, BytesMut};
 use futures_util::io::AsyncReadExt;
 
 #[derive(Debug)]
@@ -17,6 +17,11 @@ impl TokenSspi {
         Self(bytes)
     }
 
+    /// Create an SSPI token from raw bytes.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
     pub(crate) async fn decode_async<R>(src: &mut R) -> crate::Result<Self>
     where
         R: SqlReadBytes + Unpin,
@@ -31,7 +36,12 @@ impl TokenSspi {
 
 impl Encode<BytesMut> for TokenSspi {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
-        dst.extend(self.0);
+        if self.0.len() > u16::MAX as usize {
+            return Err(Error::Protocol("sspi: payload too large".into()));
+        }
+        dst.put_u8(TokenType::Sspi as u8);
+        dst.put_u16_le(self.0.len() as u16);
+        dst.extend_from_slice(&self.0);
         Ok(())
     }
 }

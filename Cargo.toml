@@ -23,6 +23,15 @@ path = "tests/query.rs"
 name = "query"
 
 [[test]]
+path = "tests/rpc_helpers.rs"
+name = "rpc_helpers"
+required-features = ["server-smol"]
+
+[[test]]
+path = "tests/rpc_helpers_live.rs"
+name = "rpc_helpers_live"
+
+[[test]]
 path = "tests/named-instance-async.rs"
 name = "named-instance-async"
 required-features = ["sql-browser-async-std"]
@@ -61,6 +70,10 @@ libgssapi = { version = "0.8.1", optional = true, default-features = false }
 [dependencies.async-native-tls]
 version = "0.4"
 features = ["runtime-async-std"]
+optional = true
+
+[dependencies.async-rustls]
+version = "0.4"
 optional = true
 
 [dependencies.tokio]
@@ -174,6 +187,7 @@ paste = "1.0"
 indicatif = "0.17"
 chrono = "0.4.38"
 indoc = "1.0.7"
+smol = "1"
 
 [package.metadata.docs.rs]
 features = ["all", "docs"]
@@ -182,21 +196,23 @@ features = ["all", "docs"]
 all = [
     "chrono",
     "time",
-    "tds73",
     "sql-browser-async-std",
     "sql-browser-tokio",
     "sql-browser-smol",
+    "server-smol",
+    "server-rustls",
     "integrated-auth-gssapi",
     "rust_decimal",
     "bigdecimal",
     "native-tls",
 ]
-default = ["tds73", "winauth", "native-tls"]
-tds73 = []
+default = ["winauth", "native-tls"]
 docs = []
 sql-browser-async-std = ["async-std"]
 sql-browser-tokio = ["tokio", "tokio-util"]
 sql-browser-smol = ["async-io", "async-net", "futures-lite"]
+server-smol = ["async-io", "async-net", "futures-lite"]
+server-rustls = ["async-rustls", "rustls-pemfile"]
 integrated-auth-gssapi = ["libgssapi"]
 bigdecimal = ["bigdecimal_"]
 rustls = ["tokio-rustls", "tokio-util", "rustls-pemfile", "rustls-native-certs"]

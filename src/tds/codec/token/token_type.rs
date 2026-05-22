@@ -1,6 +1,9 @@
 uint_enum! {
     /// Types of tokens in a token stream. Read from the first byte of the stream.
     pub enum TokenType {
+        /// Alternate metadata token (compute result set metadata).
+        AltMetaData = 0x88,
+
         /// Used to send the status value of an RPC to the client. The server
         /// also uses this token to send the result status value of a stored
         /// procedure executed through SQL Batch.
@@ -8,6 +11,9 @@ uint_enum! {
         /// This token MUST be returned to the client when an RPC is executed by
         /// the server.
         ReturnStatus = 0x79,
+
+        /// Legacy column names token.
+        ColName = 0xA0,
 
         /// Describes the result setfor interpretation of following ROW data
         /// streams
@@ -24,6 +30,9 @@ uint_enum! {
 
         /// Describes the column information in browse mode.
         ColInfo = 0xA5,
+
+        /// Table names token used with browse mode metadata.
+        TabName = 0xA4,
 
         /// Used to send the return value of an RPCto the client. When an RPC is
         /// executed, the associated parameters may be defined as input or
@@ -45,12 +54,18 @@ uint_enum! {
         /// COLMETADATA token.
         NbcRow = 0xD2,
 
+        /// Alternate row token (compute row data).
+        AltRow = 0xD3,
+
         /// The SSPI token returned during the login process.
         Sspi = 0xED,
 
         /// A notification of an environment change (such as database and
         /// language).
         EnvChange = 0xE3,
+
+        /// Session state token used for connection recovery.
+        SessionState = 0xE4,
 
         /// Indicates the completion status of a SQL statement.
         ///
@@ -78,5 +93,8 @@ uint_enum! {
         /// are defined in FeatureExt. The token stream is sent only along with the LOGINACK
         /// in a Login Response message.
         FeatureExtAck = 0xAE,
+
+        /// Federated authentication info token.
+        FedAuthInfo = 0xEE,
     }
 }

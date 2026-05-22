@@ -4,7 +4,7 @@ use crate::{tds, Error, Result};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use std::convert::TryFrom;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use tds::EncryptionLevel;
 use uuid::Uuid;
 
@@ -112,6 +112,14 @@ impl Encode<BytesMut> for PreloginMessage {
         fields.push((PRELOGIN_ENCRYPTION, 0x01)); // encryption
         data_cursor.write_u8(self.encryption as u8)?;
 
+        // instance name (null-terminated)
+        if let Some(ref name) = self.instance_name {
+            let bytes = name.as_bytes();
+            fields.push((PRELOGIN_INSTOPT, (bytes.len() + 1) as u16));
+            data_cursor.write_all(bytes)?;
+            data_cursor.write_u8(0x00)?;
+        }
+
         // threadid
         fields.push((PRELOGIN_THREADID, 0x04)); // thread id
         data_cursor.write_u32::<BigEndian>(self.thread_id)?;
@@ -120,10 +128,25 @@ impl Encode<BytesMut> for PreloginMessage {
         fields.push((PRELOGIN_MARS, 0x01)); // MARS
         data_cursor.write_u8(self.mars as u8)?;
 
+        // activity id
+        if let Some(ref activity_id) = self.activity_id {
+            fields.push((PRELOGIN_TRACEID, 0x14)); // 16-byte guid + 4-byte sequence
+            let mut guid = activity_id.id.into_bytes();
+            reorder_bytes(&mut guid);
+            data_cursor.write_all(&guid)?;
+            data_cursor.write_u32::<LittleEndian>(activity_id.sequence)?;
+        }
+
         // fed auth
         if self.fed_auth_required {
             fields.push((PRELOGIN_FEDAUTHREQUIRED, 0x01));
             data_cursor.write_u8(0x01)?;
+        }
+
+        // nonce
+        if let Some(nonce) = self.nonce {
+            fields.push((PRELOGIN_NONCEOPT, 0x20));
+            data_cursor.write_all(&nonce)?;
         }
 
         // build the packet-body
@@ -240,7 +263,9 @@ impl Decode<BytesMut> for PreloginMessage {
 
                     ret.nonce = Some(data);
                 }
-                _ => panic!("unsupported prelogin token: {}", token),
+                _ => {
+                    // Ignore unknown prelogin options to remain compatible with newer clients.
+                }
             }
 
             cursor.set_position(old_pos);

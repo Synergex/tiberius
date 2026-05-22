@@ -5,16 +5,10 @@
 //! security vulnerabilities. The code here is for legacy purposes, please use
 //! `time` crate for greenfield projects.
 
-#[cfg(not(feature = "tds73"))]
-use super::DateTime as DateTime1;
-#[cfg(feature = "tds73")]
 use super::{Date, DateTime2, DateTimeOffset, Time};
 use crate::tds::codec::ColumnData;
-#[cfg(feature = "tds73")]
-#[cfg_attr(feature = "docs", doc(cfg(feature = "tds73")))]
 pub use chrono::offset::{FixedOffset, Utc};
 pub use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
-#[cfg(feature = "tds73")]
 use std::ops::Sub;
 
 #[inline]
@@ -29,7 +23,6 @@ fn from_sec_fragments(sec_fragments: i64) -> NaiveTime {
 }
 
 #[inline]
-#[cfg(feature = "tds73")]
 fn from_mins(mins: u32) -> NaiveTime {
     NaiveTime::from_num_seconds_from_midnight_opt(mins, 0).unwrap()
 }
@@ -40,17 +33,6 @@ fn to_days(date: NaiveDate, start_year: i32) -> i64 {
         .num_days()
 }
 
-#[inline]
-#[cfg(not(feature = "tds73"))]
-fn to_sec_fragments(time: NaiveTime) -> i64 {
-    time.signed_duration_since(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
-        .num_nanoseconds()
-        .unwrap()
-        * 300
-        / (1e9 as i64)
-}
-
-#[cfg(feature = "tds73")]
 from_sql!(
     NaiveDateTime:
         ColumnData::SmallDateTime(ref dt) => dt.map(|dt| NaiveDateTime::new(
@@ -103,7 +85,6 @@ from_sql!(
     })
 );
 
-#[cfg(feature = "tds73")]
 to_sql!(self_,
         NaiveDate: (ColumnData::Date, Date::new(to_days(*self_, 1) as u32));
         NaiveTime: (ColumnData::Time, {
@@ -155,7 +136,6 @@ to_sql!(self_,
         });
 );
 
-#[cfg(feature = "tds73")]
 into_sql!(self_,
         NaiveDate: (ColumnData::Date, Date::new(to_days(self_, 1) as u32));
         NaiveTime: (ColumnData::Time, {
@@ -205,39 +185,4 @@ into_sql!(self_,
 
             DateTimeOffset::new(DateTime2::new(date, time), offset)
         });
-);
-
-#[cfg(not(feature = "tds73"))]
-to_sql!(self_,
-        NaiveDateTime: (ColumnData::DateTime, {
-            let date = self_.date();
-            let time = self_.time();
-
-            let days = to_days(date, 1900) as i32;
-            let seconds_fragments = to_sec_fragments(time);
-
-            DateTime1::new(days, seconds_fragments as u32)
-        });
-);
-
-#[cfg(not(feature = "tds73"))]
-into_sql!(self_,
-        NaiveDateTime: (ColumnData::DateTime, {
-            let date = self_.date();
-            let time = self_.time();
-
-            let days = to_days(date, 1900) as i32;
-            let seconds_fragments = to_sec_fragments(time);
-
-            DateTime1::new(days, seconds_fragments as u32)
-        });
-);
-
-#[cfg(not(feature = "tds73"))]
-from_sql!(
-    NaiveDateTime:
-        ColumnData::DateTime(ref dt) => dt.map(|dt| NaiveDateTime::new(
-            from_days(dt.days as i64, 1900),
-            from_sec_fragments(dt.seconds_fragments as i64)
-        ))
 );

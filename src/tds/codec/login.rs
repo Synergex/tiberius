@@ -1,8 +1,8 @@
-use super::Encode;
-use byteorder::{LittleEndian, WriteBytesExt};
+use super::{Decode, Encode};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::BytesMut;
 use enumflags2::{bitflags, BitFlags};
-use io::{Cursor, Write};
+use io::{Cursor, Read, Write};
 use std::fmt::Debug;
 use std::{borrow::Cow, io};
 
@@ -185,6 +185,63 @@ impl<'a> LoginMessage<'a> {
             app_name: "tiberius".into(),
             ..Default::default()
         }
+    }
+
+    pub fn packet_size(&self) -> u32 {
+        self.packet_size
+    }
+
+    pub fn tds_version(&self) -> FeatureLevel {
+        self.tds_version
+    }
+
+    pub fn user_name_ref(&self) -> &str {
+        self.username.as_ref()
+    }
+
+    pub fn password_ref(&self) -> &str {
+        self.password.as_ref()
+    }
+
+    pub fn app_name_ref(&self) -> &str {
+        self.app_name.as_ref()
+    }
+
+    pub fn server_name_ref(&self) -> &str {
+        self.server_name.as_ref()
+    }
+
+    pub fn db_name_ref(&self) -> &str {
+        self.db_name.as_ref()
+    }
+
+    pub fn hostname_ref(&self) -> &str {
+        self.hostname.as_ref()
+    }
+
+    pub fn has_feature_ext(&self) -> bool {
+        self.option_flags_3.contains(OptionFlag3::ExtensionUsed)
+    }
+
+    pub fn integrated_security_bytes(&self) -> Option<&[u8]> {
+        self.integrated_security.as_deref()
+    }
+
+    pub fn fed_auth_token(&self) -> Option<&str> {
+        self.fed_auth_ext
+            .as_ref()
+            .map(|ext| ext.fed_auth_token.as_ref())
+    }
+
+    pub fn fed_auth_nonce(&self) -> Option<[u8; 32]> {
+        self.fed_auth_ext.as_ref().and_then(|ext| ext.nonce)
+    }
+
+    pub fn fed_auth_echo(&self) -> bool {
+        self.fed_auth_ext
+            .as_ref()
+            .map(|ext| ext.fed_auth_echo)
+            .unwrap_or(false)
     }
 
     #[cfg(any(all(unix, feature = "integrated-auth-gssapi"), windows))]
@@ -400,163 +457,166 @@ impl<'a> Encode<BytesMut> for LoginMessage<'a> {
     }
 }
 
+impl<'a> Decode<BytesMut> for LoginMessage<'a> {
+    fn decode(src: &mut BytesMut) -> crate::Result<Self>
+    where
+        Self: Sized,
+    {
+        let mut cursor = Cursor::new(src);
+        let mut ret = LoginMessage::new();
+
+        let total_length = cursor.read_u32::<LittleEndian>()?;
+
+        ret.tds_version = cursor
+            .read_u32::<LittleEndian>()?
+            .try_into()
+            .expect("tds_version verification");
+        ret.packet_size = cursor.read_u32::<LittleEndian>()?;
+        ret.client_prog_ver = cursor.read_u32::<LittleEndian>()?;
+        ret.client_pid = cursor.read_u32::<LittleEndian>()?;
+        ret.connection_id = cursor.read_u32::<LittleEndian>()?;
+
+        ret.option_flags_1 =
+            BitFlags::from_bits(cursor.read_u8()?).expect("option_flags_1 verification");
+        ret.option_flags_2 =
+            BitFlags::from_bits(cursor.read_u8()?).expect("option_flags_2 verification");
+        ret.type_flags =
+            BitFlags::from_bits(cursor.read_u8()?).expect("type_flags verification");
+        ret.option_flags_3 =
+            BitFlags::from_bits(cursor.read_u8()?).expect("option_flags_3 verification");
+
+        ret.client_timezone = cursor.read_u32::<LittleEndian>()? as i32;
+        ret.client_lcid = cursor.read_u32::<LittleEndian>()?;
+
+        macro_rules! read_offset_length_bytes {
+            () => {{
+                let offset = cursor.read_u16::<LittleEndian>()?;
+                let length = cursor.read_u16::<LittleEndian>()?;
+                let pos = cursor.position();
+                cursor.set_position(offset as u64);
+
+                let mut values = vec![0u8; length as usize];
+                cursor.read_exact(&mut values)?;
+
+                cursor.set_position(pos);
+                values
+            }};
+        }
+
+        macro_rules! read_offset_length_string {
+            () => {
+                read_offset_length_string!("")
+            };
+            ($tag:expr) => {{
+                let offset = cursor.read_u16::<LittleEndian>()?;
+                let length = cursor.read_u16::<LittleEndian>()?;
+                let pos = cursor.position();
+                cursor.set_position(offset as u64);
+
+                if $tag == "password" {
+                    let buffer = cursor.get_mut();
+                    for byte in buffer
+                        .iter_mut()
+                        .skip(offset as usize)
+                        .take(length as usize * 2)
+                    {
+                        *byte ^= 0xA5;
+                        *byte = ((*byte << 4) & 0xf0 | (*byte >> 4) & 0x0f);
+                    }
+                }
+
+                let mut values = vec![0u16; length as usize];
+                cursor.read_u16_into::<LittleEndian>(&mut values)?;
+                cursor.set_position(pos);
+
+                String::from_utf16(&values).expect("decode utf16")
+            }};
+        }
+
+        ret.hostname = read_offset_length_string!().into();
+        ret.username = read_offset_length_string!().into();
+        ret.password = read_offset_length_string!("password").into();
+        ret.app_name = read_offset_length_string!().into();
+        ret.server_name = read_offset_length_string!().into();
+        let fea_ext_offset = read_offset_length_bytes!(); // 5. ibExtension
+        let fea_ext_offset = if fea_ext_offset.len() == 4 {
+            u32::from_le_bytes(fea_ext_offset.try_into().unwrap())
+        } else {
+            0
+        };
+        let _ = read_offset_length_string!(); // ibCltIntName
+        let _ = read_offset_length_string!(); // ibLanguage
+        ret.db_name = read_offset_length_string!().into();
+        // 9. ClientId (6 bytes); this is included in var_data so we don't lack the bytes of cbSspiLong (4=2*2) and can insert it at the correct position
+        let _ = cursor.read_u32::<LittleEndian>()?;
+        let _ = cursor.read_u16::<LittleEndian>()?;
+        let is = read_offset_length_bytes!();
+        ret.integrated_security = if is.is_empty() { None } else { Some(is) };
+        let _ = read_offset_length_string!(); // ibAtchDBFile
+        let _ = read_offset_length_string!(); // ibChangePassword
+                                              // let _ = cursor.read_u32::<LittleEndian>()?;
+                                              // cbSSPILong
+
+        if fea_ext_offset != 0 {
+            cursor.set_position((fea_ext_offset) as u64);
+
+            assert!(ret.option_flags_3.contains(OptionFlag3::ExtensionUsed));
+            loop {
+                let fe = cursor.read_u8()?;
+                if fe == FEA_EXT_TERMINATOR {
+                    break;
+                }
+                let fea_ext_len = cursor.read_u32::<LittleEndian>()?;
+                if fe == FEA_EXT_FEDAUTH {
+                    let pos = cursor.position();
+                    let mut options = cursor.read_u8()?;
+                    let fed_auth_echo = (options & 1) == 1;
+                    options >>= 1;
+                    if options != FED_AUTH_LIBRARYSECURITYTOKEN {
+                        // Skip unsupported FedAuth payloads.
+                        cursor.set_position(pos + fea_ext_len as u64);
+                        continue;
+                    }
+                    let token_len = cursor.read_u32::<LittleEndian>()? as usize;
+                    let mut token = vec![0u16; token_len / 2];
+                    cursor.read_u16_into::<LittleEndian>(&mut token)?;
+                    let token = String::from_utf16(&token).expect("decode utf16");
+                    let remaining = fea_ext_len.saturating_sub((cursor.position() - pos) as u32);
+                    let nonce = if remaining == 32 {
+                        let mut a = [0u8; 32];
+                        cursor.read_exact(&mut a)?;
+                        Some(a)
+                    } else {
+                        // Skip any trailing bytes we don't understand.
+                        if remaining > 0 {
+                            cursor.set_position(cursor.position() + remaining as u64);
+                        }
+                        None
+                    };
+
+                    let fed_auth_ext = FedAuthExt {
+                        fed_auth_echo,
+                        fed_auth_token: token.into(),
+                        nonce,
+                    };
+                    ret.fed_auth_ext = Some(fed_auth_ext);
+                } else {
+                    // Skip unknown feature extensions to keep parsing.
+                    cursor.set_position(cursor.position() + fea_ext_len as u64);
+                }
+            }
+        }
+
+        assert!(cursor.position() <= total_length as u64);
+
+        Ok(ret)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Decode;
-    use byteorder::ReadBytesExt;
     use bytes::BytesMut;
-    use std::io::Read;
-
-    impl<'a> Decode<BytesMut> for LoginMessage<'a> {
-        fn decode(src: &mut BytesMut) -> crate::Result<Self>
-        where
-            Self: Sized,
-        {
-            let mut cursor = Cursor::new(src);
-            let mut ret = LoginMessage::new();
-
-            let total_length = cursor.read_u32::<LittleEndian>()?;
-
-            ret.tds_version = cursor
-                .read_u32::<LittleEndian>()?
-                .try_into()
-                .expect("tds_version verification");
-            ret.packet_size = cursor.read_u32::<LittleEndian>()?;
-            ret.client_prog_ver = cursor.read_u32::<LittleEndian>()?;
-            ret.client_pid = cursor.read_u32::<LittleEndian>()?;
-            ret.connection_id = cursor.read_u32::<LittleEndian>()?;
-
-            ret.option_flags_1 =
-                BitFlags::from_bits(cursor.read_u8()?).expect("option_flags_1 verification");
-            ret.option_flags_2 =
-                BitFlags::from_bits(cursor.read_u8()?).expect("option_flags_2 verification");
-            ret.type_flags =
-                BitFlags::from_bits(cursor.read_u8()?).expect("type_flags verification");
-            ret.option_flags_3 =
-                BitFlags::from_bits(cursor.read_u8()?).expect("option_flags_3 verification");
-
-            ret.client_timezone = cursor.read_u32::<LittleEndian>()? as i32;
-            ret.client_lcid = cursor.read_u32::<LittleEndian>()?;
-
-            macro_rules! read_offset_length_bytes {
-                () => {{
-                    let offset = cursor.read_u16::<LittleEndian>()?;
-                    let length = cursor.read_u16::<LittleEndian>()?;
-                    let pos = cursor.position();
-                    cursor.set_position(offset as u64);
-
-                    let mut values = vec![0u8; length as usize];
-                    cursor.read_exact(&mut values)?;
-
-                    cursor.set_position(pos);
-                    values
-                }};
-            }
-
-            macro_rules! read_offset_length_string {
-                () => {
-                    read_offset_length_string!("")
-                };
-                ($tag:expr) => {{
-                    let offset = cursor.read_u16::<LittleEndian>()?;
-                    let length = cursor.read_u16::<LittleEndian>()?;
-                    let pos = cursor.position();
-                    cursor.set_position(offset as u64);
-
-                    if $tag == "password" {
-                        let buffer = cursor.get_mut();
-                        for byte in buffer
-                            .iter_mut()
-                            .skip(offset as usize)
-                            .take(length as usize * 2)
-                        {
-                            *byte ^= 0xA5;
-                            *byte = ((*byte << 4) & 0xf0 | (*byte >> 4) & 0x0f);
-                        }
-                    }
-
-                    let mut values = vec![0u16; length as usize];
-                    cursor.read_u16_into::<LittleEndian>(&mut values)?;
-                    cursor.set_position(pos);
-
-                    String::from_utf16(&values).expect("decode utf16")
-                }};
-            }
-
-            ret.hostname = read_offset_length_string!().into();
-            ret.username = read_offset_length_string!().into();
-            ret.password = read_offset_length_string!("password").into();
-            ret.app_name = read_offset_length_string!().into();
-            ret.server_name = read_offset_length_string!().into();
-            let fea_ext_offset = read_offset_length_bytes!(); // 5. ibExtension
-            let fea_ext_offset = if fea_ext_offset.len() == 4 {
-                u32::from_le_bytes(fea_ext_offset.try_into().unwrap())
-            } else {
-                0
-            };
-            let _ = read_offset_length_string!(); // ibCltIntName
-            let _ = read_offset_length_string!(); // ibLanguage
-            ret.db_name = read_offset_length_string!().into();
-            // 9. ClientId (6 bytes); this is included in var_data so we don't lack the bytes of cbSspiLong (4=2*2) and can insert it at the correct position
-            let _ = cursor.read_u32::<LittleEndian>()?;
-            let _ = cursor.read_u16::<LittleEndian>()?;
-            let is = read_offset_length_bytes!();
-            ret.integrated_security = if is.is_empty() { None } else { Some(is) };
-            let _ = read_offset_length_string!(); // ibAtchDBFile
-            let _ = read_offset_length_string!(); // ibChangePassword
-                                                  // let _ = cursor.read_u32::<LittleEndian>()?;
-                                                  // cbSSPILong
-
-            if fea_ext_offset != 0 {
-                cursor.set_position((fea_ext_offset) as u64);
-
-                assert!(ret.option_flags_3.contains(OptionFlag3::ExtensionUsed));
-                loop {
-                    let fe = cursor.read_u8()?;
-                    if fe == FEA_EXT_TERMINATOR {
-                        break;
-                    } else if fe == FEA_EXT_FEDAUTH {
-                        let fea_ext_len = cursor.read_u32::<LittleEndian>()?;
-                        let pos = cursor.position();
-                        let mut options = cursor.read_u8()?;
-                        let fed_auth_echo = (options & 1) == 1;
-                        options >>= 1;
-                        if options != FED_AUTH_LIBRARYSECURITYTOKEN {
-                            unimplemented!("unsupported FedAuthLibrary {:?}", options);
-                        }
-                        let token_len = cursor.read_u32::<LittleEndian>()? as usize;
-                        let mut token = vec![0u16; token_len / 2];
-                        cursor.read_u16_into::<LittleEndian>(&mut token)?;
-                        let token = String::from_utf16(&token).expect("decode utf16");
-                        let remaining = fea_ext_len - (cursor.position() - pos) as u32;
-                        let nonce = if remaining == 32 {
-                            let mut a = [0u8; 32];
-                            cursor.read_exact(&mut a)?;
-                            Some(a)
-                        } else if remaining == 0 {
-                            None
-                        } else {
-                            panic!("read feature ext fail: {}", remaining);
-                        };
-
-                        let fed_auth_ext = FedAuthExt {
-                            fed_auth_echo,
-                            fed_auth_token: token.into(),
-                            nonce,
-                        };
-                        ret.fed_auth_ext = Some(fed_auth_ext);
-                    } else {
-                        unimplemented!("unsupported feature ext {:?}", fe);
-                    }
-                }
-            }
-
-            assert!(cursor.position() <= total_length as u64);
-
-            Ok(ret)
-        }
-    }
 
     #[test]
     fn login_message_round_trip() {

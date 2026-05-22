@@ -18,7 +18,7 @@ pub use bulk_load::*;
 use bytes::BytesMut;
 pub use column_data::*;
 pub use decode::*;
-pub(crate) use encode::*;
+pub use encode::Encode;
 use futures_util::stream::{Stream, TryStreamExt};
 pub use header::*;
 pub(crate) use iterator_ext::*;
@@ -29,8 +29,8 @@ pub use rpc_request::*;
 pub use token::*;
 pub use type_info::*;
 
-const HEADER_BYTES: usize = 8;
-const ALL_HEADERS_LEN_TX: usize = 22;
+pub(crate) const HEADER_BYTES: usize = 8;
+pub(crate) const ALL_HEADERS_LEN_TX: usize = 22;
 
 #[derive(Debug)]
 #[repr(u16)]

@@ -7,7 +7,10 @@ use std::env;
 use std::sync::Once;
 
 use tiberius::FromSql;
-use tiberius::{numeric::Numeric, xml::XmlData, ColumnType, Query, QueryItem, Result};
+use tiberius::{
+    numeric::Numeric, xml::XmlData, ColumnData, ColumnFlag, ColumnType, Query, QueryItem, Result,
+    TvpColumn, TvpData, TypeInfo, UdtData, VarLenContext, VarLenType, VariantData,
+};
 use uuid::Uuid;
 
 use runtimes_macro::test_on_runtimes;
@@ -3034,6 +3037,306 @@ where
 
     let res = query.execute(&mut conn).await?;
     assert_eq!(1, res.total());
+
+    Ok(())
+}
+
+// -- sql_variant integration tests --
+
+#[test_on_runtimes]
+async fn sql_variant_read_int<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let row = conn
+        .query("SELECT CAST(42 AS sql_variant)", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    let variant: Option<&VariantData<'static>> = row.get(0);
+    assert!(variant.is_some());
+
+    // Decode the variant to verify the inner value
+    let (_, inner) = variant.unwrap().decode_typed().await?;
+    assert_eq!(inner, ColumnData::I32(Some(42)));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn sql_variant_read_string<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let row = conn
+        .query("SELECT CAST(N'hello' AS sql_variant)", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    let variant: Option<&VariantData<'static>> = row.get(0);
+    assert!(variant.is_some());
+
+    let (_, inner) = variant.unwrap().decode_typed().await?;
+    match inner {
+        ColumnData::String(Some(s)) => assert_eq!(s.as_ref(), "hello"),
+        other => panic!("expected String, got {:?}", other),
+    }
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn sql_variant_read_null<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let row = conn
+        .query("SELECT CAST(NULL AS sql_variant)", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    let variant: Option<&VariantData<'static>> = row.get(0);
+    assert!(variant.is_none());
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn sql_variant_write_as_param<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // Build a sql_variant containing an int
+    let variant = VariantData::from_typed(
+        TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+        ColumnData::I32(Some(99)),
+    )
+    .unwrap();
+
+    let table = random_table().await;
+
+    conn.execute(
+        format!("CREATE TABLE ##{} (v sql_variant)", table),
+        &[],
+    )
+    .await?;
+
+    conn.execute(
+        format!("INSERT INTO ##{} (v) VALUES (@P1)", table),
+        &[&variant],
+    )
+    .await?;
+
+    let row = conn
+        .query(format!("SELECT v FROM ##{}",table), &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    let read_back: Option<&VariantData<'static>> = row.get(0);
+    assert!(read_back.is_some());
+
+    let (_, inner) = read_back.unwrap().decode_typed().await?;
+    assert_eq!(inner, ColumnData::I32(Some(99)));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn hierarchyid_read_as_raw_clr_data<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let row = conn
+        .query("SELECT CAST('/1/2/' AS hierarchyid) AS hid", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    let hid: Option<UdtData<'_>> = row.get("hid");
+    assert!(hid.is_some());
+    assert!(!hid.unwrap().as_bytes().is_empty());
+
+    let column = &row.columns()[0];
+    assert!(column.is_udt());
+
+    let info = column.udt_info().unwrap();
+    assert_eq!(info.type_name, "hierarchyid");
+    assert!(info.assembly_name.contains("SqlHierarchyId"));
+
+    Ok(())
+}
+
+// -- TVP integration tests --
+
+#[test_on_runtimes]
+async fn tvp_as_stored_proc_param<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = random_table().await;
+    let type_name = format!("TestTvpType_{}", table);
+    let proc_name = format!("TestTvpProc_{}", table);
+
+    // Create a table type
+    conn.simple_query(format!(
+        "IF TYPE_ID('dbo.{type_name}') IS NOT NULL DROP TYPE dbo.{type_name};",
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    conn.simple_query(format!(
+        "CREATE TYPE dbo.{type_name} AS TABLE (id INT, label NVARCHAR(50))",
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    // Create a non-temp stored procedure (temp procs can't reference UDTs)
+    conn.simple_query(format!(
+        "CREATE PROCEDURE {proc_name} @tvp dbo.{type_name} READONLY AS SELECT id, label FROM @tvp ORDER BY id",
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    // Build the TVP data
+    let collation = Some(tiberius::Collation::new(13632521, 52));
+    let tvp = TvpData::new(&type_name)
+        .schema("dbo")
+        .columns(vec![
+            TvpColumn {
+                name: std::borrow::Cow::Borrowed("id"),
+                user_type: 0,
+                flags: ColumnFlag::Nullable.into(),
+                ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+            },
+            TvpColumn {
+                name: std::borrow::Cow::Borrowed("label"),
+                user_type: 0,
+                flags: ColumnFlag::Nullable.into(),
+                ty: TypeInfo::VarLenSized(VarLenContext::new(
+                    VarLenType::NVarchar,
+                    100,
+                    collation,
+                )),
+            },
+        ])
+        .rows(vec![
+            vec![
+                ColumnData::I32(Some(1)),
+                ColumnData::String(Some("alpha".into())),
+            ],
+            vec![
+                ColumnData::I32(Some(2)),
+                ColumnData::String(Some("beta".into())),
+            ],
+            vec![
+                ColumnData::I32(Some(3)),
+                ColumnData::String(Some("gamma".into())),
+            ],
+        ]);
+
+    // Execute the proc with TVP parameter
+    let stream = conn
+        .query(
+            format!("EXEC {proc_name} @tvp = @P1"),
+            &[&tvp],
+        )
+        .await?;
+
+    let rows: Vec<_> = stream.into_first_result().await?;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+    assert_eq!(rows[0].get::<&str, _>(1), Some("alpha"));
+    assert_eq!(rows[1].get::<i32, _>(0), Some(2));
+    assert_eq!(rows[1].get::<&str, _>(1), Some("beta"));
+    assert_eq!(rows[2].get::<i32, _>(0), Some(3));
+    assert_eq!(rows[2].get::<&str, _>(1), Some("gamma"));
+
+    // Cleanup
+    conn.simple_query(format!("DROP PROCEDURE {proc_name}"))
+        .await?
+        .into_results()
+        .await?;
+    conn.simple_query(format!("DROP TYPE dbo.{type_name}"))
+        .await?
+        .into_results()
+        .await?;
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn tvp_empty_rows<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = random_table().await;
+    let type_name = format!("TestTvpEmpty_{}", table);
+    let proc_name = format!("TestTvpEmptyProc_{}", table);
+
+    conn.simple_query(format!(
+        "IF TYPE_ID('dbo.{type_name}') IS NOT NULL DROP TYPE dbo.{type_name};",
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    conn.simple_query(format!(
+        "CREATE TYPE dbo.{type_name} AS TABLE (id INT)",
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    conn.simple_query(format!(
+        "CREATE PROCEDURE {proc_name} @tvp dbo.{type_name} READONLY AS SELECT COUNT(*) AS cnt FROM @tvp",
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    // TVP with zero rows
+    let tvp = TvpData::new(&type_name)
+        .schema("dbo")
+        .columns(vec![TvpColumn {
+            name: std::borrow::Cow::Borrowed("id"),
+            user_type: 0,
+            flags: ColumnFlag::Nullable.into(),
+            ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+        }])
+        .rows(vec![]);
+
+    let row = conn
+        .query(
+            format!("EXEC {proc_name} @tvp = @P1"),
+            &[&tvp],
+        )
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    assert_eq!(row.get::<i32, _>(0), Some(0));
+
+    conn.simple_query(format!("DROP PROCEDURE {proc_name}"))
+        .await?
+        .into_results()
+        .await?;
+    conn.simple_query(format!("DROP TYPE dbo.{type_name}"))
+        .await?
+        .into_results()
+        .await?;
 
     Ok(())
 }

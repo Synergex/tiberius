@@ -20,7 +20,7 @@ pub struct Collation {
 }
 
 impl Collation {
-    pub fn new(info: u32, sort_id: u8) -> Self {
+    pub const fn new(info: u32, sort_id: u8) -> Self {
         Self { info, sort_id }
     }
 

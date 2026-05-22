@@ -57,17 +57,82 @@ impl TokenDone {
     pub(crate) fn rows(&self) -> u64 {
         self.done_rows
     }
+
+    pub(crate) fn status(&self) -> BitFlags<DoneStatus> {
+        self.status
+    }
+
+    pub(crate) fn with_added_status(mut self, extra: BitFlags<DoneStatus>) -> Self {
+        self.status |= extra;
+        self
+    }
+
+    /// Create a DONE token with explicit status flags and a row count.
+    pub fn with_status(status: BitFlags<DoneStatus>, rows: u64) -> Self {
+        Self {
+            status,
+            done_rows: rows,
+            ..Self::default()
+        }
+    }
+
+    /// Create a DONE token that indicates more results follow.
+    pub fn with_more_rows(rows: u64) -> Self {
+        Self {
+            status: (DoneStatus::Count | DoneStatus::More).into(),
+            done_rows: rows,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_rows(rows: u64) -> Self {
+        Self {
+            status: DoneStatus::Count.into(),
+            done_rows: rows,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn encode_with_type(
+        self,
+        dst: &mut BytesMut,
+        ty: TokenType,
+    ) -> crate::Result<()> {
+        self.encode_with_type_and_count_bytes(dst, ty, 8)
+    }
+
+    pub(crate) fn encode_with_type_and_count_bytes(
+        self,
+        dst: &mut BytesMut,
+        ty: TokenType,
+        count_bytes: u8,
+    ) -> crate::Result<()> {
+        dst.put_u8(ty as u8);
+        dst.put_u16_le(BitFlags::bits(self.status));
+        dst.put_u16_le(self.cur_cmd);
+        match count_bytes {
+            8 => dst.put_u64_le(self.done_rows),
+            4 => {
+                if self.done_rows > u32::MAX as u64 {
+                    return Err(Error::Protocol(
+                        "done: row count exceeds 32-bit width".into(),
+                    ));
+                }
+                dst.put_u32_le(self.done_rows as u32);
+            }
+            _ => {
+                return Err(Error::Protocol(
+                    "done: invalid row count width".into(),
+                ))
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Encode<BytesMut> for TokenDone {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
-        dst.put_u8(TokenType::Done as u8);
-        dst.put_u16_le(BitFlags::bits(self.status));
-
-        dst.put_u16_le(self.cur_cmd);
-        dst.put_u64_le(self.done_rows);
-
-        Ok(())
+        self.encode_with_type(dst, TokenType::Done)
     }
 }
 

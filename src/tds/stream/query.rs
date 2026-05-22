@@ -1,5 +1,5 @@
 use crate::tds::stream::ReceivedToken;
-use crate::{row::ColumnType, Column, Row};
+use crate::{Column, Row};
 use futures_util::{
     ready,
     stream::{BoxStream, Peekable, Stream, StreamExt, TryStreamExt},
@@ -362,14 +362,7 @@ impl<'a> Stream for QueryStream<'a> {
 
             return match token {
                 ReceivedToken::NewResultset(meta) => {
-                    let column_meta = meta
-                        .columns
-                        .iter()
-                        .map(|x| Column {
-                            name: x.col_name.to_string(),
-                            column_type: ColumnType::from(&x.base.ty),
-                        })
-                        .collect::<Vec<_>>();
+                    let column_meta = meta.columns().collect::<Vec<_>>();
 
                     let column_meta = Arc::new(column_meta);
                     this.columns = Some(column_meta.clone());

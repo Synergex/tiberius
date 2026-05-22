@@ -123,7 +123,9 @@ pub(crate) struct TlsPreloginWrapper<S> {
     read_remaining: usize,
 
     wr_buf: Vec<u8>,
-    header_written: bool,
+    wr_pos: usize,
+    pending_len: usize,
+    packet_id: u8,
 }
 
 #[cfg(any(
@@ -140,13 +142,19 @@ impl<S> TlsPreloginWrapper<S> {
             header_buf: [0u8; HEADER_BYTES],
             header_pos: 0,
             read_remaining: 0,
-            wr_buf: vec![0u8; HEADER_BYTES],
-            header_written: false,
+            wr_buf: Vec::new(),
+            wr_pos: 0,
+            pending_len: 0,
+            packet_id: 1,
         }
     }
 
     pub fn handshake_complete(&mut self) {
         self.pending_handshake = false;
+        debug_assert!(self.pending_len == 0, "pending TLS handshake data not flushed");
+        self.wr_buf.clear();
+        self.wr_pos = 0;
+        self.pending_len = 0;
     }
 }
 
@@ -224,48 +232,81 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
             return Pin::new(&mut self.stream.as_mut().unwrap()).poll_write(cx, buf);
         }
 
-        // Buffering data.
-        self.wr_buf.extend_from_slice(buf);
+        let inner = self.get_mut();
+        if inner.pending_len == 0 {
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
 
-        Poll::Ready(Ok(buf.len()))
+            inner.wr_buf.clear();
+            inner.wr_buf.resize(HEADER_BYTES, 0);
+            let id = inner.packet_id;
+            inner.packet_id = inner.packet_id.wrapping_add(1);
+            if inner.packet_id == 0 {
+                inner.packet_id = 1;
+            }
+            let mut header = PacketHeader::new(HEADER_BYTES + buf.len(), id);
+            header.set_type(PacketType::PreLogin);
+            header.set_status(PacketStatus::EndOfMessage);
+            header
+                .encode(&mut &mut inner.wr_buf[0..HEADER_BYTES])
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "Could not encode header.")
+                })?;
+            inner.wr_buf.extend_from_slice(buf);
+            inner.pending_len = buf.len();
+            inner.wr_pos = 0;
+        }
+
+        while inner.wr_pos < inner.wr_buf.len() {
+            let written = ready!(Pin::new(inner.stream.as_mut().unwrap())
+                .poll_write(cx, &inner.wr_buf[inner.wr_pos..]))?;
+            if written == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write data",
+                )));
+            }
+            inner.wr_pos += written;
+        }
+
+        let len = inner.pending_len;
+        inner.pending_len = 0;
+        inner.wr_pos = 0;
+        inner.wr_buf.clear();
+
+        Poll::Ready(Ok(len))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
         let inner = self.get_mut();
 
-        // If on handshake mode, wraps the data to a TDS packet before sending.
-        if inner.pending_handshake && inner.wr_buf.len() > HEADER_BYTES {
-            if !inner.header_written {
-                let mut header = PacketHeader::new(inner.wr_buf.len(), 0);
-
-                header.set_type(PacketType::PreLogin);
-                header.set_status(PacketStatus::EndOfMessage);
-
-                header
-                    .encode(&mut &mut inner.wr_buf[0..HEADER_BYTES])
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "Could not encode header.")
-                    })?;
-
-                inner.header_written = true;
-            }
-
-            while !inner.wr_buf.is_empty() {
+        if inner.pending_handshake && inner.pending_len > 0 {
+            while inner.wr_pos < inner.wr_buf.len() {
                 event!(
                     Level::TRACE,
                     "Writing a packet of {} bytes",
-                    inner.wr_buf.len(),
+                    inner.wr_buf.len() - inner.wr_pos,
                 );
 
                 let written = ready!(
-                    Pin::new(&mut inner.stream.as_mut().unwrap()).poll_write(cx, &inner.wr_buf)
+                    Pin::new(&mut inner.stream.as_mut().unwrap())
+                        .poll_write(cx, &inner.wr_buf[inner.wr_pos..])
                 )?;
 
-                inner.wr_buf.drain(..written);
+                if written == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write data",
+                    )));
+                }
+
+                inner.wr_pos += written;
             }
 
-            inner.wr_buf.resize(HEADER_BYTES, 0);
-            inner.header_written = false;
+            inner.pending_len = 0;
+            inner.wr_pos = 0;
+            inner.wr_buf.clear();
         }
 
         Pin::new(&mut inner.stream.as_mut().unwrap()).poll_flush(cx)

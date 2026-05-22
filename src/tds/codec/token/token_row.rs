@@ -1,7 +1,9 @@
 mod bytes_mut_with_data_columns;
 mod into_row;
 use crate::tds::codec::encode::Encode;
-use crate::{tds::codec::ColumnData, BytesMutWithTypeInfo, SqlReadBytes, TokenType};
+use crate::{
+    tds::codec::ColumnData, BytesMutWithTypeInfo, MetaDataColumn, SqlReadBytes, TokenType,
+};
 use bytes::BufMut;
 pub(crate) use bytes_mut_with_data_columns::BytesMutWithDataColumns;
 use futures_util::io::AsyncReadExt;
@@ -22,8 +24,8 @@ impl<'a> IntoIterator for TokenRow<'a> {
     }
 }
 
-impl<'a> Encode<BytesMutWithDataColumns<'a>> for TokenRow<'a> {
-    fn encode(self, dst: &mut BytesMutWithDataColumns<'a>) -> crate::Result<()> {
+impl<'r, 'a, 'c> Encode<BytesMutWithDataColumns<'a, 'c>> for TokenRow<'r> {
+    fn encode(self, dst: &mut BytesMutWithDataColumns<'a, 'c>) -> crate::Result<()> {
         dst.put_u8(TokenType::Row as u8);
 
         if self.data.len() != dst.data_columns().len() {
@@ -91,6 +93,55 @@ impl<'a> TokenRow<'a> {
     pub fn push(&mut self, value: ColumnData<'a>) {
         self.data.push(value);
     }
+
+    pub(crate) fn encode_with_columns<'b>(
+        self,
+        dst: &mut bytes::BytesMut,
+        columns: &'b [MetaDataColumn<'b>],
+    ) -> crate::Result<()> {
+        let mut buf_with_columns = BytesMutWithDataColumns::new(dst, columns);
+        self.encode(&mut buf_with_columns)
+    }
+
+    pub(crate) fn encode_nbc_with_columns<'b>(
+        self,
+        dst: &mut bytes::BytesMut,
+        columns: &'b [MetaDataColumn<'b>],
+    ) -> crate::Result<()> {
+        dst.put_u8(TokenType::NbcRow as u8);
+
+        if self.data.len() != columns.len() {
+            return Err(crate::Error::BulkInput(
+                format!(
+                    "Expecting {} columns but {} were given",
+                    columns.len(),
+                    self.data.len()
+                )
+                .into(),
+            ));
+        }
+
+        let bitmap_len = (columns.len() + 7) / 8;
+        let mut bitmap = vec![0u8; bitmap_len];
+        for (idx, value) in self.data.iter().enumerate() {
+            if value.is_null() {
+                let byte = idx / 8;
+                let bit = idx % 8;
+                bitmap[byte] |= 1 << bit;
+            }
+        }
+        dst.extend_from_slice(&bitmap);
+
+        for (value, column) in self.data.into_iter().zip(columns.iter()) {
+            if value.is_null() {
+                continue;
+            }
+            let mut dst_ti = BytesMutWithTypeInfo::new(dst).with_type_info(&column.base.ty);
+            value.encode(&mut dst_ti)?;
+        }
+
+        Ok(())
+    }
 }
 
 impl TokenRow<'static> {
@@ -98,7 +149,7 @@ impl TokenRow<'static> {
     /// based on that.
     pub(crate) async fn decode<R>(src: &mut R) -> crate::Result<Self>
     where
-        R: SqlReadBytes + Unpin,
+        R: SqlReadBytes + Unpin + Send,
     {
         let col_meta = src.context().last_meta().unwrap();
 
@@ -118,7 +169,7 @@ impl TokenRow<'static> {
     /// are null from the bitmap.
     pub(crate) async fn decode_nbc<R>(src: &mut R) -> crate::Result<Self>
     where
-        R: SqlReadBytes + Unpin,
+        R: SqlReadBytes + Unpin + Send,
     {
         let col_meta = src.context().last_meta().unwrap();
         let row_bitmap = RowBitmap::decode(src, col_meta.columns.len()).await?;
@@ -196,8 +247,10 @@ mod tests {
         let row = (true, 5).into_row();
         let columns = vec![MetaDataColumn {
             base: BaseMetaDataColumn {
+                user_type: 0,
                 flags: ColumnFlag::Nullable.into(),
                 ty: TypeInfo::FixedLen(FixedLenType::Bit),
+                table_name: None,
             },
             col_name: Default::default(),
         }];

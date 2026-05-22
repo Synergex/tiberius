@@ -4,25 +4,22 @@ use bytes::{BufMut, BytesMut};
 use std::borrow::{Borrow, BorrowMut};
 use std::ops::{Deref, DerefMut};
 
-pub(crate) struct BytesMutWithDataColumns<'a> {
+pub(crate) struct BytesMutWithDataColumns<'a, 'c> {
     bytes: &'a mut BytesMut,
-    data_columns: &'a Vec<MetaDataColumn<'a>>,
+    data_columns: &'c [MetaDataColumn<'c>],
 }
 
-impl<'a> BytesMutWithDataColumns<'a> {
-    pub fn new(bytes: &'a mut BytesMut, data_columns: &'a Vec<MetaDataColumn<'a>>) -> Self {
-        BytesMutWithDataColumns {
-            bytes,
-            data_columns,
-        }
+impl<'a, 'c> BytesMutWithDataColumns<'a, 'c> {
+    pub fn new(bytes: &'a mut BytesMut, data_columns: &'c [MetaDataColumn<'c>]) -> Self {
+        BytesMutWithDataColumns { bytes, data_columns }
     }
 
-    pub fn data_columns(&self) -> &'a Vec<MetaDataColumn<'a>> {
+    pub fn data_columns(&self) -> &'c [MetaDataColumn<'c>] {
         self.data_columns
     }
 }
 
-unsafe impl<'a> BufMut for BytesMutWithDataColumns<'a> {
+unsafe impl<'a, 'c> BufMut for BytesMutWithDataColumns<'a, 'c> {
     fn remaining_mut(&self) -> usize {
         self.bytes.remaining_mut()
     }
@@ -36,19 +33,19 @@ unsafe impl<'a> BufMut for BytesMutWithDataColumns<'a> {
     }
 }
 
-impl<'a> Borrow<[u8]> for BytesMutWithDataColumns<'a> {
+impl<'a, 'c> Borrow<[u8]> for BytesMutWithDataColumns<'a, 'c> {
     fn borrow(&self) -> &[u8] {
         self.bytes.deref()
     }
 }
 
-impl<'a> BorrowMut<[u8]> for BytesMutWithDataColumns<'a> {
+impl<'a, 'c> BorrowMut<[u8]> for BytesMutWithDataColumns<'a, 'c> {
     fn borrow_mut(&mut self) -> &mut [u8] {
         self.bytes.borrow_mut()
     }
 }
 
-impl<'a> Deref for BytesMutWithDataColumns<'a> {
+impl<'a, 'c> Deref for BytesMutWithDataColumns<'a, 'c> {
     type Target = BytesMut;
 
     fn deref(&self) -> &Self::Target {
@@ -56,7 +53,7 @@ impl<'a> Deref for BytesMutWithDataColumns<'a> {
     }
 }
 
-impl<'a> DerefMut for BytesMutWithDataColumns<'a> {
+impl<'a, 'c> DerefMut for BytesMutWithDataColumns<'a, 'c> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.bytes
     }

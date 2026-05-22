@@ -56,9 +56,11 @@ pub struct RpcParam<'a> {
 /// 2.2.6.6 RPC Request
 #[allow(dead_code)]
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RpcProcId {
     CursorOpen = 2,
+    CursorPrepExec = 5,
+    CursorUnprepare = 6,
     CursorFetch = 7,
     CursorClose = 9,
     ExecuteSQL = 10,
@@ -103,10 +105,25 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
                 let val = (0xffff_u32) | ((*id as u16) as u32) << 16;
                 dst.put_u32_le(val);
             }
-            RpcProcIdValue::Name(ref _name) => {
-                //let (left_bytes, _) = try!(write_varchar::<u16>(&mut cursor, name, 0));
-                //assert_eq!(left_bytes, 0);
-                todo!()
+            RpcProcIdValue::Name(ref name) => {
+                // NameLenProcID.NameLen: u16 length in UCS-2 code units.
+                // A value of 0xFFFF signals "by ID"; anything else is the
+                // length of the following UTF-16 LE procedure name.
+                let codepoints: Vec<u16> = name.encode_utf16().collect();
+                if codepoints.len() > u16::MAX as usize - 1 {
+                    return Err(crate::Error::Protocol(
+                        format!(
+                            "RPC proc name too long ({} code units, max {})",
+                            codepoints.len(),
+                            u16::MAX - 1
+                        )
+                        .into(),
+                    ));
+                }
+                dst.put_u16_le(codepoints.len() as u16);
+                for cp in codepoints {
+                    dst.put_u16_le(cp);
+                }
             }
         }
 
@@ -141,5 +158,65 @@ impl<'a> Encode<BytesMut> for RpcParam<'a> {
         dst[len_pos] = length;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_proc_id_uses_ffff_sentinel() {
+        let req = TokenRpcRequest::new(RpcProcId::ExecuteSQL, Vec::new(), [0; 8]);
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf).unwrap();
+
+        let proc_id_word = &buf[ALL_HEADERS_LEN_TX..ALL_HEADERS_LEN_TX + 4];
+        assert_eq!(
+            proc_id_word,
+            &[0xff, 0xff, RpcProcId::ExecuteSQL as u8, 0x00]
+        );
+    }
+
+    #[test]
+    fn encode_named_proc_writes_utf16_length_prefixed() {
+        let req = TokenRpcRequest::new(
+            Cow::Borrowed("my_sp"),
+            Vec::new(),
+            [0; 8],
+        );
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf).unwrap();
+
+        let start = ALL_HEADERS_LEN_TX;
+        let name_len = u16::from_le_bytes([buf[start], buf[start + 1]]);
+        assert_eq!(name_len, 5);
+
+        let chars_start = start + 2;
+        let mut got = Vec::<u16>::new();
+        for i in 0..(name_len as usize) {
+            got.push(u16::from_le_bytes([
+                buf[chars_start + i * 2],
+                buf[chars_start + i * 2 + 1],
+            ]));
+        }
+        let expected: Vec<u16> = "my_sp".encode_utf16().collect();
+        assert_eq!(got, expected);
+
+        // Flags follow the name.
+        let flags_off = chars_start + name_len as usize * 2;
+        assert_eq!(u16::from_le_bytes([buf[flags_off], buf[flags_off + 1]]), 0);
+    }
+
+    #[test]
+    fn encode_named_proc_handles_non_ascii() {
+        let req = TokenRpcRequest::new(Cow::Borrowed("spö"), Vec::new(), [0; 8]);
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf).unwrap();
+
+        let start = ALL_HEADERS_LEN_TX;
+        let name_len = u16::from_le_bytes([buf[start], buf[start + 1]]);
+        let expected: Vec<u16> = "spö".encode_utf16().collect();
+        assert_eq!(name_len as usize, expected.len());
     }
 }

@@ -34,6 +34,8 @@ use libgssapi::{
 use pretty_hex::*;
 #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::{cmp, fmt::Debug, io, pin::Pin, task};
 use task::Poll;
 use tracing::{event, Level};
@@ -57,6 +59,7 @@ where
     flushed: bool,
     context: Context,
     buf: BytesMut,
+    cancellation_requested: Arc<AtomicBool>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Debug for Connection<S> {
@@ -86,6 +89,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             context,
             flushed: false,
             buf: BytesMut::new(),
+            cancellation_requested: Arc::new(AtomicBool::new(false)),
         };
 
         let fed_auth_required = matches!(config.auth, AuthMethod::AADToken(_));
@@ -220,32 +224,67 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         self.transport.flush().await
     }
 
-    /// Cleans the packet stream from previous use. It is important to use the
-    /// whole stream before using the connection again. Flushing the stream
-    /// makes sure we don't have any old data causing undefined behaviour after
-    /// previous queries.
-    ///
-    /// Calling this will slow down the queries if stream is still dirty if all
-    /// results are not handled.
-    pub async fn flush_stream(&mut self) -> crate::Result<()> {
-        self.buf.truncate(0);
+    /// Send an attention signal to the server to cancel the current operation.
+    pub(crate) async fn send_attention(&mut self) -> crate::Result<()> {
+        let id = self.context.next_packet_id();
+        let header = PacketHeader::attention(id);
+        self.write_to_wire(header, BytesMut::new()).await?;
+        self.flush_sink().await?;
+        Ok(())
+    }
 
-        if self.flushed {
+    /// Returns a [`CancellationToken`] that can request cancellation of
+    /// in-flight queries from another task.
+    pub(crate) fn cancellation_token(&self) -> super::CancellationToken {
+        super::CancellationToken::new(self.cancellation_requested.clone())
+    }
+
+    /// Returns `true` if a cancellation has been requested via the token.
+    pub(crate) fn is_cancellation_requested(&self) -> bool {
+        self.cancellation_requested.load(Ordering::Acquire)
+    }
+
+    /// Clears the cancellation request flag.
+    pub(crate) fn clear_cancellation_request(&self) {
+        self.cancellation_requested.store(false, Ordering::Release);
+    }
+
+    /// Cleans the packet stream from previous use by sending a TDS attention
+    /// signal and draining the response. This is significantly faster than
+    /// reading all remaining result data for large result sets.
+    ///
+    /// It is important to use the whole stream before using the connection
+    /// again. Flushing the stream makes sure we don't have any old data
+    /// causing undefined behaviour after previous queries.
+    pub async fn flush_stream(&mut self) -> crate::Result<()> {
+        self.clear_cancellation_request();
+
+        if self.flushed && self.buf.is_empty() {
             return Ok(());
         }
 
-        while let Some(packet) = self.try_next().await? {
-            event!(
-                Level::WARN,
-                "Flushing unhandled packet from the wire. Please consume your streams!",
-            );
+        event!(
+            Level::WARN,
+            "Flushing unhandled stream via attention signal. Please consume your streams!",
+        );
 
-            let is_last = packet.is_last();
-
-            if is_last {
-                break;
-            }
+        if self.flushed {
+            // Server already finished sending all data (EOM seen), but some
+            // token data remains buffered. Just discard it.
+            self.buf.truncate(0);
+            return Ok(());
         }
+
+        // Server still has data to send. Send attention to cancel quickly.
+        self.send_attention().await?;
+
+        // Drain at the token level until the server's attention
+        // acknowledgment (Done+Attention) arrives. We use
+        // `new_with_attention` so the stream knows not to terminate on a
+        // natural EOF — the attention ack may arrive as a separate message
+        // after the original query response ends.
+        let ts = TokenStream::new_with_attention(self);
+        ts.flush_to_attention().await?;
 
         Ok(())
     }
@@ -448,7 +487,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             event!(Level::INFO, "Performing a TLS handshake");
 
             let Self {
-                transport, context, ..
+                transport,
+                context,
+                cancellation_requested,
+                ..
             } = self;
             let mut stream = match transport.into_inner() {
                 MaybeTlsStream::Raw(tcp) => {
@@ -467,6 +509,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 context,
                 flushed: false,
                 buf: BytesMut::new(),
+                cancellation_requested,
             })
         } else {
             event!(

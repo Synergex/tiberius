@@ -3,10 +3,12 @@ mod collation;
 mod context;
 pub mod numeric;
 pub mod stream;
+#[cfg(feature = "server-rustls")]
+pub(crate) mod tls;
 pub mod time;
 pub mod xml;
 
-pub(crate) use collation::*;
+pub use collation::Collation;
 pub(crate) use context::*;
 pub(crate) use numeric::*;
 

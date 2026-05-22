@@ -16,7 +16,6 @@ fn from_days(days: u64, start_year: i32) -> Date {
 }
 
 #[inline]
-#[cfg(feature = "tds73")]
 fn from_secs(secs: u64) -> Time {
     Time::from_hms(0, 0, 0).unwrap() + Duration::from_secs(secs)
 }
@@ -31,18 +30,6 @@ fn to_days(date: Date, start_year: i32) -> i64 {
     (date - Date::from_calendar_date(start_year, Month::January, 1).unwrap()).whole_days()
 }
 
-#[inline]
-#[cfg(not(feature = "tds73"))]
-fn to_sec_fragments(from: Time) -> i64 {
-    let nanos: i64 = (from - Time::from_hms(0, 0, 0).unwrap())
-        .whole_nanoseconds()
-        .try_into()
-        .unwrap();
-
-    nanos * 300 / (1e9 as i64)
-}
-
-#[cfg(feature = "tds73")]
 from_sql!(
     PrimitiveDateTime:
         ColumnData::SmallDateTime(ref dt) => dt.map(|dt| PrimitiveDateTime::new(
@@ -78,7 +65,6 @@ from_sql!(
         })
 );
 
-#[cfg(feature = "tds73")]
 to_sql!(self_,
         Date: (ColumnData::Date, super::Date::new(to_days(*self_, 1) as u32));
         Time: (ColumnData::Time, {
@@ -110,25 +96,4 @@ to_sql!(self_,
 
             super::DateTimeOffset::new(super::DateTime2::new(date, time), offset)
         });
-);
-
-#[cfg(not(feature = "tds73"))]
-to_sql!(self_,
-        PrimitiveDateTime: (ColumnData::DateTime, {
-            let date = self_.date();
-            let time = self_.time();
-
-            let days = to_days(date, 1900) as i32;
-            let seconds_fragments = to_sec_fragments(time);
-
-            super::DateTime::new(days, seconds_fragments as u32)
-        });
-);
-
-#[cfg(not(feature = "tds73"))]
-from_sql!(
-    PrimitiveDateTime:
-    ColumnData::DateTime(ref dt) => dt.map(|dt| {
-        from_days(dt.days as u64, 1900).with_time(from_sec_fragments(dt.seconds_fragments as u64))
-    })
 );

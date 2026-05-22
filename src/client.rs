@@ -1,6 +1,10 @@
 mod auth;
+mod cancellation;
 mod config;
 mod connection;
+mod cursor;
+mod prepared;
+mod rpc_response;
 
 mod tls;
 #[cfg(any(
@@ -11,8 +15,15 @@ mod tls;
 mod tls_stream;
 
 pub use auth::*;
+pub use cancellation::CancellationToken;
 pub use config::*;
 pub(crate) use connection::*;
+pub use cursor::{
+    Cursor, CursorConcurrencyOptions, CursorHandle, CursorOpenOptions, CursorScrollOptions, Fetch,
+    PreparedCursor,
+};
+pub use prepared::{PreparedHandle, PreparedStatement};
+pub use rpc_response::OutputValue;
 
 use crate::tds::stream::ReceivedToken;
 use crate::{
@@ -352,6 +363,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         self.connection.close().await
     }
 
+    /// Returns a cancellation token that can be used to cancel in-flight
+    /// queries from another task.
+    ///
+    /// The token is `Clone` and `Send + Sync`, so it can be shared freely.
+    /// Calling [`CancellationToken::cancel()`] causes the active
+    /// [`QueryStream`] to terminate cleanly at its next poll point by
+    /// sending a TDS attention signal to the server.
+    ///
+    /// [`QueryStream`]: struct.QueryStream.html
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.connection.cancellation_token()
+    }
+
+    /// Cancel any pending operation and flush the connection.
+    ///
+    /// Sends an attention signal to the server and drains the response
+    /// stream. This is useful when you need to ensure the connection is
+    /// clean before starting a new operation.
+    ///
+    /// If no operation is pending, this is a no-op.
+    pub async fn cancel(&mut self) -> crate::Result<()> {
+        self.connection.flush_stream().await
+    }
+
     pub(crate) fn rpc_params<'a>(query: impl Into<Cow<'a, str>>) -> Vec<RpcParam<'a>> {
         vec![
             RpcParam {
@@ -396,6 +431,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             params.value = ColumnData::String(Some(param_str.into()));
         }
 
+        self.send_rpc(proc_id, rpc_params).await
+    }
+
+    /// Send an RPC request with the given proc id and already-built parameters.
+    ///
+    /// Unlike [`rpc_perform_query`], this does not manipulate the `@params`
+    /// definitions string — the caller is fully responsible for the parameter
+    /// layout. Used by prepared statement and cursor helpers where the wire
+    /// layout differs from `sp_executesql`.
+    pub(crate) async fn send_rpc<'b>(
+        &mut self,
+        proc_id: RpcProcId,
+        rpc_params: Vec<RpcParam<'b>>,
+    ) -> crate::Result<()> {
         let req = TokenRpcRequest::new(
             proc_id,
             rpc_params,
@@ -407,4 +456,219 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
 
         Ok(())
     }
+
+    /// Prepare a SQL statement on the server and return a handle that can be
+    /// re-executed with different parameter values via
+    /// [`PreparedStatement::query`] / [`PreparedStatement::execute`].
+    ///
+    /// `param_defs` is the parameter declaration string in SQL Server syntax,
+    /// e.g. `"@P1 int, @P2 nvarchar(50)"`. Parameter names passed to
+    /// subsequent `execute` / `query` calls must match those declarations.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use tiberius::Config;
+    /// # use tokio_util::compat::TokioAsyncWriteCompatExt;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = Config::new();
+    /// # let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+    /// # let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+    /// let stmt = client
+    ///     .prepare("SELECT @P1 + @P2", "@P1 int, @P2 int")
+    ///     .await?;
+    /// let row = stmt
+    ///     .query(&mut client, &[&1i32, &2i32])
+    ///     .await?
+    ///     .into_row()
+    ///     .await?
+    ///     .unwrap();
+    /// assert_eq!(Some(3i32), row.get(0));
+    /// stmt.unprepare(&mut client).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn prepare<'a>(
+        &mut self,
+        sql: impl Into<Cow<'a, str>>,
+        param_defs: impl Into<Cow<'a, str>>,
+    ) -> crate::Result<PreparedStatement> {
+        let sql: Cow<'a, str> = sql.into();
+        let param_defs: Cow<'a, str> = param_defs.into();
+        let sql_owned = sql.to_string();
+        let defs_owned = param_defs.to_string();
+
+        self.connection.flush_stream().await?;
+        let rpc_params = prepared::build_prepare_params(sql, param_defs);
+        self.send_rpc(RpcProcId::Prepare, rpc_params).await?;
+
+        let (outputs, _status) = rpc_response::collect_rpc_outputs(&mut self.connection).await?;
+        let handle = prepared::extract_handle(&outputs)?;
+
+        Ok(PreparedStatement::new(handle, sql_owned, defs_owned))
+    }
+
+    /// Open a server-side cursor over the given SQL statement.
+    ///
+    /// `param_defs` follows the same format as [`prepare`](Self::prepare)
+    /// (`"@P1 int, @P2 nvarchar(50)"` etc.); pass an empty string if the
+    /// statement has no parameters.
+    ///
+    /// Use [`Cursor::fetch`] to page through rows and [`Cursor::close`] when
+    /// done.
+    pub async fn open_cursor<'a>(
+        &mut self,
+        sql: impl Into<Cow<'a, str>>,
+        options: cursor::CursorOpenOptions,
+        param_defs: impl Into<Cow<'a, str>>,
+        params: &[&'a dyn ToSql],
+    ) -> crate::Result<Cursor> {
+        self.connection.flush_stream().await?;
+        let rpc_params =
+            cursor::build_cursoropen_params(sql.into(), options, param_defs.into(), params);
+        self.send_rpc(RpcProcId::CursorOpen, rpc_params).await?;
+
+        // sp_cursoropen does not produce a result set on open — only output
+        // parameters + return status + DoneProc.
+        let (outputs, _status) = rpc_response::collect_rpc_outputs(&mut self.connection).await?;
+        cursor::cursor_from_outputs(&outputs)
+    }
+
+    /// Prepare a statement and open a cursor over its first execution in one
+    /// round trip using `sp_cursorprepexec`.
+    ///
+    /// `param_defs` follows the same format as [`prepare`](Self::prepare);
+    /// pass an empty string when the statement has no parameters.
+    pub async fn cursor_prep_exec<'a>(
+        &mut self,
+        sql: impl Into<Cow<'a, str>>,
+        options: cursor::CursorOpenOptions,
+        param_defs: impl Into<Cow<'a, str>>,
+        params: &[&'a dyn ToSql],
+    ) -> crate::Result<PreparedCursor> {
+        self.connection.flush_stream().await?;
+        let rpc_params =
+            cursor::build_cursorprepexec_params(sql.into(), options, param_defs.into(), params);
+        self.send_rpc(RpcProcId::CursorPrepExec, rpc_params).await?;
+
+        let (outputs, _status, metadata) =
+            rpc_response::collect_rpc_outputs_with_metadata(&mut self.connection).await?;
+        cursor::prepared_cursor_from_outputs(&outputs, metadata)
+    }
+
+    /// Prepare and execute a SQL statement in a single round trip. Returns
+    /// the handle alongside the buffered result rows from the first
+    /// execution.
+    ///
+    /// For subsequent executions use [`PreparedStatement::query`] or
+    /// [`PreparedStatement::execute`] on the returned handle.
+    ///
+    /// Unlike [`query`](Self::query), results are fully buffered rather
+    /// than streamed — the trailing `@handle` output parameter only arrives
+    /// after the result set, so streaming would require the caller to fully
+    /// consume the stream before seeing the handle. If you need to stream
+    /// the first execution, use [`prepare`](Self::prepare) followed by
+    /// [`PreparedStatement::query`] (two round trips).
+    pub async fn prep_exec<'a>(
+        &mut self,
+        sql: impl Into<Cow<'a, str>>,
+        param_defs: impl Into<Cow<'a, str>>,
+        params: &[&'a dyn ToSql],
+    ) -> crate::Result<(PreparedStatement, Vec<Vec<crate::Row>>)> {
+        let sql: Cow<'a, str> = sql.into();
+        let param_defs: Cow<'a, str> = param_defs.into();
+        let sql_owned = sql.to_string();
+        let defs_owned = param_defs.to_string();
+
+        self.connection.flush_stream().await?;
+        let rpc_params = prepared::build_prepexec_params(sql, param_defs, params);
+        self.send_rpc(RpcProcId::PrepExec, rpc_params).await?;
+
+        let (results, outputs) = collect_prep_exec_results(&mut self.connection).await?;
+        let handle = prepared::extract_handle(&outputs)?;
+
+        Ok((
+            PreparedStatement::new(handle, sql_owned, defs_owned),
+            results,
+        ))
+    }
+}
+
+/// Drain the response of an `sp_prepexec` call: collect all result sets into
+/// a `Vec<Vec<Row>>`, accumulating `RETURNVALUE` tokens (the `@handle` output
+/// arrives at the tail) and terminating when the final `DONEPROC` without the
+/// `More` flag is observed.
+async fn collect_prep_exec_results<S>(
+    conn: &mut Connection<S>,
+) -> crate::Result<(Vec<Vec<crate::Row>>, Vec<OutputValue>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    use crate::tds::codec::DoneStatus;
+    use crate::{Column, Row};
+    use std::sync::Arc;
+
+    let ts = TokenStream::new(conn);
+    let mut stream = ts.try_unfold();
+
+    let mut results: Vec<Vec<Row>> = Vec::new();
+    let mut current: Vec<Row> = Vec::new();
+    let mut columns: Option<Arc<Vec<Column>>> = None;
+    let mut result_index: usize = 0;
+    let mut outputs: Vec<OutputValue> = Vec::new();
+    let mut last_error: Option<crate::Error> = None;
+
+    while let Some(tok) = stream.try_next().await? {
+        match tok {
+            ReceivedToken::NewResultset(meta) => {
+                if columns.is_some() {
+                    results.push(std::mem::take(&mut current));
+                    result_index += 1;
+                }
+                let column_meta = meta.columns().collect::<Vec<_>>();
+                columns = Some(Arc::new(column_meta));
+            }
+            ReceivedToken::Row(data) => {
+                if let Some(cols) = &columns {
+                    current.push(Row {
+                        columns: cols.clone(),
+                        data,
+                        result_index,
+                    });
+                }
+            }
+            ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
+            ReceivedToken::Error(e) => {
+                last_error.get_or_insert(crate::Error::Server(e));
+            }
+            ReceivedToken::DoneInProc(ref done)
+                if !done.status().contains(DoneStatus::More) =>
+            {
+                if columns.is_some() {
+                    results.push(std::mem::take(&mut current));
+                    columns = None;
+                }
+                // DoneInProc without More closes one statement's result set
+                // inside the proc, but more tokens (like ReturnValue and
+                // DoneProc) still follow — keep draining.
+            }
+            ReceivedToken::Done(ref done) | ReceivedToken::DoneProc(ref done)
+                if !done.status().contains(DoneStatus::More) =>
+            {
+                if columns.is_some() {
+                    results.push(std::mem::take(&mut current));
+                    columns = None;
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(err);
+    }
+
+    Ok((results, outputs))
 }

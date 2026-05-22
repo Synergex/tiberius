@@ -1,5 +1,9 @@
 use super::BaseMetaDataColumn;
-use crate::{tds::codec::ColumnData, Error, SqlReadBytes};
+use crate::{
+    tds::codec::{BytesMutWithTypeInfo, ColumnData, Encode},
+    Error, SqlReadBytes, TokenType,
+};
+use bytes::{BufMut, BytesMut};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -15,7 +19,7 @@ pub struct TokenReturnValue {
 impl TokenReturnValue {
     pub(crate) async fn decode<R>(src: &mut R) -> crate::Result<Self>
     where
-        R: SqlReadBytes + Unpin,
+        R: SqlReadBytes + Unpin + Send,
     {
         let param_ordinal = src.read_u16_le().await?;
         let param_name = src.read_b_varchar().await?;
@@ -38,5 +42,22 @@ impl TokenReturnValue {
         };
 
         Ok(token)
+    }
+}
+
+impl Encode<BytesMut> for TokenReturnValue {
+    fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+        dst.put_u8(TokenType::ReturnValue as u8);
+        dst.put_u16_le(self.param_ordinal);
+
+        crate::tds::codec::token::write_b_varchar(dst, &self.param_name)?;
+        dst.put_u8(if self.udf { 0x02 } else { 0x01 });
+
+        self.meta.clone().encode(dst)?;
+
+        let mut dst_ti = BytesMutWithTypeInfo::new(dst).with_type_info(&self.meta.ty);
+        self.value.encode(&mut dst_ti)?;
+
+        Ok(())
     }
 }

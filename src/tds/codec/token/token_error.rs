@@ -1,4 +1,6 @@
-use crate::{tds::codec::FeatureLevel, SqlReadBytes};
+use crate::{tds::codec::Encode, tds::codec::FeatureLevel, SqlReadBytes, TokenType};
+use bytes::{BufMut, BytesMut};
+use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -18,6 +20,26 @@ pub struct TokenError {
 }
 
 impl TokenError {
+    pub fn new(
+        code: u32,
+        state: u8,
+        class: u8,
+        message: impl Into<String>,
+        server: impl Into<String>,
+        procedure: impl Into<String>,
+        line: u32,
+    ) -> Self {
+        Self {
+            code,
+            state,
+            class,
+            message: message.into(),
+            server: server.into(),
+            procedure: procedure.into(),
+            line,
+        }
+    }
+
     pub(crate) async fn decode<R>(src: &mut R) -> crate::Result<Self>
     where
         R: SqlReadBytes + Unpin,
@@ -89,6 +111,24 @@ impl TokenError {
     /// the message, the value is 0.
     pub fn line(&self) -> u32 {
         self.line
+    }
+}
+
+impl Encode<BytesMut> for TokenError {
+    fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+        let mut payload = BytesMut::new();
+        payload.put_u32_le(self.code);
+        payload.put_u8(self.state);
+        payload.put_u8(self.class);
+        write_us_varchar(&mut payload, &self.message)?;
+        write_b_varchar(&mut payload, &self.server)?;
+        write_b_varchar(&mut payload, &self.procedure)?;
+        payload.put_u32_le(self.line);
+
+        dst.put_u8(TokenType::Error as u8);
+        dst.put_u16_le(payload.len() as u16);
+        dst.extend(payload);
+        Ok(())
     }
 }
 

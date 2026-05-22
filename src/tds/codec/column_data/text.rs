@@ -1,4 +1,5 @@
 use crate::{error::Error, sql_read_bytes::SqlReadBytes, tds::Collation, ColumnData};
+use futures_util::AsyncReadExt;
 
 pub(crate) async fn decode<R>(
     src: &mut R,
@@ -7,24 +8,23 @@ pub(crate) async fn decode<R>(
 where
     R: SqlReadBytes + Unpin,
 {
-    let ptr_len = src.read_u8().await? as usize;
-
-    if ptr_len == 0 {
+    let text_ptr_len = src.read_u8().await?;
+    if text_ptr_len == 0 {
         return Ok(ColumnData::String(None));
     }
-
-    for _ in 0..ptr_len {
-        src.read_u8().await?;
+    let mut text_ptr = vec![0u8; text_ptr_len as usize];
+    src.read_exact(&mut text_ptr).await?;
+    let _timestamp = src.read_u64_le().await?;
+    let text_len = src.read_u32_le().await?;
+    if text_len == u32::MAX {
+        return Ok(ColumnData::String(None));
     }
-
-    src.read_i32_le().await?; // days
-    src.read_u32_le().await?; // second fractions
 
     let text = match collation {
         // TEXT
         Some(collation) => {
             let encoder = collation.encoding()?;
-            let text_len = src.read_u32_le().await? as usize;
+            let text_len = text_len as usize;
             let mut buf = Vec::with_capacity(text_len);
 
             for _ in 0..text_len {
@@ -38,7 +38,10 @@ where
         }
         // NTEXT
         None => {
-            let text_len = src.read_u32_le().await? as usize / 2;
+            if text_len % 2 != 0 {
+                return Err(Error::Protocol("ntext: odd byte length".into()));
+            }
+            let text_len = text_len as usize / 2;
             let mut buf = Vec::with_capacity(text_len);
 
             for _ in 0..text_len {

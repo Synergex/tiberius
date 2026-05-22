@@ -1,4 +1,6 @@
-use crate::SqlReadBytes;
+use crate::{tds::codec::Encode, SqlReadBytes, TokenType};
+use bytes::{BufMut, BytesMut};
+use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 
 #[allow(dead_code)] // we might want to debug the values
 #[derive(Debug)]
@@ -16,6 +18,27 @@ pub struct TokenInfo {
 }
 
 impl TokenInfo {
+    /// Create a new info token for server responses.
+    pub fn new(
+        number: u32,
+        state: u8,
+        class: u8,
+        message: impl Into<String>,
+        server: impl Into<String>,
+        procedure: impl Into<String>,
+        line: u32,
+    ) -> Self {
+        Self {
+            number,
+            state,
+            class,
+            message: message.into(),
+            server: server.into(),
+            procedure: procedure.into(),
+            line,
+        }
+    }
+
     pub(crate) async fn decode<R>(src: &mut R) -> crate::Result<Self>
     where
         R: SqlReadBytes + Unpin,
@@ -39,5 +62,23 @@ impl TokenInfo {
             procedure,
             line,
         })
+    }
+}
+
+impl Encode<BytesMut> for TokenInfo {
+    fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+        let mut payload = BytesMut::new();
+        payload.put_u32_le(self.number);
+        payload.put_u8(self.state);
+        payload.put_u8(self.class);
+        write_us_varchar(&mut payload, &self.message)?;
+        write_b_varchar(&mut payload, &self.server)?;
+        write_b_varchar(&mut payload, &self.procedure)?;
+        payload.put_u32_le(self.line);
+
+        dst.put_u8(TokenType::Info as u8);
+        dst.put_u16_le(payload.len() as u16);
+        dst.extend(payload);
+        Ok(())
     }
 }

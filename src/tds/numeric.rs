@@ -5,7 +5,6 @@ use crate::{sql_read_bytes::SqlReadBytes, Error};
 #[cfg(feature = "bigdecimal")]
 #[cfg_attr(feature = "docs", doc(cfg(feature = "bigdecimal")))]
 pub use bigdecimal::{num_bigint::BigInt, BigDecimal};
-use byteorder::{ByteOrder, LittleEndian};
 use bytes::{BufMut, BytesMut};
 #[cfg(feature = "rust_decimal")]
 #[cfg_attr(feature = "docs", doc(cfg(feature = "rust_decimal")))]
@@ -95,27 +94,6 @@ impl Numeric {
     where
         R: SqlReadBytes + Unpin,
     {
-        fn decode_d128(buf: &[u8]) -> u128 {
-            let low_part = LittleEndian::read_u64(&buf[0..]) as u128;
-
-            if !buf[8..].iter().any(|x| *x != 0) {
-                return low_part;
-            }
-
-            let high_part = match buf.len() {
-                12 => LittleEndian::read_u32(&buf[8..]) as u128,
-                16 => LittleEndian::read_u64(&buf[8..]) as u128,
-                _ => unreachable!(),
-            };
-
-            // swap high&low for big endian
-            #[cfg(target_endian = "big")]
-            let (low_part, high_part) = (high_part, low_part);
-
-            let high_part = high_part * (u64::max_value() as u128 + 1);
-            low_part + high_part
-        }
-
         let len = src.read_u8().await?;
 
         if len == 0 {
@@ -127,29 +105,19 @@ impl Numeric {
                 _ => return Err(Error::Protocol("decimal: invalid sign".into())),
             };
 
-            let value = match len {
-                5 => src.read_u32_le().await? as i128 * sign,
-                9 => src.read_u64_le().await? as i128 * sign,
-                13 => {
-                    let mut bytes = [0u8; 12]; //u96
-                    for item in &mut bytes {
-                        *item = src.read_u8().await?;
-                    }
-                    decode_d128(&bytes) as i128 * sign
-                }
-                17 => {
-                    let mut bytes = [0u8; 16];
-                    for item in &mut bytes {
-                        *item = src.read_u8().await?;
-                    }
-                    decode_d128(&bytes) as i128 * sign
-                }
-                x => {
-                    return Err(Error::Protocol(
-                        format!("decimal/numeric: invalid length of {} received", x).into(),
-                    ))
-                }
-            };
+            let data_len = (len as usize).saturating_sub(1);
+            if data_len > 16 {
+                return Err(Error::Protocol(
+                    format!("decimal/numeric: invalid length of {} received", len).into(),
+                ));
+            }
+
+            let mut raw = 0u128;
+            for idx in 0..data_len {
+                let byte = src.read_u8().await?;
+                raw |= (byte as u128) << (8 * idx);
+            }
+            let value = raw as i128 * sign;
 
             Ok(Some(Numeric::new_with_scale(value, scale)))
         }
@@ -239,7 +207,6 @@ mod decimal {
     use super::{Decimal, Numeric};
     use crate::ColumnData;
 
-    #[cfg(feature = "tds73")]
     from_sql!(Decimal: ColumnData::Numeric(ref num) => num.map(|num| {
         Decimal::from_i128_with_scale(
             num.value(),
@@ -247,7 +214,6 @@ mod decimal {
         )})
     );
 
-    #[cfg(feature = "tds73")]
     to_sql!(self_,
             Decimal: (ColumnData::Numeric, {
                 let unpacked = self_.unpack();
@@ -272,14 +238,12 @@ mod bigdecimal_ {
     use num_traits::ToPrimitive;
     use std::convert::TryFrom;
 
-    #[cfg(feature = "tds73")]
     from_sql!(BigDecimal: ColumnData::Numeric(ref num) => num.map(|num| {
         let int = BigInt::from(num.value());
 
         BigDecimal::new(int, num.scale() as i64)
     }));
 
-    #[cfg(feature = "tds73")]
     to_sql!(self_,
             BigDecimal: (ColumnData::Numeric, {
                 let (int, exp) = self_.as_bigint_and_exponent();
@@ -304,7 +268,6 @@ mod bigdecimal_ {
             });
     );
 
-    #[cfg(feature = "tds73")]
     into_sql!(self_,
             BigDecimal: (ColumnData::Numeric, {
                 let (int, exp) = self_.as_bigint_and_exponent();

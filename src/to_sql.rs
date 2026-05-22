@@ -1,5 +1,6 @@
 use crate::{
-    tds::{codec::ColumnData, Numeric},
+    tds::codec::{ColumnData, TvpData, VariantData},
+    tds::Numeric,
     xml::XmlData,
 };
 use std::borrow::Cow;
@@ -30,6 +31,8 @@ use uuid::Uuid;
 /// |[`Decimal`] (with feature flag `rust_decimal`)|`numeric`/`decimal`|
 /// |[`BigDecimal`] (with feature flag `bigdecimal`)|`numeric`/`decimal`|
 /// |[`XmlData`]|`xml`|
+/// |[`VariantData`]|`sql_variant`|
+/// |[`TvpData`]|table-valued parameter|
 /// |[`NaiveDate`] (with `chrono` feature, TDS 7.3 >)|`date`|
 /// |[`NaiveTime`] (with `chrono` feature, TDS 7.3 >)|`time`|
 /// |[`DateTime`] (with `chrono` feature, TDS 7.3 >)|`datetimeoffset`|
@@ -199,3 +202,43 @@ to_sql!(self_,
         XmlData: (ColumnData::Xml, Cow::Borrowed(self_));
         Uuid: (ColumnData::Guid, *self_);
 );
+
+// -- TvpData: ToSql / IntoSql --
+
+impl<'a> ToSql for TvpData<'a> {
+    fn to_sql(&self) -> ColumnData<'_> {
+        ColumnData::Tvp(Some(self.clone()))
+    }
+}
+
+impl<'a> IntoSql<'a> for TvpData<'a> {
+    fn into_sql(self) -> ColumnData<'a> {
+        ColumnData::Tvp(Some(self))
+    }
+}
+
+// -- VariantData: ToSql / IntoSql --
+
+impl<'a> ToSql for VariantData<'a> {
+    fn to_sql(&self) -> ColumnData<'_> {
+        ColumnData::Variant(Some(self.clone()))
+    }
+}
+
+impl<'a> ToSql for Option<VariantData<'a>> {
+    fn to_sql(&self) -> ColumnData<'_> {
+        ColumnData::Variant(self.clone())
+    }
+}
+
+impl<'a> IntoSql<'a> for VariantData<'a> {
+    fn into_sql(self) -> ColumnData<'a> {
+        ColumnData::Variant(Some(self))
+    }
+}
+
+impl<'a> IntoSql<'a> for Option<VariantData<'a>> {
+    fn into_sql(self) -> ColumnData<'a> {
+        ColumnData::Variant(self)
+    }
+}

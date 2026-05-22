@@ -43,6 +43,7 @@ uint_enum! {
 pub(crate) struct PacketHeader {
     ty: PacketType,
     status: PacketStatus,
+    raw_status: u8,
     /// [BE] the length of the packet (including the 8 header bytes)
     /// must match the negotiated size sending from client to server [since TDSv7.3] after login
     /// (only if not EndOfMessage)
@@ -60,7 +61,8 @@ impl PacketHeader {
         assert!(length <= u16::max_value() as usize);
         PacketHeader {
             ty: PacketType::TDSv7Login,
-            status: PacketStatus::ResetConnection,
+            status: PacketStatus::NormalMessage,
+            raw_status: PacketStatus::NormalMessage as u8,
             length: length as u16,
             spid: 0,
             id,
@@ -69,47 +71,59 @@ impl PacketHeader {
     }
 
     pub fn rpc(id: u8) -> Self {
-        Self {
-            ty: PacketType::Rpc,
-            status: PacketStatus::NormalMessage,
-            ..Self::new(0, id)
-        }
+        let mut header = Self::new(0, id);
+        header.set_type(PacketType::Rpc);
+        header.set_status(PacketStatus::NormalMessage);
+        header
     }
 
     pub fn pre_login(id: u8) -> Self {
-        Self {
-            ty: PacketType::PreLogin,
-            status: PacketStatus::EndOfMessage,
-            ..Self::new(0, id)
-        }
+        let mut header = Self::new(0, id);
+        header.set_type(PacketType::PreLogin);
+        header.set_status(PacketStatus::EndOfMessage);
+        header
     }
 
     pub fn login(id: u8) -> Self {
-        Self {
-            ty: PacketType::TDSv7Login,
-            status: PacketStatus::EndOfMessage,
-            ..Self::new(0, id)
-        }
+        let mut header = Self::new(0, id);
+        header.set_type(PacketType::TDSv7Login);
+        header.set_status(PacketStatus::EndOfMessage);
+        header
     }
 
     pub fn batch(id: u8) -> Self {
-        Self {
-            ty: PacketType::SQLBatch,
-            status: PacketStatus::NormalMessage,
-            ..Self::new(0, id)
-        }
+        let mut header = Self::new(0, id);
+        header.set_type(PacketType::SQLBatch);
+        header.set_status(PacketStatus::NormalMessage);
+        header
     }
 
     pub fn bulk_load(id: u8) -> Self {
-        Self {
-            ty: PacketType::BulkLoad,
-            status: PacketStatus::NormalMessage,
-            ..Self::new(0, id)
-        }
+        let mut header = Self::new(0, id);
+        header.set_type(PacketType::BulkLoad);
+        header.set_status(PacketStatus::NormalMessage);
+        header
+    }
+
+    pub fn attention(id: u8) -> Self {
+        let mut header = Self::new(0, id);
+        header.set_type(PacketType::AttentionSignal);
+        header.set_status(PacketStatus::EndOfMessage);
+        header
     }
 
     pub fn set_status(&mut self, status: PacketStatus) {
         self.status = status;
+        self.raw_status = status as u8;
+    }
+
+    pub fn set_status_bits(&mut self, bits: u8) {
+        self.raw_status |= bits;
+        if (self.raw_status & PacketStatus::EndOfMessage as u8) != 0 {
+            self.status = PacketStatus::EndOfMessage;
+        } else {
+            self.status = PacketStatus::NormalMessage;
+        }
     }
 
     pub fn set_type(&mut self, ty: PacketType) {
@@ -120,12 +134,20 @@ impl PacketHeader {
         self.status
     }
 
+    pub fn status_bits(&self) -> u8 {
+        self.raw_status
+    }
+
     pub fn r#type(&self) -> PacketType {
         self.ty
     }
 
     pub fn length(&self) -> u16 {
         self.length
+    }
+
+    pub(crate) fn id(&self) -> u8 {
+        self.id
     }
 }
 
@@ -135,7 +157,7 @@ where
 {
     fn encode(self, dst: &mut B) -> crate::Result<()> {
         dst.put_u8(self.ty as u8);
-        dst.put_u8(self.status as u8);
+        dst.put_u8(self.raw_status);
         dst.put_u16(self.length);
         dst.put_u16(self.spid);
         dst.put_u8(self.id);
@@ -156,12 +178,17 @@ impl Decode<BytesMut> for PacketHeader {
             Error::Protocol(format!("header: invalid packet type: {}", raw_ty).into())
         })?;
 
-        let status = PacketStatus::try_from(src.get_u8())
-            .map_err(|_| Error::Protocol("header: invalid packet status".into()))?;
+        let raw_status = src.get_u8();
+        let status = if (raw_status & PacketStatus::EndOfMessage as u8) != 0 {
+            PacketStatus::EndOfMessage
+        } else {
+            PacketStatus::NormalMessage
+        };
 
         let header = PacketHeader {
             ty,
             status,
+            raw_status,
             length: src.get_u16(),
             spid: src.get_u16(),
             id: src.get_u8(),

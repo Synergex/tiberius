@@ -1,4 +1,7 @@
-use crate::{Error, FeatureLevel, SqlReadBytes};
+use crate::{tds::codec::Encode, Error, FeatureLevel, SqlReadBytes, TokenType};
+use bytes::BytesMut;
+use bytes::BufMut;
+use crate::tds::codec::token::write_b_varchar;
 use std::convert::TryFrom;
 
 #[allow(dead_code)] // we might want to debug the values
@@ -16,6 +19,20 @@ pub struct TokenLoginAck {
 }
 
 impl TokenLoginAck {
+    pub fn new(
+        interface: u8,
+        tds_version: FeatureLevel,
+        prog_name: impl Into<String>,
+        version: u32,
+    ) -> Self {
+        Self {
+            interface,
+            tds_version,
+            prog_name: prog_name.into(),
+            version,
+        }
+    }
+
     pub(crate) async fn decode<R>(src: &mut R) -> crate::Result<Self>
     where
         R: SqlReadBytes + Unpin,
@@ -36,5 +53,21 @@ impl TokenLoginAck {
             prog_name,
             version,
         })
+    }
+}
+
+impl Encode<BytesMut> for TokenLoginAck {
+    fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+        let mut payload = BytesMut::new();
+        payload.put_u8(self.interface);
+        // TDS version is encoded big-endian in LOGINACK.
+        payload.put_u32(self.tds_version as u32);
+        write_b_varchar(&mut payload, &self.prog_name)?;
+        payload.put_u32_le(self.version);
+
+        dst.put_u8(TokenType::LoginAck as u8);
+        dst.put_u16_le(payload.len() as u16);
+        dst.extend(payload);
+        Ok(())
     }
 }
