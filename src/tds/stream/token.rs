@@ -347,14 +347,26 @@ where
                     };
                 }
 
-                // Check for cancellation request from CancellationToken
-                if !this.attention_sent && this.conn.is_cancellation_requested() {
-                    this.conn.clear_cancellation_request();
-                    this.conn.send_attention().await?;
-                    this.attention_sent = true;
-                }
-
-                let ty_byte = this.conn.read_u8().await?;
+                // Read the next token-type byte. While we have not yet sent an
+                // attention signal, use the cancellable read: a packet-less
+                // statement (e.g. `WAITFOR DELAY`) produces no bytes until it
+                // completes, so a bare `read_u8().await` would park here and
+                // never observe a `cancel()`. `read_u8_or_cancel` checks the
+                // cancellation flag up front and otherwise races the read
+                // against a waker-backed signal; on cancellation it sends the
+                // attention and we switch to the drain path. Once draining, a
+                // plain read suffices — the Done+Attention ack is incoming.
+                let ty_byte = if this.attention_sent {
+                    this.conn.read_u8().await?
+                } else {
+                    match this.conn.read_u8_or_cancel().await? {
+                        Some(byte) => byte,
+                        None => {
+                            this.attention_sent = true;
+                            continue;
+                        }
+                    }
+                };
 
                 let ty = TokenType::try_from(ty_byte).map_err(|_| {
                     Error::Protocol(format!("invalid token type {:x}", ty_byte).into())

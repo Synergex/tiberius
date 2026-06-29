@@ -63,6 +63,11 @@ pub enum Error {
     #[error("BULK UPLOAD input failure: {0}")]
     /// Invalid input in Bulk Upload
     BulkInput(Cow<'static, str>),
+    #[error("The operation was canceled")]
+    /// The in-flight operation was canceled via a
+    /// [`CancellationToken`](crate::CancellationToken); a TDS attention signal
+    /// was sent and the response drained. The connection remains usable.
+    Canceled,
 }
 
 impl Error {
