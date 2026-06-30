@@ -106,18 +106,42 @@ impl AuthHandler for TestAuth {
 // Trivial SQL batch handler — responds with a single empty Done
 // =============================================================================
 
+/// SQL text that makes [`NoopSqlBatch`] simulate a long, packet-less statement
+/// (the moral equivalent of `WAITFOR DELAY`): it emits no tokens and waits for
+/// an attention/cancellation to arrive.
+const PACKETLESS_DELAY_SQL: &str = "/* packetless-cancel-probe */ WAITFOR DELAY";
+
 struct NoopSqlBatch;
 
 impl SqlBatchHandler for NoopSqlBatch {
     fn on_sql_batch<'a, C>(
         &'a self,
         client: &'a mut C,
-        _message: tiberius::server::SqlBatchMessage,
+        message: tiberius::server::SqlBatchMessage,
     ) -> BoxFuture<'a, tiberius::Result<()>>
     where
         C: TdsClient + 'a,
     {
         Box::pin(async move {
+            if message.batch.contains(PACKETLESS_DELAY_SQL) {
+                // Simulate a long-running, packet-less statement: send nothing
+                // and cooperatively poll for an attention. When the client's
+                // CancellationToken fires, the (fixed) client wakes its parked
+                // read and sends a TDS attention; we observe it here and return,
+                // and the connection driver auto-emits Done+Attention.
+                //
+                // The loop is capped so that — absent a working cancel — the
+                // statement still terminates rather than hanging the suite (the
+                // test's timing assertion is what fails in that case). 500 * 10ms
+                // = 5s cap, well above the ~tens-of-ms a working cancel takes.
+                for _ in 0..500 {
+                    if client.poll_attention().await? {
+                        return Ok(());
+                    }
+                    smol::Timer::after(std::time::Duration::from_millis(10)).await;
+                }
+            }
+
             client
                 .send(TdsBackendMessage::Token(BackendToken::Done(
                     TokenDone::with_rows(0),
@@ -142,6 +166,10 @@ struct SharedState {
     cursor_fetch_log: Mutex<Vec<(i32, i32, i32)>>,
     cursorprepexec_param_defs_log: Mutex<Vec<Option<String>>>,
     cursorprepexec_send_metadata: Mutex<bool>,
+    /// When set, a metadata-only (`n_rows == 0`) `sp_cursorfetch` emits no
+    /// tokens and instead polls for an attention, simulating a stalled probe.
+    /// Used to exercise cancellation of the metadata-fetch read path.
+    stall_metadata_fetch: Mutex<bool>,
     rpc_log: Mutex<Vec<RpcProcId>>,
 }
 
@@ -154,6 +182,7 @@ impl SharedState {
             cursor_fetch_log: Mutex::new(Vec::new()),
             cursorprepexec_param_defs_log: Mutex::new(Vec::new()),
             cursorprepexec_send_metadata: Mutex::new(false),
+            stall_metadata_fetch: Mutex::new(false),
             rpc_log: Mutex::new(Vec::new()),
         }
     }
@@ -498,6 +527,20 @@ impl SpCursorFetchHandler for TestCursorFetch {
                 let store = self.0.cursor_rows.lock().unwrap();
                 store.get(&request.handle).cloned().unwrap_or_default()
             };
+
+            // Simulate a stalled metadata probe: emit no tokens and poll for an
+            // attention so a `cancel()` during `fetch_metadata` can interrupt
+            // the read. Read the flag into a bool first so no lock guard is held
+            // across an await. Capped so an un-cancelled run can't hang.
+            let stall = request.n_rows == 0 && *self.0.stall_metadata_fetch.lock().unwrap();
+            if stall {
+                for _ in 0..500 {
+                    if client.poll_attention().await? {
+                        return Ok(());
+                    }
+                    smol::Timer::after(std::time::Duration::from_millis(10)).await;
+                }
+            }
 
             if request.n_rows == 0 {
                 client
@@ -1307,6 +1350,140 @@ fn cancellation_mid_query_surfaces_as_error() {
 
             stmt.unprepare(&mut client).await.ok();
             stmt2.unprepare(&mut client).await.unwrap();
+        })
+        .await;
+    });
+}
+
+#[test]
+fn cancel_interrupts_packetless_long_statement() {
+    // Regression test for cancellation of a long, packet-less statement
+    // (e.g. `WAITFOR DELAY`). The server batch handler emits no tokens and
+    // only finishes when it observes an attention. From another task we fire
+    // `cancel()` shortly after issuing the query; the client must wake its
+    // parked read, send a TDS attention immediately, and the query must
+    // terminate in ~the cancel latency — NOT run to the handler's 5s cap.
+    //
+    // Before the fix `cancel()` only set an AtomicBool with no waker, so the
+    // client stayed parked in `read_u8().await` (no bytes arrive for a
+    // packet-less statement) and never sent the attention — this test would
+    // take ~5s and the elapsed assertion would fail.
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            // Take the token before borrowing the client for the query. The
+            // parking happens inside `simple_query` itself (it forwards to
+            // metadata), so the cancel must fire from another task.
+            let token = client.cancellation_token();
+            let canceller = smol::spawn(async move {
+                smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                token.cancel();
+            });
+
+            let start = std::time::Instant::now();
+            let sql = format!("{PACKETLESS_DELAY_SQL} '00:00:30'");
+            // Scope the query so the QueryStream's mutable borrow of `client`
+            // is released before we reuse the client below.
+            let elapsed = {
+                // `simple_query` issues a raw SQL batch (hits `on_sql_batch`)
+                // and awaits the first metadata token, which never comes until
+                // the cancel-induced attention drains the stream.
+                let result = client.simple_query(sql).await;
+                let elapsed = start.elapsed();
+                // Whether the drained stream surfaces as Ok (empty) or an
+                // error, it must have terminated — drain it without hanging.
+                if let Ok(stream) = result {
+                    let _ = stream.into_results().await;
+                }
+                elapsed
+            };
+            canceller.await;
+
+            // Must terminate promptly, not at the handler's 5s cap.
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "cancellation did not interrupt the packet-less statement: took {elapsed:?}"
+            );
+
+            // The connection must be clean and reusable after the cancel drain.
+            let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
+            let row = stmt
+                .query(&mut client, &[&42i32])
+                .await
+                .unwrap()
+                .into_row()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i32, _>(0), Some(42));
+            stmt.unprepare(&mut client).await.unwrap();
+        })
+        .await;
+    });
+}
+
+#[test]
+fn cancel_interrupts_packetless_cursor_metadata_fetch() {
+    // Regression test for the cursor metadata-fetch path, which drains its RPC
+    // response in `collect_metadata_only_rpc` (a raw read loop *outside*
+    // `TokenStream::try_unfold`). With the server stalling the `sp_cursorfetch`
+    // (@nrows = 0) probe, a `cancel()` from another task must interrupt the
+    // parked read, send attention, and surface `Error::Canceled` promptly —
+    // proving the cancellation race covers this path too, not just the token
+    // stream.
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            *state.stall_metadata_fetch.lock().unwrap() = true;
+            let mut client = connect_client(addr).await.unwrap();
+
+            let mut cursor = client
+                .cursor_prep_exec(
+                    "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
+                    CursorOpenOptions::default(),
+                    "",
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            let token = client.cancellation_token();
+            let canceller = smol::spawn(async move {
+                smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                token.cancel();
+            });
+
+            // `fetch_metadata` issues `sp_cursorfetch` (@nrows = 0) and parks in
+            // `collect_metadata_only_rpc`'s read loop; the stalled handler emits
+            // no tokens until it observes the attention.
+            let start = std::time::Instant::now();
+            let result = cursor.fetch_metadata(&mut client).await;
+            let elapsed = start.elapsed();
+            canceller.await;
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "cancellation did not interrupt the cursor metadata fetch: took {elapsed:?}"
+            );
+            assert!(
+                matches!(&result, Err(tiberius::error::Error::Canceled)),
+                "expected Error::Canceled, got {result:?}"
+            );
+
+            // Stop stalling, then prove the connection is reusable after the
+            // cancel drain.
+            *state.stall_metadata_fetch.lock().unwrap() = false;
+            let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
+            let row = stmt
+                .query(&mut client, &[&42i32])
+                .await
+                .unwrap()
+                .into_row()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i32, _>(0), Some(42));
+            stmt.unprepare(&mut client).await.unwrap();
         })
         .await;
     });

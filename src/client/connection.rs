@@ -5,7 +5,7 @@
 ))]
 use crate::client::{tls::TlsPreloginWrapper, tls_stream::create_tls_stream};
 use crate::{
-    client::{tls::MaybeTlsStream, AuthMethod, Config},
+    client::{tls::MaybeTlsStream, AuthMethod, CancelSignal, CancellationState, Config},
     tds::{
         codec::{
             self, Encode, LoginMessage, Packet, PacketCodec, PacketHeader, PacketStatus,
@@ -20,6 +20,7 @@ use asynchronous_codec::Framed;
 use bytes::BytesMut;
 #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
 use codec::TokenSspi;
+use futures_util::future::{select, Either};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::ready;
 use futures_util::sink::SinkExt;
@@ -34,7 +35,6 @@ use libgssapi::{
 use pretty_hex::*;
 #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{cmp, fmt::Debug, io, pin::Pin, task};
 use task::Poll;
@@ -59,7 +59,7 @@ where
     flushed: bool,
     context: Context,
     buf: BytesMut,
-    cancellation_requested: Arc<AtomicBool>,
+    cancellation: Arc<CancellationState>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Debug for Connection<S> {
@@ -89,7 +89,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             context,
             flushed: false,
             buf: BytesMut::new(),
-            cancellation_requested: Arc::new(AtomicBool::new(false)),
+            cancellation: Arc::new(CancellationState::new()),
         };
 
         let fed_auth_required = matches!(config.auth, AuthMethod::AADToken(_));
@@ -236,17 +236,61 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Returns a [`CancellationToken`] that can request cancellation of
     /// in-flight queries from another task.
     pub(crate) fn cancellation_token(&self) -> super::CancellationToken {
-        super::CancellationToken::new(self.cancellation_requested.clone())
+        super::CancellationToken::new(self.cancellation.clone())
     }
 
     /// Returns `true` if a cancellation has been requested via the token.
     pub(crate) fn is_cancellation_requested(&self) -> bool {
-        self.cancellation_requested.load(Ordering::Acquire)
+        self.cancellation.is_requested()
     }
 
     /// Clears the cancellation request flag.
     pub(crate) fn clear_cancellation_request(&self) {
-        self.cancellation_requested.store(false, Ordering::Release);
+        self.cancellation.clear();
+    }
+
+    /// Reads the next token-type byte, racing the read against cancellation.
+    ///
+    /// While no attention has yet been sent, a packet-less statement produces
+    /// no bytes, so a bare `read_u8().await` would park indefinitely and never
+    /// observe a `cancel()`. Racing the read against [`CancelSignal`] lets
+    /// `cancel()` wake this task; on cancellation we send the TDS attention
+    /// signal here and return `Ok(None)`, leaving the caller to drain the rest
+    /// of the response to the server's `Done+Attention` acknowledgment.
+    ///
+    /// Returns `Ok(Some(byte))` if a byte was read, or `Ok(None)` if
+    /// cancellation won (the attention signal has been sent). Any abandoned
+    /// read has consumed no bytes — a single-byte read parks before touching
+    /// the buffer — so nothing is lost.
+    pub(crate) async fn read_u8_or_cancel(&mut self) -> crate::Result<Option<u8>> {
+        // Check the flag up front. `select` polls the read first and returns
+        // immediately if it is ready, so without this a cancellation requested
+        // before entry would be ignored whenever the next byte is already
+        // buffered (the read would keep winning the race). This makes the
+        // helper self-contained so every caller gets the fast path.
+        if self.is_cancellation_requested() {
+            self.clear_cancellation_request();
+            self.send_attention().await?;
+            return Ok(None);
+        }
+
+        let signal = CancelSignal::new(self.cancellation.clone());
+
+        // Both raced futures (one of which borrows the connection) are dropped
+        // at the end of this statement, freeing the connection to write below.
+        let maybe_byte = match select(self.read_u8(), signal).await {
+            Either::Left((res, _cancel)) => Some(res?),
+            Either::Right(((), _read)) => None,
+        };
+
+        match maybe_byte {
+            Some(byte) => Ok(Some(byte)),
+            None => {
+                self.clear_cancellation_request();
+                self.send_attention().await?;
+                Ok(None)
+            }
+        }
     }
 
     /// Cleans the packet stream from previous use by sending a TDS attention
@@ -489,7 +533,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             let Self {
                 transport,
                 context,
-                cancellation_requested,
+                cancellation,
                 ..
             } = self;
             let mut stream = match transport.into_inner() {
@@ -509,7 +553,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 context,
                 flushed: false,
                 buf: BytesMut::new(),
-                cancellation_requested,
+                cancellation,
             })
         } else {
             event!(

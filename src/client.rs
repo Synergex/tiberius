@@ -15,6 +15,7 @@ mod tls;
 mod tls_stream;
 
 pub use auth::*;
+pub(crate) use cancellation::{CancelSignal, CancellationState};
 pub use cancellation::CancellationToken;
 pub use config::*;
 pub(crate) use connection::*;

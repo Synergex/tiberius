@@ -195,7 +195,19 @@ where
     let mut last_error = None;
 
     loop {
-        let ty_byte = conn.read_u8().await?;
+        // Race the token-byte read against cancellation. A metadata probe that
+        // stalls (e.g. server lock contention) would otherwise park here with
+        // no way to observe a `cancel()`. On cancellation the attention signal
+        // has been sent; drain to the Done+Attention ack and surface it.
+        let ty_byte = match conn.read_u8_or_cancel().await? {
+            Some(byte) => byte,
+            None => {
+                TokenStream::new_with_attention(conn)
+                    .flush_to_attention()
+                    .await?;
+                return Err(crate::Error::Canceled);
+            }
+        };
         let ty = TokenType::try_from(ty_byte).map_err(|_| {
             crate::Error::Protocol(format!("invalid token type {:x}", ty_byte).into())
         })?;
@@ -411,8 +423,9 @@ mod tests {
             mk_done_proc_final(),
         ]);
 
-        let (outputs, status, metadata) =
-            collect_rpc_outputs_with_metadata_from_stream(s).await.unwrap();
+        let (outputs, status, metadata) = collect_rpc_outputs_with_metadata_from_stream(s)
+            .await
+            .unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].get::<i32>().unwrap(), Some(42));
