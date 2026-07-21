@@ -8,8 +8,9 @@ use std::sync::Once;
 
 use tiberius::FromSql;
 use tiberius::{
-    numeric::Numeric, xml::XmlData, ColumnData, ColumnFlag, ColumnType, Query, QueryItem, Result,
-    TvpColumn, TvpData, TypeInfo, UdtData, VarLenContext, VarLenType, VariantData,
+    numeric::Numeric, xml::XmlData, ColumnData, ColumnFlag, ColumnType, CursorConcurrencyOptions,
+    CursorOpenOptions, CursorScrollOptions, Query, QueryItem, Result, TvpColumn, TvpData, TypeInfo,
+    UdtData, VarLenContext, VarLenType, VariantData,
 };
 use uuid::Uuid;
 
@@ -561,6 +562,61 @@ where
             }
         }
     }
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn cursor_prep_exec_allow_direct_returns_owned_results<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let outcome = conn
+        .cursor_prep_exec(
+            "SELECT CAST(101 AS int) AS first_value; \
+             SELECT CAST(202 AS int) AS second_value;",
+            CursorOpenOptions::new(
+                CursorScrollOptions::ForwardOnly,
+                CursorConcurrencyOptions::ReadOnly | CursorConcurrencyOptions::AllowDirect,
+            ),
+            "",
+            &[],
+        )
+        .await?;
+
+    let direct = match outcome.into_direct() {
+        Ok(direct) => direct,
+        Err(cursor) => {
+            cursor.close_and_unprepare(&mut conn).await?;
+            panic!("SQL Server opened a cursor instead of taking AllowDirect");
+        }
+    };
+
+    assert_ne!(direct.prepared_handle().as_i32(), 0);
+    assert_eq!(direct.results().len(), 2);
+    assert_eq!(direct.results()[0].columns()[0].name(), "first_value");
+    assert_eq!(direct.results()[0].rows().len(), 1);
+    assert_eq!(direct.results()[0].rows()[0].result_index(), 0);
+    assert_eq!(direct.results()[0].rows()[0].get::<i32, _>(0), Some(101));
+    assert_eq!(direct.results()[1].columns()[0].name(), "second_value");
+    assert_eq!(direct.results()[1].rows().len(), 1);
+    assert_eq!(direct.results()[1].rows()[0].result_index(), 1);
+    assert_eq!(direct.results()[1].rows()[0].get::<i32, _>(0), Some(202));
+
+    let owned = direct.unprepare(&mut conn).await?;
+    assert_eq!(owned.len(), 2);
+
+    // A successful follow-up request proves the direct RPC response and
+    // CursorUnprepare response were both fully drained.
+    let row = conn
+        .query("SELECT CAST(303 AS int)", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i32, _>(0), Some(303));
 
     Ok(())
 }

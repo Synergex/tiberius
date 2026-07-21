@@ -9,15 +9,18 @@
 //! until the connection closes; a warning is emitted via `tracing`.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use enumflags2::{bitflags, BitFlags};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use tracing::{event, Level};
 
-use crate::client::rpc_response::{collect_metadata_only_rpc, collect_rpc_outputs, OutputValue};
+use crate::client::rpc_response::{
+    collect_metadata_only_rpc, collect_rpc_outputs, BufferedResultSet, OutputValue,
+};
 use crate::tds::codec::{ColumnData, RpcParam, RpcProcId, RpcStatus};
 use crate::tds::stream::{QueryStream, TokenStream};
-use crate::{Client, Column, PreparedHandle, ToSql};
+use crate::{Client, Column, PreparedHandle, Row, ToSql};
 
 /// Scroll options for `sp_cursoropen` / `sp_cursorprepexec` (TDS §2.2.6.7).
 ///
@@ -346,6 +349,172 @@ impl Drop for PreparedCursor {
                 "PreparedCursor dropped without unprepare; server-side handle will leak until the connection closes"
             );
         }
+    }
+}
+
+/// The outcome of [`Client::cursor_prep_exec`](crate::Client::cursor_prep_exec).
+///
+/// `sp_cursorprepexec` normally opens a server-side cursor, but when the
+/// statement is opened read-only with the
+/// [`AllowDirect`](CursorConcurrencyOptions::AllowDirect) concurrency option
+/// the server may elect the *AllowDirect* fast path: it prepares the statement
+/// but skips opening a cursor (`@cursor == 0`) and instead streams the result
+/// sets inline during the RPC response. This enum reports which path the
+/// server took.
+#[derive(Debug)]
+pub enum CursorPrepExecOutcome {
+    /// The server opened a cursor (`@cursor` nonzero). Page through it with
+    /// [`PreparedCursor::fetch`].
+    Cursor(PreparedCursor),
+    /// The server executed the statement directly (`@cursor == 0`), returning
+    /// the result sets inline. The prepared handle still needs releasing — see
+    /// [`DirectResults::unprepare`].
+    Direct(DirectResults),
+}
+
+impl CursorPrepExecOutcome {
+    /// The server-assigned prepared statement handle, which is present in both
+    /// outcomes.
+    pub fn prepared_handle(&self) -> PreparedHandle {
+        match self {
+            CursorPrepExecOutcome::Cursor(c) => c.prepared_handle(),
+            CursorPrepExecOutcome::Direct(d) => d.prepared_handle(),
+        }
+    }
+
+    /// `true` if the server took the AllowDirect fast path.
+    pub fn is_direct(&self) -> bool {
+        matches!(self, CursorPrepExecOutcome::Direct(_))
+    }
+
+    /// Consume the outcome, returning the [`PreparedCursor`] if the server
+    /// opened a cursor.
+    ///
+    /// An AllowDirect response is returned intact as `Err(DirectResults)` so
+    /// its prepared handle and buffered rows remain available for cleanup and
+    /// consumption.
+    pub fn into_cursor(self) -> std::result::Result<PreparedCursor, DirectResults> {
+        match self {
+            CursorPrepExecOutcome::Cursor(c) => Ok(c),
+            CursorPrepExecOutcome::Direct(d) => Err(d),
+        }
+    }
+
+    /// Consume the outcome, returning the [`DirectResults`] if the server took
+    /// the AllowDirect fast path.
+    ///
+    /// A normal cursor response is returned intact as `Err(PreparedCursor)` so
+    /// both server-side handles remain available for fetching and cleanup.
+    pub fn into_direct(self) -> std::result::Result<DirectResults, PreparedCursor> {
+        match self {
+            CursorPrepExecOutcome::Direct(d) => Ok(d),
+            CursorPrepExecOutcome::Cursor(c) => Err(c),
+        }
+    }
+}
+
+/// The result sets a server returned inline from an AllowDirect
+/// `sp_cursorprepexec`, together with the prepared handle that must still be
+/// released.
+///
+/// No cursor was opened, so there is nothing to fetch or close — the buffered
+/// [`results`](Self::results) are the complete response. Call
+/// [`unprepare`](Self::unprepare) to release the prepared handle (and take
+/// ownership of the result sets); dropping without unpreparing leaks the
+/// handle until the connection closes and logs a warning.
+#[derive(Debug)]
+pub struct DirectResults {
+    prepared_handle: PreparedHandle,
+    results: Vec<DirectResultSet>,
+    scrollopt: BitFlags<CursorScrollOptions>,
+    ccopt: BitFlags<CursorConcurrencyOptions>,
+    row_count: i32,
+    released: bool,
+}
+
+impl DirectResults {
+    /// The server-assigned prepared statement handle.
+    pub fn prepared_handle(&self) -> PreparedHandle {
+        self.prepared_handle
+    }
+
+    /// Negotiated scroll flags returned by the server.
+    pub fn scroll_options(&self) -> BitFlags<CursorScrollOptions> {
+        self.scrollopt
+    }
+
+    /// Negotiated concurrency flags returned by the server (includes the
+    /// [`AllowDirect`](CursorConcurrencyOptions::AllowDirect) bit).
+    pub fn concurrency_options(&self) -> BitFlags<CursorConcurrencyOptions> {
+        self.ccopt
+    }
+
+    /// Server-reported row count, or `-1` if unknown.
+    pub fn row_count(&self) -> i32 {
+        self.row_count
+    }
+
+    /// The buffered result sets, in the order the server streamed them.
+    pub fn results(&self) -> &[DirectResultSet] {
+        &self.results
+    }
+
+    /// Release the prepared handle via `sp_cursorunprepare`, returning the
+    /// owned result sets.
+    ///
+    /// There is no cursor to close, so this only unprepares the statement.
+    pub async fn unprepare<S>(
+        mut self,
+        client: &mut Client<S>,
+    ) -> crate::Result<Vec<DirectResultSet>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        client.connection.flush_stream().await?;
+        let handle_param = build_cursorunprepare_param(self.prepared_handle);
+        client
+            .send_rpc(RpcProcId::CursorUnprepare, vec![handle_param])
+            .await?;
+        self.released = true;
+        collect_rpc_outputs(&mut client.connection).await?;
+        Ok(std::mem::take(&mut self.results))
+    }
+}
+
+impl Drop for DirectResults {
+    fn drop(&mut self) {
+        if !self.released {
+            event!(
+                Level::WARN,
+                prepared_handle = self.prepared_handle.as_i32(),
+                "DirectResults dropped without unprepare; server-side prepared handle will leak until the connection closes"
+            );
+        }
+    }
+}
+
+/// A single result set from an AllowDirect execution: its column metadata and
+/// the rows the server streamed for it.
+#[derive(Debug)]
+pub struct DirectResultSet {
+    columns: Arc<Vec<Column>>,
+    rows: Vec<Row>,
+}
+
+impl DirectResultSet {
+    /// The column metadata for this result set.
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    /// The buffered rows, in order.
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
+    /// Consume this result set, returning its owned rows.
+    pub fn into_rows(self) -> Vec<Row> {
+        self.rows
     }
 }
 
@@ -712,10 +881,87 @@ pub(crate) fn prepared_cursor_from_outputs(
     })
 }
 
+/// Interpret an `sp_cursorprepexec` response, distinguishing a normal
+/// prepared cursor from an AllowDirect direct-result response.
+///
+/// The server signals AllowDirect by returning a nonzero `@prepared_handle`
+/// but a zero `@cursor`, streaming the result sets inline (buffered here into
+/// `result_sets`). A nonzero `@cursor` is the normal cursor path and is
+/// handled exactly as before by [`prepared_cursor_from_outputs`]; the buffered
+/// rows (a normal open streams only metadata) are used solely to seed the
+/// cursor's cached metadata.
+pub(crate) fn cursor_prep_exec_outcome(
+    outputs: &[OutputValue],
+    result_sets: Vec<BufferedResultSet>,
+) -> crate::Result<CursorPrepExecOutcome> {
+    let lookup_named = |name: &str| -> Option<i32> {
+        outputs
+            .iter()
+            .find(|o| !o.name().is_empty() && o.matches_name(name))
+            .and_then(|o| o.get::<i32>().ok().flatten())
+    };
+    let by_pos = |idx: usize| -> Option<i32> {
+        outputs.get(idx).and_then(|o| o.get::<i32>().ok().flatten())
+    };
+
+    let prepared_handle = lookup_named("prepared_handle")
+        .or_else(|| lookup_named("handle"))
+        .or_else(|| by_pos(0))
+        .ok_or_else(|| {
+            crate::Error::Protocol(
+                "sp_cursorprepexec: missing @prepared_handle output parameter".into(),
+            )
+        })?;
+    if prepared_handle == 0 {
+        return Err(crate::Error::Protocol(
+            "sp_cursorprepexec: server returned a zero @prepared_handle".into(),
+        ));
+    }
+
+    // A zero @cursor (with a valid prepared handle) is the AllowDirect signal:
+    // the server executed directly and streamed the result sets inline. A
+    // nonzero or absent @cursor falls through to the normal cursor path.
+    match lookup_named("cursor").or_else(|| by_pos(1)) {
+        Some(0) => {
+            let scrollopt = lookup_named("scrollopt").or_else(|| by_pos(2)).unwrap_or(0);
+            let ccopt = lookup_named("ccopt").or_else(|| by_pos(3)).unwrap_or(0);
+            let row_count = lookup_named("rowcount").or_else(|| by_pos(4)).unwrap_or(-1);
+
+            let results = result_sets
+                .into_iter()
+                .map(|rs| DirectResultSet {
+                    columns: rs.columns,
+                    rows: rs.rows,
+                })
+                .collect();
+
+            Ok(CursorPrepExecOutcome::Direct(DirectResults {
+                prepared_handle: PreparedHandle::from_i32(prepared_handle),
+                results,
+                scrollopt: i32_to_scroll_flags(scrollopt),
+                ccopt: i32_to_cc_flags(ccopt),
+                row_count,
+                released: false,
+            }))
+        }
+        _ => {
+            // Preserve the pre-AllowDirect behaviour: seed the cursor's cached
+            // metadata from the first result set (only non-empty sets are
+            // buffered, so `first` is the first non-empty COLMETADATA).
+            let metadata = result_sets.first().map(|rs| (*rs.columns).clone());
+            Ok(CursorPrepExecOutcome::Cursor(prepared_cursor_from_outputs(
+                outputs, metadata,
+            )?))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tds::codec::{BaseMetaDataColumn, FixedLenType, TokenReturnValue, TypeInfo};
+    use crate::tds::codec::{
+        BaseMetaDataColumn, FixedLenType, TokenReturnValue, TokenRow, TypeInfo,
+    };
 
     #[test]
     fn fetch_encodes_next() {
@@ -920,5 +1166,171 @@ mod tests {
         assert_eq!(param.name, "");
         assert!(param.flags.is_empty());
         assert!(matches!(param.value, ColumnData::I32(Some(77))));
+    }
+
+    fn direct_set(result_index: usize, values: &[i32]) -> BufferedResultSet {
+        let columns = Arc::new(vec![Column::new("v".to_string(), crate::ColumnType::Int4)]);
+        let rows = values
+            .iter()
+            .map(|&v| {
+                let mut data = TokenRow::new();
+                data.push(ColumnData::I32(Some(v)));
+                Row {
+                    columns: columns.clone(),
+                    data,
+                    result_index,
+                }
+            })
+            .collect();
+        BufferedResultSet { columns, rows }
+    }
+
+    #[test]
+    fn cursor_prep_exec_outcome_returns_cursor_for_nonzero_cursor() {
+        let outputs = vec![
+            output("", 11),
+            output("", 22),
+            output("", CursorScrollOptions::ForwardOnly as i32),
+            output("", CursorConcurrencyOptions::ReadOnly as i32),
+            output("", 3),
+        ];
+
+        let outcome = cursor_prep_exec_outcome(&outputs, Vec::new()).unwrap();
+        assert!(!outcome.is_direct());
+        assert_eq!(outcome.prepared_handle().as_i32(), 11);
+
+        let cursor = outcome.into_cursor().expect("expected cursor outcome");
+        assert_eq!(cursor.prepared_handle().as_i32(), 11);
+        assert_eq!(cursor.cursor_handle().as_i32(), 22);
+        assert_eq!(cursor.row_count(), 3);
+    }
+
+    #[test]
+    fn cursor_prep_exec_outcome_returns_direct_for_zero_cursor() {
+        let outputs = vec![
+            output("", 11),
+            output("", 0),
+            output("", CursorScrollOptions::ForwardOnly as i32),
+            output("", CursorConcurrencyOptions::AllowDirect as i32),
+            output("", 3),
+        ];
+
+        let outcome = cursor_prep_exec_outcome(&outputs, vec![direct_set(0, &[1, 2, 3])]).unwrap();
+        assert!(outcome.is_direct());
+        assert_eq!(outcome.prepared_handle().as_i32(), 11);
+
+        let direct = outcome.into_direct().expect("expected direct outcome");
+        assert_eq!(direct.prepared_handle().as_i32(), 11);
+        assert_eq!(direct.row_count(), 3);
+        assert!(direct
+            .concurrency_options()
+            .contains(CursorConcurrencyOptions::AllowDirect));
+        assert_eq!(direct.results().len(), 1);
+        assert_eq!(direct.results()[0].columns().len(), 1);
+        assert_eq!(direct.results()[0].columns()[0].name(), "v");
+        assert_eq!(direct.results()[0].rows().len(), 3);
+        assert_eq!(direct.results()[0].rows()[0].get::<i32, _>(0), Some(1));
+        assert_eq!(direct.results()[0].rows()[2].get::<i32, _>(0), Some(3));
+    }
+
+    #[test]
+    fn into_cursor_preserves_direct_results_on_mismatch() {
+        let outputs = vec![output("", 11), output("", 0)];
+        let outcome = cursor_prep_exec_outcome(&outputs, vec![direct_set(0, &[7])]).unwrap();
+
+        let mut direct = outcome
+            .into_cursor()
+            .expect_err("expected intact direct results");
+        assert_eq!(direct.prepared_handle().as_i32(), 11);
+        assert_eq!(direct.results().len(), 1);
+        assert_eq!(direct.results()[0].rows()[0].get::<i32, _>(0), Some(7));
+
+        // This is a synthetic unit-test handle, so suppress the intentional
+        // leak warning after proving the alternate variant survived intact.
+        direct.released = true;
+    }
+
+    #[test]
+    fn into_direct_preserves_prepared_cursor_on_mismatch() {
+        let outputs = vec![output("", 11), output("", 22)];
+        let outcome = cursor_prep_exec_outcome(&outputs, Vec::new()).unwrap();
+
+        let mut cursor = outcome
+            .into_direct()
+            .expect_err("expected intact prepared cursor");
+        assert_eq!(cursor.prepared_handle().as_i32(), 11);
+        assert_eq!(cursor.cursor_handle().as_i32(), 22);
+
+        // These are synthetic unit-test handles, so suppress the intentional
+        // leak warnings after proving the alternate variant survived intact.
+        cursor.released = true;
+        if let Some(inner) = cursor.cursor.as_mut() {
+            inner.closed = true;
+        }
+    }
+
+    #[test]
+    fn cursor_prep_exec_outcome_preserves_multiple_direct_sets_in_order() {
+        let outputs = vec![
+            output("", 11),
+            output("", 0),
+            output("", 0),
+            output("", 0),
+            output("", 5),
+        ];
+
+        let outcome = cursor_prep_exec_outcome(
+            &outputs,
+            vec![direct_set(0, &[1, 2, 3]), direct_set(1, &[4, 5])],
+        )
+        .unwrap();
+        let direct = outcome.into_direct().expect("expected direct outcome");
+
+        assert_eq!(direct.results().len(), 2);
+        assert_eq!(direct.results()[0].rows().len(), 3);
+        assert_eq!(direct.results()[0].rows()[0].get::<i32, _>(0), Some(1));
+        assert_eq!(direct.results()[1].rows().len(), 2);
+        assert_eq!(direct.results()[1].rows()[0].get::<i32, _>(0), Some(4));
+        assert_eq!(direct.results()[1].rows()[1].get::<i32, _>(0), Some(5));
+    }
+
+    #[test]
+    fn direct_result_set_into_rows_returns_owned_rows() {
+        let columns = Arc::new(vec![Column::new("v".to_string(), crate::ColumnType::Int4)]);
+        let mut data = TokenRow::new();
+        data.push(ColumnData::I32(Some(9)));
+        let rows = vec![Row {
+            columns: columns.clone(),
+            data,
+            result_index: 0,
+        }];
+        let rs = DirectResultSet { columns, rows };
+
+        assert_eq!(rs.columns().len(), 1);
+        assert_eq!(rs.rows().len(), 1);
+
+        let owned = rs.into_rows();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].get::<i32, _>(0), Some(9));
+    }
+
+    #[test]
+    fn cursor_prep_exec_outcome_errors_on_zero_prepared_handle() {
+        let outputs = vec![output("", 0), output("", 0)];
+        let err = cursor_prep_exec_outcome(&outputs, Vec::new()).unwrap_err();
+        assert!(matches!(err, crate::Error::Protocol(_)));
+    }
+
+    #[test]
+    fn cursor_prep_exec_outcome_errors_on_missing_cursor() {
+        // A prepared handle but no @cursor anywhere falls through to the normal
+        // cursor path, which reports the missing-@cursor protocol error.
+        let outputs = vec![output("@prepared_handle", 11)];
+        match cursor_prep_exec_outcome(&outputs, Vec::new()).unwrap_err() {
+            crate::Error::Protocol(msg) => {
+                assert!(msg.contains("@cursor"), "unexpected message: {msg}")
+            }
+            other => panic!("expected protocol error, got {:?}", other),
+        }
     }
 }
