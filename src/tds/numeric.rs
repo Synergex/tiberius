@@ -152,19 +152,27 @@ impl Encode<BytesMut> for Numeric {
 
 impl Debug for Numeric {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(
-            f,
-            "{}.{:0pad$}",
-            self.int_part(),
-            self.dec_part(),
-            pad = self.scale as usize
-        )
+        Display::fmt(self, f)
     }
 }
 
 impl Display for Numeric {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{:?}", self)
+        if self.scale == 0 {
+            return write!(f, "{}", self.value);
+        }
+
+        let magnitude = self.value.unsigned_abs();
+        let scale = 10u128.pow(self.scale as u32);
+        let sign = if self.value < 0 { "-" } else { "" };
+
+        write!(
+            f,
+            "{sign}{}.{:0width$}",
+            magnitude / scale,
+            magnitude % scale,
+            width = self.scale as usize
+        )
     }
 }
 
@@ -329,6 +337,24 @@ mod tests {
         let n = Numeric::new_with_scale(57705, 2);
         assert_eq!(n.int_part(), 577);
         assert_eq!(n.dec_part(), 5);
+    }
+
+    #[test]
+    fn numeric_formatting() {
+        let cases = [
+            (Numeric::new_with_scale(123, 0), "123"),
+            (Numeric::new_with_scale(12345, 2), "123.45"),
+            (Numeric::new_with_scale(5, 2), "0.05"),
+            (Numeric::new_with_scale(-12345, 2), "-123.45"),
+            (Numeric::new_with_scale(-5, 2), "-0.05"),
+            (Numeric::new_with_scale(0, 0), "0"),
+            (Numeric::new_with_scale(0, 2), "0.00"),
+        ];
+
+        for (numeric, expected) in cases {
+            assert_eq!(numeric.to_string(), expected);
+            assert_eq!(format!("{numeric:?}"), expected);
+        }
     }
 
     #[test]
