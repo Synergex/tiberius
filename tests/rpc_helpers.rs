@@ -31,7 +31,7 @@ use tiberius::server::{
 use tiberius::{
     BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions,
     CursorScrollOptions, EncryptionLevel, FixedLenType, MetaDataColumn, RpcProcId,
-    TokenColMetaData, TokenDone, TypeInfo,
+    TokenColMetaData, TokenDone, TokenInfo, TypeInfo,
 };
 
 // =============================================================================
@@ -167,8 +167,8 @@ struct SharedState {
     cursorprepexec_param_defs_log: Mutex<Vec<Option<String>>>,
     cursorprepexec_send_metadata: Mutex<bool>,
     /// When set, `sp_cursorprepexec` takes the AllowDirect fast path: it
-    /// prepares the statement but returns `@cursor == 0` and streams the
-    /// result sets inline instead of opening a cursor.
+    /// prepares the statement, emits INFO 16954, and streams the result sets
+    /// inline instead of opening a cursor.
     cursorprepexec_allow_direct: Mutex<bool>,
     /// When set, a metadata-only (`n_rows == 0`) `sp_cursorfetch` emits no
     /// tokens and instead polls for an attention, simulating a stalled probe.
@@ -377,6 +377,7 @@ impl SpUnprepareHandler for TestUnprepare {
         C: TdsClient + 'a,
     {
         Box::pin(async move {
+            self.0.rpc_log.lock().unwrap().push(RpcProcId::Unprepare);
             self.0.procs.lock().unwrap().unprepare(&request.handle());
             send_return_status(client, 0).await?;
             client
@@ -713,26 +714,33 @@ impl RpcHandler for SpecialRpc {
 
                     if *self.0.cursorprepexec_allow_direct.lock().unwrap() {
                         // AllowDirect: prepare the statement but do NOT open a
-                        // cursor. Stream the result sets inline and return
-                        // @cursor == 0. Emit two sets to exercise ordering.
+                        // cursor. Real SQL Server signals that fallback with
+                        // INFO 16954 and omits the cursor ID and row-count
+                        // outputs. Emit two sets to exercise ordering.
+                        client
+                            .send(TdsBackendMessage::TokenPartial(BackendToken::Info(
+                                TokenInfo::new(
+                                    16954,
+                                    1,
+                                    10,
+                                    "Executing SQL directly; no cursor.",
+                                    "test-server",
+                                    "",
+                                    1,
+                                ),
+                            )))
+                            .await?;
                         write_int_result_set(client, &[1, 2, 3], FinalDone::InProc).await?;
                         write_int_result_set(client, &[4, 5, 6], FinalDone::InProc).await?;
 
-                        let outputs = vec![
-                            OutputParameter::from_input(
-                                &all[0],
-                                ColumnData::I32(Some(prepared_handle.as_i32())),
-                            )
-                            .with_ordinal(1),
-                            OutputParameter::from_input(&all[1], ColumnData::I32(Some(0)))
-                                .with_ordinal(2),
-                            OutputParameter::from_input(&all[4], ColumnData::I32(Some(scrollopt)))
-                                .with_ordinal(5),
-                            OutputParameter::from_input(&all[5], ColumnData::I32(Some(ccopt)))
-                                .with_ordinal(6),
-                            OutputParameter::from_input(&all[6], ColumnData::I32(Some(6)))
-                                .with_ordinal(7),
-                        ];
+                        // Only the prepared handle is guaranteed to be useful
+                        // after direct fallback. In particular, do not invent a
+                        // zero @cursor or option outputs just to satisfy the
+                        // client parser.
+                        let outputs = vec![OutputParameter::from_input(
+                            &all[0],
+                            ColumnData::I32(Some(prepared_handle.as_i32())),
+                        )];
                         send_output_params(client, outputs).await?;
                         send_return_status(client, 0).await?;
                         client
@@ -1258,7 +1266,7 @@ fn cursor_prep_exec_allow_direct_returns_owned_results() {
             let seen_rpcs = state.rpc_log.lock().unwrap().clone();
             assert_eq!(
                 seen_rpcs,
-                vec![RpcProcId::CursorPrepExec, RpcProcId::CursorUnprepare]
+                vec![RpcProcId::CursorPrepExec, RpcProcId::Unprepare]
             );
         })
         .await;

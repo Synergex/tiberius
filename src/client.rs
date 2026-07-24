@@ -563,9 +563,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             cursor::build_cursorprepexec_params(sql.into(), options, param_defs.into(), params);
         self.send_rpc(RpcProcId::CursorPrepExec, rpc_params).await?;
 
-        let (result_sets, outputs, _status) =
+        let (result_sets, outputs, _status, infos) =
             rpc_response::collect_rpc_result_sets(&mut self.connection).await?;
-        cursor::cursor_prep_exec_outcome(&outputs, result_sets)
+        cursor::cursor_prep_exec_outcome(&outputs, result_sets, &infos, options)
     }
 
     /// Prepare and execute a SQL statement in a single round trip. Returns

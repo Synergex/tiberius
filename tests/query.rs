@@ -9,8 +9,8 @@ use std::sync::Once;
 use tiberius::FromSql;
 use tiberius::{
     numeric::Numeric, xml::XmlData, ColumnData, ColumnFlag, ColumnType, CursorConcurrencyOptions,
-    CursorOpenOptions, CursorScrollOptions, Query, QueryItem, Result, TvpColumn, TvpData, TypeInfo,
-    UdtData, VarLenContext, VarLenType, VariantData,
+    CursorOpenOptions, CursorScrollOptions, Fetch, Query, QueryItem, Result, TvpColumn, TvpData,
+    TypeInfo, UdtData, VarLenContext, VarLenType, VariantData,
 };
 use uuid::Uuid;
 
@@ -567,6 +567,40 @@ where
 }
 
 #[test_on_runtimes]
+async fn cursor_prep_exec_normal_cursor_round_trip<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let outcome = conn
+        .cursor_prep_exec(
+            "SELECT CAST(101 AS int) AS value",
+            CursorOpenOptions::default(),
+            "",
+            &[],
+        )
+        .await?;
+
+    let cursor = match outcome.into_cursor() {
+        Ok(cursor) => cursor,
+        Err(direct) => {
+            direct.unprepare(&mut conn).await?;
+            panic!("SQL Server executed directly without AllowDirect");
+        }
+    };
+
+    let rows = cursor
+        .fetch(&mut conn, Fetch::Next { count: 10 })
+        .await?
+        .into_first_result()
+        .await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i32, _>(0), Some(101));
+
+    cursor.close_and_unprepare(&mut conn).await?;
+    Ok(())
+}
+
+#[test_on_runtimes]
 async fn cursor_prep_exec_allow_direct_returns_owned_results<S>(
     mut conn: tiberius::Client<S>,
 ) -> Result<()>
@@ -609,7 +643,7 @@ where
     assert_eq!(owned.len(), 2);
 
     // A successful follow-up request proves the direct RPC response and
-    // CursorUnprepare response were both fully drained.
+    // Unprepare response were both fully drained.
     let row = conn
         .query("SELECT CAST(303 AS int)", &[])
         .await?

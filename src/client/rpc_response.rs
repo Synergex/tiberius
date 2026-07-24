@@ -204,7 +204,12 @@ pub(crate) struct BufferedResultSet {
 /// inline, and those rows must be kept.
 pub(crate) async fn collect_rpc_result_sets<S>(
     conn: &mut Connection<S>,
-) -> crate::Result<(Vec<BufferedResultSet>, Vec<OutputValue>, Option<u32>)>
+) -> crate::Result<(
+    Vec<BufferedResultSet>,
+    Vec<OutputValue>,
+    Option<u32>,
+    Vec<TokenInfo>,
+)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -218,7 +223,12 @@ where
 /// [`collect_rpc_outputs_from_stream`]).
 async fn collect_rpc_result_sets_from_stream<S>(
     mut stream: S,
-) -> crate::Result<(Vec<BufferedResultSet>, Vec<OutputValue>, Option<u32>)>
+) -> crate::Result<(
+    Vec<BufferedResultSet>,
+    Vec<OutputValue>,
+    Option<u32>,
+    Vec<TokenInfo>,
+)>
 where
     S: Stream<Item = crate::Result<ReceivedToken>> + Unpin,
 {
@@ -227,6 +237,7 @@ where
     let mut current: Vec<Row> = Vec::new();
     let mut outputs: Vec<OutputValue> = Vec::new();
     let mut status = None;
+    let mut infos = Vec::new();
     let mut last_error: Option<crate::Error> = None;
 
     // Flush the in-progress result set into `results`, but only if it carries
@@ -267,6 +278,7 @@ where
             }
             ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
             ReceivedToken::ReturnStatus(s) => status = Some(s),
+            ReceivedToken::Info(info) => infos.push(info),
             ReceivedToken::Error(e) => {
                 if last_error.is_none() {
                     last_error = Some(crate::Error::Server(e));
@@ -293,7 +305,7 @@ where
         return Err(err);
     }
 
-    Ok((results, outputs, status))
+    Ok((results, outputs, status, infos))
 }
 
 /// Drain a metadata-only cursor-fetch RPC response without constructing a
@@ -652,7 +664,8 @@ mod tests {
             mk_done_proc_final(),
         ]);
 
-        let (results, outputs, status) = collect_rpc_result_sets_from_stream(s).await.unwrap();
+        let (results, outputs, status, infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].columns.len(), 1);
@@ -663,6 +676,7 @@ mod tests {
         assert_eq!(results[0].rows[0].result_index(), 0);
         assert_eq!(outputs.len(), 2);
         assert_eq!(status, Some(0));
+        assert!(infos.is_empty());
     }
 
     #[tokio::test]
@@ -678,7 +692,8 @@ mod tests {
             mk_done_proc_final(),
         ]);
 
-        let (results, _outputs, _status) = collect_rpc_result_sets_from_stream(s).await.unwrap();
+        let (results, _outputs, _status, _infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].rows.len(), 2);
@@ -700,7 +715,8 @@ mod tests {
             mk_done_proc_final(),
         ]);
 
-        let (results, _outputs, _status) = collect_rpc_result_sets_from_stream(s).await.unwrap();
+        let (results, _outputs, _status, _infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].rows[0].get::<i32, _>(0), Some(1));
@@ -733,10 +749,36 @@ mod tests {
             mk_done_proc_final(),
         ]);
 
-        let (results, outputs, status) = collect_rpc_result_sets_from_stream(s).await.unwrap();
+        let (results, outputs, status, infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
 
         assert!(results.is_empty());
         assert_eq!(outputs.len(), 1);
         assert_eq!(status, Some(0));
+        assert!(infos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_result_sets_retains_info_tokens() {
+        let s = synthetic(vec![
+            ReceivedToken::Info(TokenInfo::new(
+                16954,
+                1,
+                10,
+                "Executing SQL directly; no cursor.",
+                "srv",
+                "",
+                1,
+            )),
+            ReceivedToken::ReturnValue(mk_return_value("", 1, ColumnData::I32(Some(11)))),
+            mk_done_proc_final(),
+        ]);
+
+        let (_results, outputs, _status, infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].number, 16954);
     }
 }
