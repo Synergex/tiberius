@@ -20,8 +20,8 @@ pub use cancellation::CancellationToken;
 pub use config::*;
 pub(crate) use connection::*;
 pub use cursor::{
-    Cursor, CursorConcurrencyOptions, CursorHandle, CursorOpenOptions, CursorScrollOptions, Fetch,
-    PreparedCursor,
+    Cursor, CursorConcurrencyOptions, CursorHandle, CursorOpenOptions, CursorPrepExecOutcome,
+    CursorScrollOptions, DirectResultSet, DirectResults, Fetch, PreparedCursor,
 };
 pub use prepared::{PreparedHandle, PreparedStatement};
 pub use rpc_response::OutputValue;
@@ -541,21 +541,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     ///
     /// `param_defs` follows the same format as [`prepare`](Self::prepare);
     /// pass an empty string when the statement has no parameters.
+    ///
+    /// The return value is a [`CursorPrepExecOutcome`]: usually the server
+    /// opens a cursor ([`Cursor`](CursorPrepExecOutcome::Cursor)), but when the
+    /// statement is opened read-only with
+    /// [`CursorConcurrencyOptions::AllowDirect`] the server may take the
+    /// *AllowDirect* fast path — preparing the statement but skipping the
+    /// cursor and streaming the result sets inline
+    /// ([`Direct`](CursorPrepExecOutcome::Direct)). Either way the prepared
+    /// handle must be released (via [`PreparedCursor::unprepare`] or
+    /// [`DirectResults::unprepare`]).
     pub async fn cursor_prep_exec<'a>(
         &mut self,
         sql: impl Into<Cow<'a, str>>,
         options: cursor::CursorOpenOptions,
         param_defs: impl Into<Cow<'a, str>>,
         params: &[&'a dyn ToSql],
-    ) -> crate::Result<PreparedCursor> {
+    ) -> crate::Result<CursorPrepExecOutcome> {
         self.connection.flush_stream().await?;
         let rpc_params =
             cursor::build_cursorprepexec_params(sql.into(), options, param_defs.into(), params);
         self.send_rpc(RpcProcId::CursorPrepExec, rpc_params).await?;
 
-        let (outputs, _status, metadata) =
-            rpc_response::collect_rpc_outputs_with_metadata(&mut self.connection).await?;
-        cursor::prepared_cursor_from_outputs(&outputs, metadata)
+        let (result_sets, outputs, _status, infos) =
+            rpc_response::collect_rpc_result_sets(&mut self.connection).await?;
+        cursor::cursor_prep_exec_outcome(&outputs, result_sets, &infos, options)
     }
 
     /// Prepare and execute a SQL statement in a single round trip. Returns

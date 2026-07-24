@@ -13,7 +13,7 @@ use crate::tds::codec::{
     TokenTabName,
 };
 use crate::tds::stream::{ReceivedToken, TokenStream};
-use crate::{Column, FromSql, SqlReadBytes, TokenType};
+use crate::{Column, FromSql, Row, SqlReadBytes, TokenType};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::{Stream, TryStreamExt};
 use std::convert::TryFrom;
@@ -182,6 +182,132 @@ where
     Ok((outputs, status, metadata))
 }
 
+/// A single result set buffered from an RPC response: its column metadata and
+/// every row that belongs to it.
+///
+/// Unlike [`collect_rpc_outputs_with_metadata`], which keeps only the first
+/// COLMETADATA and discards row data, this retains the rows so callers such as
+/// the AllowDirect `sp_cursorprepexec` path can own the streamed result sets.
+#[derive(Debug)]
+pub(crate) struct BufferedResultSet {
+    pub columns: Arc<Vec<Column>>,
+    pub rows: Vec<Row>,
+}
+
+/// Drain an RPC response, buffering every result set (metadata + rows, in
+/// order) alongside the `RETURNVALUE` outputs and the return status.
+///
+/// This is the row-preserving counterpart of
+/// [`collect_rpc_outputs_with_metadata`]: `sp_cursorprepexec` normally streams
+/// only COLMETADATA on open (rows arrive later via `sp_cursorfetch`), but when
+/// the server selects the AllowDirect fast path it streams the result sets
+/// inline, and those rows must be kept.
+pub(crate) async fn collect_rpc_result_sets<S>(
+    conn: &mut Connection<S>,
+) -> crate::Result<(
+    Vec<BufferedResultSet>,
+    Vec<OutputValue>,
+    Option<u32>,
+    Vec<TokenInfo>,
+)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let ts = TokenStream::new(conn);
+    let stream = ts.try_unfold();
+    collect_rpc_result_sets_from_stream(stream).await
+}
+
+/// Lower-level variant that drains an arbitrary token stream, so the buffering
+/// logic can be unit-tested with synthetic inputs (mirrors
+/// [`collect_rpc_outputs_from_stream`]).
+async fn collect_rpc_result_sets_from_stream<S>(
+    mut stream: S,
+) -> crate::Result<(
+    Vec<BufferedResultSet>,
+    Vec<OutputValue>,
+    Option<u32>,
+    Vec<TokenInfo>,
+)>
+where
+    S: Stream<Item = crate::Result<ReceivedToken>> + Unpin,
+{
+    let mut results: Vec<BufferedResultSet> = Vec::new();
+    let mut columns: Option<Arc<Vec<Column>>> = None;
+    let mut current: Vec<Row> = Vec::new();
+    let mut outputs: Vec<OutputValue> = Vec::new();
+    let mut status = None;
+    let mut infos = Vec::new();
+    let mut last_error: Option<crate::Error> = None;
+
+    // Flush the in-progress result set into `results`, but only if it carries
+    // column metadata — a result set is defined by its COLMETADATA, so an
+    // empty-COLMETADATA placeholder (0 columns) is dropped rather than recorded.
+    fn flush(
+        results: &mut Vec<BufferedResultSet>,
+        columns: &mut Option<Arc<Vec<Column>>>,
+        current: &mut Vec<Row>,
+    ) {
+        if let Some(cols) = columns.take() {
+            if !cols.is_empty() {
+                results.push(BufferedResultSet {
+                    columns: cols,
+                    rows: std::mem::take(current),
+                });
+            } else {
+                current.clear();
+            }
+        }
+    }
+
+    while let Some(token) = stream.try_next().await? {
+        match token {
+            ReceivedToken::NewResultset(meta) => {
+                flush(&mut results, &mut columns, &mut current);
+                columns = Some(Arc::new(meta.columns().collect::<Vec<_>>()));
+            }
+            ReceivedToken::Row(data) => {
+                if let Some(cols) = &columns {
+                    current.push(Row {
+                        columns: cols.clone(),
+                        data,
+                        // The index this set will occupy once flushed.
+                        result_index: results.len(),
+                    });
+                }
+            }
+            ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
+            ReceivedToken::ReturnStatus(s) => status = Some(s),
+            ReceivedToken::Info(info) => infos.push(info),
+            ReceivedToken::Error(e) => {
+                if last_error.is_none() {
+                    last_error = Some(crate::Error::Server(e));
+                }
+            }
+            ReceivedToken::DoneInProc(done) => {
+                // A DoneInProc without `More` closes one statement's result set
+                // inside the proc; more tokens (ReturnValue, DoneProc) follow.
+                if !done.status().contains(DoneStatus::More) {
+                    flush(&mut results, &mut columns, &mut current);
+                }
+            }
+            ReceivedToken::DoneProc(done) | ReceivedToken::Done(done) => {
+                if !done.status().contains(DoneStatus::More) {
+                    flush(&mut results, &mut columns, &mut current);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(err);
+    }
+
+    Ok((results, outputs, status, infos))
+}
+
 /// Drain a metadata-only cursor-fetch RPC response without constructing a
 /// [`QueryStream`](crate::QueryStream). The metadata probe requests zero rows,
 /// so this walker returns as soon as it sees the first non-empty COLMETADATA
@@ -294,7 +420,7 @@ where
 mod tests {
     use super::*;
     use crate::tds::codec::{
-        BaseMetaDataColumn, FixedLenType, MetaDataColumn, TokenDone, TokenError, TypeInfo,
+        BaseMetaDataColumn, FixedLenType, MetaDataColumn, TokenDone, TokenError, TokenRow, TypeInfo,
     };
     use enumflags2::BitFlags;
     use futures_util::stream::iter;
@@ -513,5 +639,146 @@ mod tests {
         let (outputs, status) = collect_rpc_outputs_from_stream(s).await.unwrap();
         assert!(outputs.is_empty());
         assert!(status.is_none());
+    }
+
+    fn mk_row(value: i32) -> ReceivedToken {
+        let mut row = TokenRow::new();
+        row.push(ColumnData::I32(Some(value)));
+        ReceivedToken::Row(row)
+    }
+
+    #[tokio::test]
+    async fn collect_result_sets_buffers_single_set_with_rows_and_outputs() {
+        let s = synthetic(vec![
+            ReceivedToken::NewResultset(mk_metadata("v")),
+            mk_row(1),
+            mk_row(2),
+            mk_row(3),
+            ReceivedToken::ReturnValue(mk_return_value(
+                "@prepared_handle",
+                1,
+                ColumnData::I32(Some(11)),
+            )),
+            ReceivedToken::ReturnValue(mk_return_value("@cursor", 2, ColumnData::I32(Some(0)))),
+            ReceivedToken::ReturnStatus(0),
+            mk_done_proc_final(),
+        ]);
+
+        let (results, outputs, status, infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].columns.len(), 1);
+        assert_eq!(results[0].columns[0].name(), "v");
+        assert_eq!(results[0].rows.len(), 3);
+        assert_eq!(results[0].rows[0].get::<i32, _>(0), Some(1));
+        assert_eq!(results[0].rows[2].get::<i32, _>(0), Some(3));
+        assert_eq!(results[0].rows[0].result_index(), 0);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(status, Some(0));
+        assert!(infos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_result_sets_preserves_multiple_sets_in_order() {
+        let s = synthetic(vec![
+            ReceivedToken::NewResultset(mk_metadata("v")),
+            mk_row(1),
+            mk_row(2),
+            ReceivedToken::DoneInProc(TokenDone::with_rows(2)),
+            ReceivedToken::NewResultset(mk_metadata("v")),
+            mk_row(3),
+            ReceivedToken::ReturnStatus(0),
+            mk_done_proc_final(),
+        ]);
+
+        let (results, _outputs, _status, _infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].rows.len(), 2);
+        assert_eq!(results[0].rows[0].get::<i32, _>(0), Some(1));
+        assert_eq!(results[0].rows[0].result_index(), 0);
+        assert_eq!(results[1].rows.len(), 1);
+        assert_eq!(results[1].rows[0].get::<i32, _>(0), Some(3));
+        assert_eq!(results[1].rows[0].result_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_result_sets_drops_empty_colmetadata_placeholder() {
+        let s = synthetic(vec![
+            ReceivedToken::NewResultset(Arc::new(TokenColMetaData {
+                columns: Vec::new(),
+            })),
+            ReceivedToken::NewResultset(mk_metadata("v")),
+            mk_row(1),
+            mk_done_proc_final(),
+        ]);
+
+        let (results, _outputs, _status, _infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].rows[0].get::<i32, _>(0), Some(1));
+        assert_eq!(results[0].rows[0].result_index(), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_result_sets_surfaces_first_error() {
+        let err = TokenError::new(50000, 1, 16, "boom", "srv", "proc", 1);
+        let s = synthetic(vec![
+            ReceivedToken::NewResultset(mk_metadata("v")),
+            mk_row(1),
+            ReceivedToken::Error(err),
+            ReceivedToken::ReturnStatus(0),
+            mk_done_proc_final(),
+        ]);
+
+        match collect_rpc_result_sets_from_stream(s).await {
+            Err(crate::Error::Server(te)) => assert_eq!(te.code, 50000),
+            other => panic!("expected Server error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_result_sets_no_result_sets_outputs_only() {
+        // The normal (non-AllowDirect) shape: no inline rows, just outputs.
+        let s = synthetic(vec![
+            ReceivedToken::ReturnValue(mk_return_value("@handle", 1, ColumnData::I32(Some(7)))),
+            ReceivedToken::ReturnStatus(0),
+            mk_done_proc_final(),
+        ]);
+
+        let (results, outputs, status, infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
+
+        assert!(results.is_empty());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(status, Some(0));
+        assert!(infos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_result_sets_retains_info_tokens() {
+        let s = synthetic(vec![
+            ReceivedToken::Info(TokenInfo::new(
+                16954,
+                1,
+                10,
+                "Executing SQL directly; no cursor.",
+                "srv",
+                "",
+                1,
+            )),
+            ReceivedToken::ReturnValue(mk_return_value("", 1, ColumnData::I32(Some(11)))),
+            mk_done_proc_final(),
+        ]);
+
+        let (_results, outputs, _status, infos) =
+            collect_rpc_result_sets_from_stream(s).await.unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].number, 16954);
     }
 }
