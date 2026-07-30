@@ -31,7 +31,7 @@ use tiberius::server::{
 use tiberius::{
     BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions,
     CursorScrollOptions, EncryptionLevel, FixedLenType, MetaDataColumn, RpcProcId,
-    TokenColMetaData, TokenDone, TypeInfo,
+    TokenColMetaData, TokenDone, TokenInfo, TypeInfo,
 };
 
 // =============================================================================
@@ -166,6 +166,10 @@ struct SharedState {
     cursor_fetch_log: Mutex<Vec<(i32, i32, i32)>>,
     cursorprepexec_param_defs_log: Mutex<Vec<Option<String>>>,
     cursorprepexec_send_metadata: Mutex<bool>,
+    /// When set, `sp_cursorprepexec` takes the AllowDirect fast path: it
+    /// prepares the statement, emits INFO 16954, and streams the result sets
+    /// inline instead of opening a cursor.
+    cursorprepexec_allow_direct: Mutex<bool>,
     /// When set, a metadata-only (`n_rows == 0`) `sp_cursorfetch` emits no
     /// tokens and instead polls for an attention, simulating a stalled probe.
     /// Used to exercise cancellation of the metadata-fetch read path.
@@ -182,6 +186,7 @@ impl SharedState {
             cursor_fetch_log: Mutex::new(Vec::new()),
             cursorprepexec_param_defs_log: Mutex::new(Vec::new()),
             cursorprepexec_send_metadata: Mutex::new(false),
+            cursorprepexec_allow_direct: Mutex::new(false),
             stall_metadata_fetch: Mutex::new(false),
             rpc_log: Mutex::new(Vec::new()),
         }
@@ -372,6 +377,7 @@ impl SpUnprepareHandler for TestUnprepare {
         C: TdsClient + 'a,
     {
         Box::pin(async move {
+            self.0.rpc_log.lock().unwrap().push(RpcProcId::Unprepare);
             self.0.procs.lock().unwrap().unprepare(&request.handle());
             send_return_status(client, 0).await?;
             client
@@ -705,6 +711,46 @@ impl RpcHandler for SpecialRpc {
                         ColumnData::I32(Some(v)) => *v,
                         _ => 0,
                     };
+
+                    if *self.0.cursorprepexec_allow_direct.lock().unwrap() {
+                        // AllowDirect: prepare the statement but do NOT open a
+                        // cursor. Real SQL Server signals that fallback with
+                        // INFO 16954 and omits the cursor ID and row-count
+                        // outputs. Emit two sets to exercise ordering.
+                        client
+                            .send(TdsBackendMessage::TokenPartial(BackendToken::Info(
+                                TokenInfo::new(
+                                    16954,
+                                    1,
+                                    10,
+                                    "Executing SQL directly; no cursor.",
+                                    "test-server",
+                                    "",
+                                    1,
+                                ),
+                            )))
+                            .await?;
+                        write_int_result_set(client, &[1, 2, 3], FinalDone::InProc).await?;
+                        write_int_result_set(client, &[4, 5, 6], FinalDone::InProc).await?;
+
+                        // Only the prepared handle is guaranteed to be useful
+                        // after direct fallback. In particular, do not invent a
+                        // zero @cursor or option outputs just to satisfy the
+                        // client parser.
+                        let outputs = vec![OutputParameter::from_input(
+                            &all[0],
+                            ColumnData::I32(Some(prepared_handle.as_i32())),
+                        )];
+                        send_output_params(client, outputs).await?;
+                        send_return_status(client, 0).await?;
+                        client
+                            .send(TdsBackendMessage::Token(BackendToken::DoneProc(
+                                TokenDone::with_rows(0),
+                            )))
+                            .await?;
+                        return Ok(());
+                    }
+
                     let cursor_entry = CursorEntry::new(sql, scrollopt, ccopt, rows.len() as i32);
                     let cursor_handle = self.0.cursors.lock().unwrap().open(cursor_entry);
                     self.0
@@ -1102,7 +1148,9 @@ fn cursor_prep_exec_fetch_close_unprepare() {
                     &[],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_cursor()
+                .expect("expected prepared cursor");
             assert_ne!(cursor.prepared_handle().as_i32(), 0);
             assert_ne!(cursor.cursor_handle().as_i32(), 0);
             assert_eq!(cursor.row_count(), 3);
@@ -1159,6 +1207,73 @@ fn cursor_prep_exec_fetch_close_unprepare() {
 }
 
 #[test]
+fn cursor_prep_exec_allow_direct_returns_owned_results() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            *state.cursorprepexec_allow_direct.lock().unwrap() = true;
+            let mut client = connect_client(addr).await.unwrap();
+
+            let outcome = client
+                .cursor_prep_exec(
+                    "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
+                    CursorOpenOptions::new(
+                        CursorScrollOptions::ForwardOnly,
+                        tiberius::CursorConcurrencyOptions::ReadOnly
+                            | tiberius::CursorConcurrencyOptions::AllowDirect,
+                    ),
+                    "",
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            // The server took the AllowDirect fast path: no cursor, results
+            // streamed inline.
+            assert!(outcome.is_direct());
+            assert_ne!(outcome.prepared_handle().as_i32(), 0);
+
+            let direct = outcome.into_direct().expect("expected AllowDirect results");
+            assert!(direct
+                .concurrency_options()
+                .contains(tiberius::CursorConcurrencyOptions::AllowDirect));
+
+            // Both result sets are preserved, in order, with metadata and rows.
+            assert_eq!(direct.results().len(), 2);
+            assert_eq!(direct.results()[0].columns().len(), 1);
+            assert_eq!(direct.results()[0].columns()[0].name(), "v");
+
+            let first: Vec<i32> = direct.results()[0]
+                .rows()
+                .iter()
+                .map(|r| r.get::<i32, _>(0).unwrap())
+                .collect();
+            assert_eq!(first, vec![1, 2, 3]);
+
+            let second: Vec<i32> = direct.results()[1]
+                .rows()
+                .iter()
+                .map(|r| r.get::<i32, _>(0).unwrap())
+                .collect();
+            assert_eq!(second, vec![4, 5, 6]);
+
+            // Cleanup releases the prepared handle and hands back the owned
+            // result sets — no cursor close is issued.
+            let owned = direct.unprepare(&mut client).await.unwrap();
+            assert_eq!(owned.len(), 2);
+            assert_eq!(owned[0].rows().len(), 3);
+            assert_eq!(owned[1].rows().len(), 3);
+
+            let seen_rpcs = state.rpc_log.lock().unwrap().clone();
+            assert_eq!(
+                seen_rpcs,
+                vec![RpcProcId::CursorPrepExec, RpcProcId::Unprepare]
+            );
+        })
+        .await;
+    });
+}
+
+#[test]
 fn cursor_prep_exec_fetch_metadata_close_unprepare() {
     smol::block_on(async {
         with_server(|addr, state| async move {
@@ -1172,7 +1287,9 @@ fn cursor_prep_exec_fetch_metadata_close_unprepare() {
                     &[],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_cursor()
+                .expect("expected prepared cursor");
 
             let columns = cursor.fetch_metadata(&mut client).await.unwrap();
             assert_eq!(columns.len(), 1);
@@ -1223,7 +1340,9 @@ fn cursor_prep_exec_fetch_metadata_reuses_initial_metadata() {
                     &[],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_cursor()
+                .expect("expected prepared cursor");
 
             let columns = cursor.fetch_metadata(&mut client).await.unwrap();
             assert_eq!(columns.len(), 1);
@@ -1437,7 +1556,7 @@ fn cancel_interrupts_packetless_cursor_metadata_fetch() {
             *state.stall_metadata_fetch.lock().unwrap() = true;
             let mut client = connect_client(addr).await.unwrap();
 
-            let mut cursor = client
+            let cursor = client
                 .cursor_prep_exec(
                     "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
                     CursorOpenOptions::default(),
@@ -1445,7 +1564,9 @@ fn cancel_interrupts_packetless_cursor_metadata_fetch() {
                     &[],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_cursor()
+                .expect("expected prepared cursor");
 
             let token = client.cancellation_token();
             let canceller = smol::spawn(async move {

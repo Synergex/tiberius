@@ -271,8 +271,8 @@ pub mod server;
 
 pub use client::{
     AuthMethod, CancellationToken, Client, Config, Cursor, CursorConcurrencyOptions, CursorHandle,
-    CursorOpenOptions, CursorScrollOptions, Fetch, OutputValue, PreparedCursor, PreparedHandle,
-    PreparedStatement,
+    CursorOpenOptions, CursorPrepExecOutcome, CursorScrollOptions, DirectResultSet, DirectResults,
+    Fetch, OutputValue, PreparedCursor, PreparedHandle, PreparedStatement,
 };
 pub(crate) use error::Error;
 pub use from_sql::{FromSql, FromSqlOwned};
