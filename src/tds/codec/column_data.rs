@@ -1296,9 +1296,11 @@ impl<'a> ColumnData<'a> {
                 }
             },
             TypeInfo::Xml { schema, size } => xml::decode(src, *size, schema.clone()).await?,
-            TypeInfo::Udt(info) => {
-                let data = plp::decode(src, info.max_len as usize).await?;
-                ColumnData::Udt(data.map(|d| Cow::Owned(d)))
+            TypeInfo::Udt(_) => {
+                // A UDT is always PLP-encoded; its MAX_LEN does not select
+                // the wire format the way VARCHAR/VARBINARY's does.
+                let data = plp::decode_unknown_size(src).await?;
+                ColumnData::Udt(data.map(Cow::Owned))
             }
             TypeInfo::SsVariant(info) => {
                 let len = src.read_u32_le().await?;
@@ -1930,8 +1932,8 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 dst.extend_from_slice(headers);
                 num.encode(&mut *dst)?;
             }
-            (ColumnData::Udt(opt), Some(TypeInfo::Udt(info))) => {
-                encode_var_len_bytes(dst, info.max_len as usize, opt)?;
+            (ColumnData::Udt(opt), Some(TypeInfo::Udt(_))) => {
+                encode_udt_bytes(dst, opt)?;
             }
             (ColumnData::Variant(opt), Some(TypeInfo::SsVariant(info))) => {
                 if let Some(payload) = opt {
@@ -2017,36 +2019,20 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
     }
 }
 
-fn encode_var_len_bytes<'a>(
+/// Encode a UDT value, which is always PLP-encoded regardless of its
+/// declared `MAX_LEN`.
+fn encode_udt_bytes<'a>(
     dst: &mut BytesMutWithTypeInfo<'a>,
-    max_len: usize,
     value: Option<Cow<'a, [u8]>>,
 ) -> crate::Result<()> {
     if let Some(bytes) = value {
-        if max_len < 0xffff {
-            if bytes.len() > max_len {
-                return Err(crate::Error::BulkInput(
-                    format!(
-                        "Binary length {} exceed column limit {}",
-                        bytes.len(),
-                        max_len
-                    )
-                    .into(),
-                ));
-            }
-            dst.put_u16_le(bytes.len() as u16);
-            dst.extend(bytes.into_owned());
-        } else {
-            dst.put_u64_le(0xfffffffffffffffe);
-            dst.put_u32_le(bytes.len() as u32);
+        dst.put_u64_le(0xfffffffffffffffe);
+        dst.put_u32_le(bytes.len() as u32);
 
-            if !bytes.is_empty() {
-                dst.extend(bytes.into_owned());
-                dst.put_u32_le(0);
-            }
+        if !bytes.is_empty() {
+            dst.extend(bytes.into_owned());
+            dst.put_u32_le(0);
         }
-    } else if max_len < 0xffff {
-        dst.put_u16_le(0xffff);
     } else {
         dst.put_u64_le(0xffffffffffffffff);
     }
@@ -2412,6 +2398,16 @@ mod tests {
             .read_u8()
             .await
             .expect_err("decode must consume entire buffer");
+    }
+
+    #[tokio::test]
+    async fn nvarchar_max_plp_round_trip_smoke() {
+        let ty = TypeInfo::VarLenSized(VarLenContext::new(
+            VarLenType::NVarchar,
+            0xffff,
+            Some(Collation::new(13632521, 52)),
+        ));
+        test_round_trip(ty, ColumnData::String(Some("hello".into()))).await;
     }
 
     #[tokio::test]
