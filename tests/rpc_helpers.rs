@@ -2124,7 +2124,6 @@ fn call_procedure_cancellation_leaves_connection_reusable() {
     });
 }
 
-
 #[test]
 fn call_procedure_positional_binding_preserves_descriptor_order() {
     // No parameter carries a name, so binding is by declaration order alone.
@@ -2175,7 +2174,6 @@ fn call_procedure_positional_binding_preserves_descriptor_order() {
         .await;
     });
 }
-
 #[test]
 fn call_procedure_echoes_multi_packet_value() {
     // Values spanning several TDS packets must survive the round trip in
@@ -2244,4 +2242,3 @@ fn call_procedure_echoes_multi_packet_value() {
         .await;
     });
 }
-

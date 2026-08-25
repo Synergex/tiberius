@@ -302,11 +302,11 @@ where
                     flush(&mut results, &mut columns, &mut current);
                 }
             }
-            ReceivedToken::DoneProc(done) | ReceivedToken::Done(done) => {
-                if !done.status().contains(DoneStatus::More) {
-                    flush(&mut results, &mut columns, &mut current);
-                    break;
-                }
+            ReceivedToken::DoneProc(done) | ReceivedToken::Done(done)
+                if !done.status().contains(DoneStatus::More) =>
+            {
+                flush(&mut results, &mut columns, &mut current);
+                break;
             }
             _ => {}
         }

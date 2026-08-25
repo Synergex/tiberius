@@ -296,6 +296,12 @@ pub use tds::{
     stream::QueryStream,
     time, xml, Collation, EncryptionLevel,
 };
+/// RPC options used by the TDS server and client protocol.
+pub use tds::codec::RpcOption;
+/// Well-known TDS system procedure identifiers.
+pub use tds::codec::RpcProcId;
+/// Flags describing TDS RPC parameter behavior.
+pub use tds::codec::RpcStatus;
 pub use to_sql::{IntoSql, ToSql};
 pub use uuid::Uuid;
 

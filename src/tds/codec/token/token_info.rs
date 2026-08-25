@@ -1,6 +1,6 @@
+use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 use crate::{tds::codec::Encode, SqlReadBytes, TokenType};
 use bytes::{BufMut, BytesMut};
-use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 
 /// An informational message from the server (`PRINT`, `RAISERROR` with
 /// severity <= 10, and similar).

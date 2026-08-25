@@ -218,7 +218,10 @@ mod tests {
 
     #[test]
     fn input_sets_no_flags() {
-        let p = ProcedureParameter::input(TypeInfo::FixedLen(crate::FixedLenType::Int4), ColumnData::I32(Some(1)));
+        let p = ProcedureParameter::input(
+            TypeInfo::FixedLen(crate::FixedLenType::Int4),
+            ColumnData::I32(Some(1)),
+        );
         assert_eq!(p.direction(), ParameterDirection::Input);
         let rpc = p.into_rpc_param();
         assert_eq!(rpc.flags, BitFlags::empty());
@@ -256,7 +259,10 @@ mod tests {
 
     #[test]
     fn positional_by_default() {
-        let p = ProcedureParameter::input(TypeInfo::FixedLen(crate::FixedLenType::Int4), ColumnData::I32(Some(1)));
+        let p = ProcedureParameter::input(
+            TypeInfo::FixedLen(crate::FixedLenType::Int4),
+            ColumnData::I32(Some(1)),
+        );
         assert_eq!(p.name(), None);
         let rpc = p.into_rpc_param();
         assert_eq!(rpc.name, Cow::Borrowed(""));
