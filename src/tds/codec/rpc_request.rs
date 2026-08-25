@@ -1,5 +1,5 @@
 use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
-use crate::{tds::codec::ColumnData, BytesMutWithTypeInfo, Result};
+use crate::{tds::codec::ColumnData, BytesMutWithTypeInfo, Result, TypeInfo};
 use bytes::{BufMut, BytesMut};
 use enumflags2::{bitflags, BitFlags};
 use std::borrow::BorrowMut;
@@ -50,6 +50,10 @@ impl<'a> TokenRpcRequest<'a> {
 pub struct RpcParam<'a> {
     pub name: Cow<'a, str>,
     pub flags: BitFlags<RpcStatus>,
+    /// Explicit wire type for `value`. When `None`, `value` self-describes
+    /// its own type, which cannot express a nullable type for a `NULL`
+    /// output placeholder.
+    pub type_info: Option<TypeInfo>,
     pub value: ColumnData<'a>,
 }
 
@@ -70,10 +74,15 @@ pub enum RpcProcId {
     Unprepare = 15,
 }
 
+/// The RPC procedure being invoked: either one of the well-known system
+/// procedures by numeric id, or an arbitrary stored procedure by name.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum RpcProcIdValue<'a> {
+    /// Call a stored procedure by name (`sp_executesql`, a user-defined
+    /// procedure, etc.).
     Name(Cow<'a, str>),
+    /// Call one of the well-known system procedures by its numeric id.
     Id(RpcProcId),
 }
 
@@ -151,8 +160,19 @@ impl<'a> Encode<BytesMut> for RpcParam<'a> {
 
         dst.put_u8(self.flags.bits());
 
-        let mut dst_fi = BytesMutWithTypeInfo::new(dst);
-        self.value.encode(&mut dst_fi)?;
+        match self.type_info {
+            Some(ty) => {
+                // No preceding metadata token carries TYPE_INFO for an RPC
+                // param, so write the header before the value.
+                ty.clone().encode(dst)?;
+                let mut dst_fi = BytesMutWithTypeInfo::new(dst).with_type_info(&ty);
+                self.value.encode(&mut dst_fi)?;
+            }
+            None => {
+                let mut dst_fi = BytesMutWithTypeInfo::new(dst);
+                self.value.encode(&mut dst_fi)?;
+            }
+        }
 
         let dst: &mut [u8] = dst.borrow_mut();
         dst[len_pos] = length;
@@ -175,6 +195,34 @@ mod tests {
         assert_eq!(
             proc_id_word,
             &[0xff, 0xff, RpcProcId::ExecuteSQL as u8, 0x00]
+        );
+    }
+
+    #[test]
+    fn encode_param_with_explicit_type_info_overrides_self_describe() {
+        // A NULL i32 output placeholder with an explicit nullable
+        // VarLenSized(Intn) type must encode as that type (length byte 0),
+        // not the non-nullable FixedLen(Int4) the bare value would
+        // self-describe as.
+        use crate::tds::codec::{VarLenContext, VarLenType};
+
+        let param = RpcParam {
+            name: Cow::Borrowed(""),
+            flags: RpcStatus::ByRefValue.into(),
+            type_info: Some(TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::Intn,
+                4,
+                None,
+            ))),
+            value: ColumnData::I32(None),
+        };
+        let mut buf = BytesMut::new();
+        param.encode(&mut buf).unwrap();
+
+        // name_len(0) + status(1) + [VarLenType::Intn, max_len=4, actual_len=0]
+        assert_eq!(
+            &buf[..],
+            &[0, RpcStatus::ByRefValue as u8, VarLenType::Intn as u8, 4, 0]
         );
     }
 

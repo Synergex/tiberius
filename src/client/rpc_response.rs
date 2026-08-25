@@ -10,7 +10,7 @@ use crate::client::Connection;
 use crate::tds::codec::{
     ColumnData, DoneStatus, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
     TokenEnvChange, TokenError, TokenInfo, TokenOrder, TokenReturnValue, TokenSessionState,
-    TokenTabName,
+    TokenTabName, TypeInfo,
 };
 use crate::tds::stream::{ReceivedToken, TokenStream};
 use crate::{Column, FromSql, Row, SqlReadBytes, TokenType};
@@ -29,6 +29,7 @@ use std::sync::Arc;
 pub struct OutputValue {
     name: String,
     ordinal: u16,
+    type_info: TypeInfo,
     value: ColumnData<'static>,
 }
 
@@ -45,6 +46,12 @@ impl OutputValue {
     /// when the server populates it.
     pub fn ordinal(&self) -> u16 {
         self.ordinal
+    }
+
+    /// The wire type the server used for this value (e.g. precision/scale
+    /// for `NUMERIC`, the declared length for `VARCHAR`/`VARBINARY`).
+    pub fn type_info(&self) -> &TypeInfo {
+        &self.type_info
     }
 
     /// Decode the value as `T` via [`FromSql`].
@@ -86,6 +93,7 @@ impl From<TokenReturnValue> for OutputValue {
         Self {
             name: tok.param_name,
             ordinal: tok.param_ordinal,
+            type_info: tok.meta.ty,
             value: tok.value,
         }
     }
@@ -187,10 +195,13 @@ where
 ///
 /// Unlike [`collect_rpc_outputs_with_metadata`], which keeps only the first
 /// COLMETADATA and discards row data, this retains the rows so callers such as
-/// the AllowDirect `sp_cursorprepexec` path can own the streamed result sets.
+/// the AllowDirect `sp_cursorprepexec` path — and [`Client::call_procedure`](
+/// crate::Client::call_procedure) — can own the streamed result sets.
 #[derive(Debug)]
-pub(crate) struct BufferedResultSet {
+pub struct BufferedResultSet {
+    /// The result set's column metadata.
     pub columns: Arc<Vec<Column>>,
+    /// Every row belonging to this result set, in server order.
     pub rows: Vec<Row>,
 }
 

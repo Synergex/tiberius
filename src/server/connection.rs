@@ -502,8 +502,12 @@ impl<S: NetStream> TdsConnection<S> {
             }
 
             let packet = Packet::new(header, split_payload);
+            // `Packet::encode` back-patches the length at absolute offsets
+            // 2..4, so it must always be handed an empty buffer.
+            let mut framed = BytesMut::new();
             self.codec
-                .encode(TdsBackendMessage::Packet(packet), &mut self.write_buf)?;
+                .encode(TdsBackendMessage::Packet(packet), &mut framed)?;
+            self.write_buf.extend_from_slice(&framed);
         }
 
         self.message_in_progress = !end_of_message;
@@ -603,21 +607,24 @@ impl<S: NetStream> Stream for TdsConnection<S> {
             return Poll::Ready(Some(Ok(msg)));
         }
 
-        match this.try_decode() {
-            Ok(Some(msg)) => return Poll::Ready(Some(Ok(msg))),
-            Ok(None) => {}
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        }
+        // Keep reading until a whole message decodes. A read that yields
+        // bytes without completing one (an interior packet of a multi-packet
+        // message) registers no waker, so returning Pending here would park
+        // the task forever.
+        loop {
+            match this.try_decode() {
+                Ok(Some(msg)) => return Poll::Ready(Some(Ok(msg))),
+                Ok(None) => {}
+                Err(e) => return Poll::Ready(Some(Err(e))),
+            }
 
-        match this.poll_read_buf(cx) {
-            Poll::Ready(Ok(0)) => Poll::Ready(None),
-            Poll::Ready(Ok(_)) => match this.try_decode() {
-                Ok(Some(msg)) => Poll::Ready(Some(Ok(msg))),
-                Ok(None) => Poll::Pending,
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Pending => Poll::Pending,
+            match this.poll_read_buf(cx) {
+                Poll::Ready(Ok(0)) => return Poll::Ready(None),
+                Poll::Ready(Ok(_)) => continue,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                // poll_read registered the waker.
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
