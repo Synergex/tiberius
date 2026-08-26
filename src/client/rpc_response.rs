@@ -226,14 +226,54 @@ where
 {
     let ts = TokenStream::new(conn);
     let stream = ts.try_unfold();
-    collect_rpc_result_sets_from_stream(stream).await
+    collect_rpc_result_sets_from_stream_with_mode(stream, RowCollectionMode::BufferRows).await
 }
 
+/// Drain an RPC response while retaining result-set metadata and response
+/// values, but dropping each row after it has been decoded.
+pub(crate) async fn collect_rpc_result_sets_without_rows<S>(
+    conn: &mut Connection<S>,
+) -> crate::Result<(
+    Vec<BufferedResultSet>,
+    Vec<OutputValue>,
+    Option<u32>,
+    Vec<TokenInfo>,
+)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let ts = TokenStream::new(conn);
+    let stream = ts.try_unfold();
+    collect_rpc_result_sets_from_stream_with_mode(stream, RowCollectionMode::DiscardRows).await
+}
+
+#[cfg(test)]
 /// Lower-level variant that drains an arbitrary token stream, so the buffering
 /// logic can be unit-tested with synthetic inputs (mirrors
 /// [`collect_rpc_outputs_from_stream`]).
 async fn collect_rpc_result_sets_from_stream<S>(
+    stream: S,
+) -> crate::Result<(
+    Vec<BufferedResultSet>,
+    Vec<OutputValue>,
+    Option<u32>,
+    Vec<TokenInfo>,
+)>
+where
+    S: Stream<Item = crate::Result<ReceivedToken>> + Unpin,
+{
+    collect_rpc_result_sets_from_stream_with_mode(stream, RowCollectionMode::BufferRows).await
+}
+
+#[derive(Clone, Copy)]
+enum RowCollectionMode {
+    BufferRows,
+    DiscardRows,
+}
+
+async fn collect_rpc_result_sets_from_stream_with_mode<S>(
     mut stream: S,
+    row_mode: RowCollectionMode,
 ) -> crate::Result<(
     Vec<BufferedResultSet>,
     Vec<OutputValue>,
@@ -278,13 +318,15 @@ where
                 columns = Some(Arc::new(meta.columns().collect::<Vec<_>>()));
             }
             ReceivedToken::Row(data) => {
-                if let Some(cols) = &columns {
-                    current.push(Row {
-                        columns: cols.clone(),
-                        data,
-                        // The index this set will occupy once flushed.
-                        result_index: results.len(),
-                    });
+                if let RowCollectionMode::BufferRows = row_mode {
+                    if let Some(cols) = &columns {
+                        current.push(Row {
+                            columns: cols.clone(),
+                            data,
+                            // The index this set will occupy once flushed.
+                            result_index: results.len(),
+                        });
+                    }
                 }
             }
             ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
@@ -296,11 +338,19 @@ where
                 }
             }
             ReceivedToken::DoneInProc(done) => {
+                if done.status().contains(DoneStatus::Attention) {
+                    return Err(crate::Error::Canceled);
+                }
                 // A DoneInProc without `More` closes one statement's result set
                 // inside the proc; more tokens (ReturnValue, DoneProc) follow.
                 if !done.status().contains(DoneStatus::More) {
                     flush(&mut results, &mut columns, &mut current);
                 }
+            }
+            ReceivedToken::DoneProc(done) | ReceivedToken::Done(done)
+                if done.status().contains(DoneStatus::Attention) =>
+            {
+                return Err(crate::Error::Canceled);
             }
             ReceivedToken::DoneProc(done) | ReceivedToken::Done(done)
                 if !done.status().contains(DoneStatus::More) =>
@@ -716,6 +766,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_result_sets_discards_rows_but_preserves_response_data() {
+        let s = synthetic(vec![
+            ReceivedToken::NewResultset(Arc::new(TokenColMetaData {
+                columns: Vec::new(),
+            })),
+            ReceivedToken::NewResultset(mk_metadata("first")),
+            mk_row(1),
+            mk_row(2),
+            ReceivedToken::DoneInProc(TokenDone::with_rows(2)),
+            ReceivedToken::NewResultset(mk_metadata("second")),
+            mk_row(3),
+            ReceivedToken::Info(TokenInfo::new(
+                5000,
+                1,
+                5,
+                "procedure info",
+                "srv",
+                "proc",
+                1,
+            )),
+            ReceivedToken::ReturnValue(mk_return_value("@out", 1, ColumnData::I32(Some(11)))),
+            ReceivedToken::ReturnStatus(7),
+            mk_done_proc_final(),
+        ]);
+
+        let (results, outputs, status, infos) =
+            collect_rpc_result_sets_from_stream_with_mode(s, RowCollectionMode::DiscardRows)
+                .await
+                .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].columns[0].name(), "first");
+        assert_eq!(results[1].columns[0].name(), "second");
+        assert!(results.iter().all(|result| result.rows.is_empty()));
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].get::<i32>().unwrap(), Some(11));
+        assert_eq!(status, Some(7));
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].number, 5000);
+    }
+
+    #[tokio::test]
     async fn collect_result_sets_drops_empty_colmetadata_placeholder() {
         let s = synthetic(vec![
             ReceivedToken::NewResultset(Arc::new(TokenColMetaData {
@@ -749,6 +841,36 @@ mod tests {
             Err(crate::Error::Server(te)) => assert_eq!(te.code, 50000),
             other => panic!("expected Server error, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn collect_result_sets_discard_mode_surfaces_error_after_rows() {
+        let err = TokenError::new(50000, 1, 16, "boom", "srv", "proc", 1);
+        let s = synthetic(vec![
+            ReceivedToken::NewResultset(mk_metadata("v")),
+            mk_row(1),
+            ReceivedToken::Error(err),
+            ReceivedToken::ReturnStatus(0),
+            mk_done_proc_final(),
+        ]);
+
+        match collect_rpc_result_sets_from_stream_with_mode(s, RowCollectionMode::DiscardRows).await
+        {
+            Err(crate::Error::Server(te)) => assert_eq!(te.code, 50000),
+            other => panic!("expected Server error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_result_sets_surfaces_attention_as_canceled() {
+        let s = synthetic(vec![ReceivedToken::DoneProc(TokenDone::with_status(
+            DoneStatus::Attention.into(),
+            0,
+        ))]);
+
+        let result = collect_rpc_result_sets_from_stream(s).await;
+
+        assert!(matches!(result, Err(crate::Error::Canceled)));
     }
 
     #[tokio::test]

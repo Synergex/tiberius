@@ -8,8 +8,8 @@ use std::borrow::Cow;
 use std::env;
 use tiberius::numeric::Numeric;
 use tiberius::{
-    Client, ColumnData, Config, CursorOpenOptions, Fetch, ProcedureParameter, QueryItem,
-    TypeInfo, VarLenContext, VarLenType,
+    Client, ColumnData, Config, CursorOpenOptions, Fetch, ProcedureParameter, QueryItem, TypeInfo,
+    VarLenContext, VarLenType,
 };
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -229,8 +229,7 @@ async fn live_call_procedure_with_output_and_return_status() -> tiberius::Result
             vec![
                 ProcedureParameter::input(int_type(), ColumnData::I32(Some(21))).named("@in"),
                 ProcedureParameter::output(int_type(), ColumnData::I32(Some(0))).named("@out"),
-                ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(9)))
-                    .named("@io"),
+                ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(9))).named("@io"),
             ],
         )
         .await?;
@@ -239,10 +238,9 @@ async fn live_call_procedure_with_output_and_return_status() -> tiberius::Result
     assert_eq!(result.result_sets[0].rows.len(), 1);
     assert_eq!(result.result_sets[0].rows[0].get::<i32, _>(0), Some(21));
     assert_eq!(result.return_status, Some(21));
-    assert!(result
-        .messages
-        .iter()
-        .any(|m| m.message().contains("tiberius_call_procedure_test: running")));
+    assert!(result.messages.iter().any(|m| m
+        .message()
+        .contains("tiberius_call_procedure_test: running")));
 
     let out = result
         .output_values
@@ -266,8 +264,7 @@ async fn live_call_procedure_with_output_and_return_status() -> tiberius::Result
             vec![
                 ProcedureParameter::input(int_type(), ColumnData::I32(Some(-3))).named("@in"),
                 ProcedureParameter::output(int_type(), ColumnData::I32(Some(0))).named("@out"),
-                ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(0)))
-                    .named("@io"),
+                ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(0))).named("@io"),
             ],
         )
         .await?;
@@ -357,7 +354,10 @@ async fn live_call_procedure_cancellation_leaves_connection_reusable() -> tiberi
         elapsed < std::time::Duration::from_secs(5),
         "cancellation did not interrupt call_procedure: took {elapsed:?}"
     );
-    let _ = result;
+    assert!(
+        matches!(&result, Err(tiberius::error::Error::Canceled)),
+        "expected Error::Canceled, got {result:?}"
+    );
 
     // Connection is still reusable after the cancel drain.
     let rows = client
@@ -474,8 +474,7 @@ async fn live_call_procedure_echoes_binary_bounded_and_max() -> tiberius::Result
                     ColumnData::Binary(Some(Cow::Borrowed(&[1u8, 2, 3][..]))),
                 )
                 .named("@in"),
-                ProcedureParameter::output(max_ty.clone(), ColumnData::Binary(None))
-                    .named("@out"),
+                ProcedureParameter::output(max_ty.clone(), ColumnData::Binary(None)).named("@out"),
             ],
         )
         .await?;
@@ -855,9 +854,7 @@ async fn live_call_procedure_multi_packet_clob_and_blob() -> tiberius::Result<()
     assert_eq!(row.get::<i32, _>(0), Some(42));
 
     client
-        .simple_query(
-            "DROP PROCEDURE ##tiberius_echo_clob; DROP PROCEDURE ##tiberius_echo_blob",
-        )
+        .simple_query("DROP PROCEDURE ##tiberius_echo_clob; DROP PROCEDURE ##tiberius_echo_blob")
         .await?
         .into_results()
         .await?;

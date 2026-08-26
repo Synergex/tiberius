@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use enumflags2::BitFlags;
 use futures_util::sink::SinkExt;
 
+use tiberius::numeric::Numeric;
 use tiberius::server::sp_cursor::{
     CursorCache, CursorEntry, CursorHandle, ParsedCursorClose, ParsedCursorFetch, ParsedCursorOpen,
     SpCursorCloseHandler, SpCursorFetchHandler, SpCursorOpenHandler,
@@ -28,7 +29,6 @@ use tiberius::server::{
     SpUnprepareHandler, SqlAuthSource, SqlBatchHandler, SystemProcRouter, SystemProcRouterBuilder,
     TdsAuthHandler, TdsBackendMessage, TdsClient, TdsServerHandlers,
 };
-use tiberius::numeric::Numeric;
 use tiberius::{
     BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions,
     CursorScrollOptions, EncryptionLevel, FixedLenType, MetaDataColumn, ProcedureParameter,
@@ -1904,8 +1904,9 @@ fn call_procedure_echoes_null_output() {
             let result = client
                 .call_procedure(
                     "tiberius_echo_proc",
-                    vec![ProcedureParameter::output(int_type(), ColumnData::I32(None))
-                        .named("@out")],
+                    vec![
+                        ProcedureParameter::output(int_type(), ColumnData::I32(None)).named("@out"),
+                    ],
                 )
                 .await
                 .unwrap();
@@ -2047,6 +2048,58 @@ fn call_procedure_multiple_results() {
 }
 
 #[test]
+fn call_procedure_without_rows_discards_rows_but_preserves_response_data() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let result = client
+                .call_procedure_without_rows("tiberius_multi_result_proc", Vec::new())
+                .await
+                .unwrap();
+
+            assert_eq!(result.result_sets.len(), 2);
+            assert_eq!(result.result_sets[0].columns[0].name(), "v");
+            assert_eq!(result.result_sets[1].columns[0].name(), "v");
+            assert!(result
+                .result_sets
+                .iter()
+                .all(|result_set| result_set.rows.is_empty()));
+            assert_eq!(result.return_status, Some(0));
+
+            let output_result = client
+                .call_procedure_without_rows(
+                    "tiberius_echo_proc",
+                    vec![
+                        ProcedureParameter::output(int_type(), ColumnData::I32(Some(7)))
+                            .named("@out"),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            assert!(output_result.result_sets.is_empty());
+            assert_eq!(output_result.messages.len(), 1);
+            assert_eq!(output_result.messages[0].number(), 5000);
+            assert_eq!(output_result.return_status, Some(1));
+            assert_eq!(
+                output_result.output_values[0].get::<i32>().unwrap(),
+                Some(7)
+            );
+
+            // The new collector must leave the connection ready for another
+            // operation after draining all rows and trailing RPC tokens.
+            let reusable = client
+                .call_procedure_without_rows("tiberius_echo_proc", Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(reusable.return_status, Some(0));
+        })
+        .await;
+    });
+}
+
+#[test]
 fn call_procedure_surfaces_server_error() {
     smol::block_on(async {
         with_server(|addr, _state| async move {
@@ -2101,11 +2154,10 @@ fn call_procedure_cancellation_leaves_connection_reusable() {
                 elapsed < std::time::Duration::from_secs(2),
                 "cancellation did not interrupt call_procedure: took {elapsed:?}"
             );
-            // Whether the drain surfaces as Ok (with an empty response) or an
-            // error, it must have terminated promptly — that's asserted
-            // above. What matters here is that the connection comes out
-            // clean either way.
-            let _ = result;
+            assert!(
+                matches!(&result, Err(tiberius::error::Error::Canceled)),
+                "expected Error::Canceled, got {result:?}"
+            );
 
             // Connection is still reusable after the cancel drain.
             let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
