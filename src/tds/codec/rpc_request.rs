@@ -2,7 +2,6 @@ use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
 use crate::{tds::codec::ColumnData, BytesMutWithTypeInfo, Result, TypeInfo};
 use bytes::{BufMut, BytesMut};
 use enumflags2::{bitflags, BitFlags};
-use std::borrow::BorrowMut;
 use std::borrow::Cow;
 
 #[bitflags]
@@ -148,13 +147,23 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
 
 impl<'a> Encode<BytesMut> for RpcParam<'a> {
     fn encode(self, dst: &mut BytesMut) -> Result<()> {
-        let len_pos = dst.len();
-        let mut length = 0u8;
+        // ParamMetaData.ParamName is a B_VARCHAR: a u8 length in UCS-2 code
+        // units, so a longer name cannot be represented on the wire.
+        let name_len = self.name.encode_utf16().count();
+        if name_len > u8::MAX as usize {
+            return Err(crate::Error::Protocol(
+                format!(
+                    "RPC param name too long ({} code units, max {})",
+                    name_len,
+                    u8::MAX
+                )
+                .into(),
+            ));
+        }
 
-        dst.put_u8(length);
+        dst.put_u8(name_len as u8);
 
         for codepoint in self.name.encode_utf16() {
-            length += 1;
             dst.put_u16_le(codepoint);
         }
 
@@ -173,9 +182,6 @@ impl<'a> Encode<BytesMut> for RpcParam<'a> {
                 self.value.encode(&mut dst_fi)?;
             }
         }
-
-        let dst: &mut [u8] = dst.borrow_mut();
-        dst[len_pos] = length;
 
         Ok(())
     }
@@ -262,5 +268,43 @@ mod tests {
         let name_len = u16::from_le_bytes([buf[start], buf[start + 1]]);
         let expected: Vec<u16> = "spö".encode_utf16().collect();
         assert_eq!(name_len as usize, expected.len());
+    }
+
+    fn param(name: &str) -> RpcParam<'_> {
+        RpcParam {
+            name: Cow::Borrowed(name),
+            flags: BitFlags::empty(),
+            type_info: None,
+            value: ColumnData::I32(None),
+        }
+    }
+
+    #[test]
+    fn encode_param_name_at_the_length_limit() {
+        let name = "a".repeat(u8::MAX as usize);
+        let mut buf = BytesMut::new();
+        param(&name).encode(&mut buf).unwrap();
+
+        assert_eq!(buf[0], u8::MAX);
+    }
+
+    #[test]
+    fn encode_param_name_over_the_length_limit_errors() {
+        // 256 code units do not fit the u8 ParamName length prefix.
+        let name = "a".repeat(u8::MAX as usize + 1);
+        let mut buf = BytesMut::new();
+
+        assert!(param(&name).encode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn encode_param_name_length_counts_utf16_code_units() {
+        // A non-BMP char is two UTF-16 code units, so 128 of them are exactly
+        // 256 units and must be rejected even though the name is 128 chars.
+        let name = "😀".repeat(128);
+        let mut buf = BytesMut::new();
+
+        assert_eq!(name.chars().count(), 128);
+        assert!(param(&name).encode(&mut buf).is_err());
     }
 }
