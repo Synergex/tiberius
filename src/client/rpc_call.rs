@@ -120,9 +120,12 @@ impl<'a> ProcedureParameter<'a> {
     }
 }
 
-/// The full response to a [`Client::call_procedure`] call: any result sets
-/// the procedure produced, its output parameter values, its `RETURN`
-/// status, and any informational messages it emitted.
+/// The full response to a procedure call: any result sets the procedure
+/// produced, its output parameter values, its `RETURN` status, and any
+/// informational messages it emitted.
+///
+/// [`Client::call_procedure_without_rows`] returns the same response shape,
+/// but intentionally leaves each result set's `rows` vector empty.
 #[derive(Debug)]
 pub struct ProcedureResult {
     /// Result sets produced by the procedure, in the order the server sent
@@ -139,6 +142,12 @@ pub struct ProcedureResult {
     pub messages: Vec<crate::TokenInfo>,
 }
 
+#[derive(Clone, Copy)]
+enum ProcedureRowMode {
+    BufferRows,
+    DiscardRows,
+}
+
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// Call a stored procedure by name via native TDS RPC.
     ///
@@ -151,7 +160,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     ///
     /// Build `parameters` with [`ProcedureParameter::input`],
     /// [`ProcedureParameter::output`], and
-    /// [`ProcedureParameter::input_output`]. The response is fully buffered
+    /// [`ProcedureParameter::input_output`]. Result rows are fully buffered
     /// before this call returns, so the connection is safe to reuse
     /// immediately afterward, and an in-flight call can be interrupted with
     /// [`cancellation_token`](Self::cancellation_token) exactly like
@@ -191,6 +200,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         proc: impl Into<Cow<'a, str>>,
         parameters: Vec<ProcedureParameter<'a>>,
     ) -> crate::Result<ProcedureResult> {
+        self.call_procedure_inner(proc, parameters, ProcedureRowMode::BufferRows)
+            .await
+    }
+
+    /// Call a stored procedure by name while draining, but not retaining, its
+    /// result rows.
+    ///
+    /// The returned [`ProcedureResult`] retains all non-empty result-set
+    /// metadata, output parameter values, the procedure's `RETURN` status, and
+    /// informational messages. Each returned result set has an empty `rows`
+    /// vector by design. Use [`call_procedure`](Self::call_procedure) when row
+    /// values are needed.
+    ///
+    /// The response is fully drained before this call returns, so the
+    /// connection is safe to reuse immediately afterward. Cancellation uses
+    /// the same behavior as [`call_procedure`](Self::call_procedure).
+    pub async fn call_procedure_without_rows<'a>(
+        &mut self,
+        proc: impl Into<Cow<'a, str>>,
+        parameters: Vec<ProcedureParameter<'a>>,
+    ) -> crate::Result<ProcedureResult> {
+        self.call_procedure_inner(proc, parameters, ProcedureRowMode::DiscardRows)
+            .await
+    }
+
+    async fn call_procedure_inner<'a>(
+        &mut self,
+        proc: impl Into<Cow<'a, str>>,
+        parameters: Vec<ProcedureParameter<'a>>,
+        row_mode: ProcedureRowMode,
+    ) -> crate::Result<ProcedureResult> {
         self.connection.flush_stream().await?;
 
         let proc: Cow<'a, str> = proc.into();
@@ -200,8 +240,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .collect();
         self.send_rpc(proc, rpc_params).await?;
 
-        let (result_sets, output_values, return_status, messages) =
-            rpc_response::collect_rpc_result_sets(&mut self.connection).await?;
+        let (result_sets, output_values, return_status, messages) = match row_mode {
+            ProcedureRowMode::BufferRows => {
+                rpc_response::collect_rpc_result_sets(&mut self.connection).await?
+            }
+            ProcedureRowMode::DiscardRows => {
+                rpc_response::collect_rpc_result_sets_without_rows(&mut self.connection).await?
+            }
+        };
 
         Ok(ProcedureResult {
             result_sets,
