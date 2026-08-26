@@ -25,20 +25,16 @@ fn nvarchar_type(len: usize) -> TypeInfo {
     ))
 }
 
-/// `NVARCHAR(MAX)` / `VARBINARY(MAX)`.
-///
-/// The declared length is written to the wire as a `u16`, so any value whose
-/// low 16 bits are `0xFFFF` emits the MAX sentinel. It is declared larger
-/// than `0xFFFF` here because the encoder also treats it as a byte ceiling,
-/// which would otherwise reject MAX values over 64 KiB.
-const MAX_LEN: usize = 0xFFFF_FFFF;
-
 fn nvarchar_max_type() -> TypeInfo {
-    nvarchar_type(MAX_LEN)
+    nvarchar_type(u16::MAX as usize)
 }
 
 fn varbinary_max_type() -> TypeInfo {
-    TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, MAX_LEN, None))
+    TypeInfo::VarLenSized(VarLenContext::new(
+        VarLenType::BigVarBin,
+        u16::MAX as usize,
+        None,
+    ))
 }
 
 fn conn_str() -> String {
