@@ -270,9 +270,10 @@ mod sql_browser;
 pub mod server;
 
 pub use client::{
-    AuthMethod, CancellationToken, Client, Config, Cursor, CursorConcurrencyOptions, CursorHandle,
-    CursorOpenOptions, CursorPrepExecOutcome, CursorScrollOptions, DirectResultSet, DirectResults,
-    Fetch, OutputValue, PreparedCursor, PreparedHandle, PreparedStatement,
+    AuthMethod, BufferedResultSet, CancellationToken, Client, Config, Cursor,
+    CursorConcurrencyOptions, CursorHandle, CursorOpenOptions, CursorPrepExecOutcome,
+    CursorScrollOptions, DirectResultSet, DirectResults, Fetch, OutputValue, ParameterDirection,
+    PreparedCursor, PreparedHandle, PreparedStatement, ProcedureParameter, ProcedureResult,
 };
 pub(crate) use error::Error;
 pub use from_sql::{FromSql, FromSqlOwned};
@@ -284,7 +285,7 @@ pub use tds::{
         codec::{
         AltMetaDataColumn, BaseMetaDataColumn, BulkLoadRequest, ColumnData, ColumnFlag, Encode,
         FedAuthInfoOption, FixedLenType, IntoRow, LoginMessage, MetaDataColumn, PreloginMessage,
-        RpcOption, RpcProcId, RpcStatus, DoneStatus, SessionStateEntry, SsVariantInfo,
+        DoneStatus, SessionStateEntry, SsVariantInfo,
         TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
         TokenEnvChange, TokenError, TokenFedAuthInfo, TokenFeatureExtAck, TokenInfo, TokenLoginAck,
         TokenOrder, TokenReturnValue, TokenRow, TokenSessionState, TokenSspi, TokenTabName,
@@ -295,6 +296,12 @@ pub use tds::{
     stream::QueryStream,
     time, xml, Collation, EncryptionLevel,
 };
+/// RPC options used by the TDS server and client protocol.
+pub use tds::codec::RpcOption;
+/// Well-known TDS system procedure identifiers.
+pub use tds::codec::RpcProcId;
+/// Flags describing TDS RPC parameter behavior.
+pub use tds::codec::RpcStatus;
 pub use to_sql::{IntoSql, ToSql};
 pub use uuid::Uuid;
 

@@ -140,6 +140,11 @@ impl Encode<BytesMut> for VarLenContext {
             | VarLenType::BigVarChar
             | VarLenType::BigBinary
             | VarLenType::BigVarBin => {
+                if self.len() > u16::MAX as usize {
+                    return Err(Error::Protocol(
+                        format!("type info length {} exceeds 2-byte limit", self.len()).into(),
+                    ));
+                }
                 dst.put_u16_le(self.len() as u16);
             }
             VarLenType::Image | VarLenType::Text | VarLenType::NText => {
@@ -475,6 +480,11 @@ mod tests {
                 Some(Collation::new(13632521, 52)),
             )),
             TypeInfo::VarLenSized(VarLenContext::new(VarLenType::VarBinary, 32, None)),
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::BigVarBin,
+                u16::MAX as usize,
+                None,
+            )),
             TypeInfo::VarLenSizedPrecision {
                 ty: VarLenType::Decimal,
                 size: 5,
@@ -496,5 +506,15 @@ mod tests {
 
             assert_eq!(nti, ti)
         }
+    }
+
+    #[test]
+    fn var_len_context_rejects_length_over_two_byte_wire_limit() {
+        let mut buf = BytesMut::new();
+        let err = VarLenContext::new(VarLenType::BigVarBin, u16::MAX as usize + 1, None)
+            .encode(&mut buf)
+            .expect_err("oversized type length must fail");
+
+        assert!(matches!(err, Error::Protocol(_)));
     }
 }

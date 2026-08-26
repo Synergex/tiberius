@@ -1,8 +1,9 @@
+use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 use crate::{tds::codec::Encode, SqlReadBytes, TokenType};
 use bytes::{BufMut, BytesMut};
-use crate::tds::codec::token::{write_b_varchar, write_us_varchar};
 
-#[allow(dead_code)] // we might want to debug the values
+/// An informational message from the server (`PRINT`, `RAISERROR` with
+/// severity <= 10, and similar).
 #[derive(Debug)]
 pub struct TokenInfo {
     /// info number
@@ -62,6 +63,44 @@ impl TokenInfo {
             procedure,
             line,
         })
+    }
+
+    /// The message number.
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+
+    /// The error state, used as a modifier to the message number.
+    pub fn state(&self) -> u8 {
+        self.state
+    }
+
+    /// The class (severity) of the message. A class of less than 10
+    /// indicates a purely informational message.
+    pub fn class(&self) -> u8 {
+        self.class
+    }
+
+    /// The message text.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The server name.
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// The name of the stored procedure that emitted the message, if any.
+    pub fn procedure(&self) -> &str {
+        &self.procedure
+    }
+
+    /// The line number in the SQL batch or stored procedure that emitted
+    /// the message. Line numbers begin at 1. If not applicable, the value
+    /// is 0.
+    pub fn line(&self) -> u32 {
+        self.line
     }
 }
 

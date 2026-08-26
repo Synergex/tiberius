@@ -1,8 +1,7 @@
 use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
-use crate::{tds::codec::ColumnData, BytesMutWithTypeInfo, Result};
+use crate::{tds::codec::ColumnData, BytesMutWithTypeInfo, Result, TypeInfo};
 use bytes::{BufMut, BytesMut};
 use enumflags2::{bitflags, BitFlags};
-use std::borrow::BorrowMut;
 use std::borrow::Cow;
 
 #[bitflags]
@@ -50,6 +49,10 @@ impl<'a> TokenRpcRequest<'a> {
 pub struct RpcParam<'a> {
     pub name: Cow<'a, str>,
     pub flags: BitFlags<RpcStatus>,
+    /// Explicit wire type for `value`. When `None`, `value` self-describes
+    /// its own type, which cannot express a nullable type for a `NULL`
+    /// output placeholder.
+    pub type_info: Option<TypeInfo>,
     pub value: ColumnData<'a>,
 }
 
@@ -70,10 +73,15 @@ pub enum RpcProcId {
     Unprepare = 15,
 }
 
+/// The RPC procedure being invoked: either one of the well-known system
+/// procedures by numeric id, or an arbitrary stored procedure by name.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum RpcProcIdValue<'a> {
+    /// Call a stored procedure by name (`sp_executesql`, a user-defined
+    /// procedure, etc.).
     Name(Cow<'a, str>),
+    /// Call one of the well-known system procedures by its numeric id.
     Id(RpcProcId),
 }
 
@@ -139,23 +147,41 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
 
 impl<'a> Encode<BytesMut> for RpcParam<'a> {
     fn encode(self, dst: &mut BytesMut) -> Result<()> {
-        let len_pos = dst.len();
-        let mut length = 0u8;
+        // ParamMetaData.ParamName is a B_VARCHAR: a u8 length in UCS-2 code
+        // units, so a longer name cannot be represented on the wire.
+        let name_len = self.name.encode_utf16().count();
+        if name_len > u8::MAX as usize {
+            return Err(crate::Error::Protocol(
+                format!(
+                    "RPC param name too long ({} code units, max {})",
+                    name_len,
+                    u8::MAX
+                )
+                .into(),
+            ));
+        }
 
-        dst.put_u8(length);
+        dst.put_u8(name_len as u8);
 
         for codepoint in self.name.encode_utf16() {
-            length += 1;
             dst.put_u16_le(codepoint);
         }
 
         dst.put_u8(self.flags.bits());
 
-        let mut dst_fi = BytesMutWithTypeInfo::new(dst);
-        self.value.encode(&mut dst_fi)?;
-
-        let dst: &mut [u8] = dst.borrow_mut();
-        dst[len_pos] = length;
+        match self.type_info {
+            Some(ty) => {
+                // No preceding metadata token carries TYPE_INFO for an RPC
+                // param, so write the header before the value.
+                ty.clone().encode(dst)?;
+                let mut dst_fi = BytesMutWithTypeInfo::new(dst).with_type_info(&ty);
+                self.value.encode(&mut dst_fi)?;
+            }
+            None => {
+                let mut dst_fi = BytesMutWithTypeInfo::new(dst);
+                self.value.encode(&mut dst_fi)?;
+            }
+        }
 
         Ok(())
     }
@@ -179,12 +205,36 @@ mod tests {
     }
 
     #[test]
-    fn encode_named_proc_writes_utf16_length_prefixed() {
-        let req = TokenRpcRequest::new(
-            Cow::Borrowed("my_sp"),
-            Vec::new(),
-            [0; 8],
+    fn encode_param_with_explicit_type_info_overrides_self_describe() {
+        // A NULL i32 output placeholder with an explicit nullable
+        // VarLenSized(Intn) type must encode as that type (length byte 0),
+        // not the non-nullable FixedLen(Int4) the bare value would
+        // self-describe as.
+        use crate::tds::codec::{VarLenContext, VarLenType};
+
+        let param = RpcParam {
+            name: Cow::Borrowed(""),
+            flags: RpcStatus::ByRefValue.into(),
+            type_info: Some(TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::Intn,
+                4,
+                None,
+            ))),
+            value: ColumnData::I32(None),
+        };
+        let mut buf = BytesMut::new();
+        param.encode(&mut buf).unwrap();
+
+        // name_len(0) + status(1) + [VarLenType::Intn, max_len=4, actual_len=0]
+        assert_eq!(
+            &buf[..],
+            &[0, RpcStatus::ByRefValue as u8, VarLenType::Intn as u8, 4, 0]
         );
+    }
+
+    #[test]
+    fn encode_named_proc_writes_utf16_length_prefixed() {
+        let req = TokenRpcRequest::new(Cow::Borrowed("my_sp"), Vec::new(), [0; 8]);
         let mut buf = BytesMut::new();
         req.encode(&mut buf).unwrap();
 
@@ -218,5 +268,43 @@ mod tests {
         let name_len = u16::from_le_bytes([buf[start], buf[start + 1]]);
         let expected: Vec<u16> = "spö".encode_utf16().collect();
         assert_eq!(name_len as usize, expected.len());
+    }
+
+    fn param(name: &str) -> RpcParam<'_> {
+        RpcParam {
+            name: Cow::Borrowed(name),
+            flags: BitFlags::empty(),
+            type_info: None,
+            value: ColumnData::I32(None),
+        }
+    }
+
+    #[test]
+    fn encode_param_name_at_the_length_limit() {
+        let name = "a".repeat(u8::MAX as usize);
+        let mut buf = BytesMut::new();
+        param(&name).encode(&mut buf).unwrap();
+
+        assert_eq!(buf[0], u8::MAX);
+    }
+
+    #[test]
+    fn encode_param_name_over_the_length_limit_errors() {
+        // 256 code units do not fit the u8 ParamName length prefix.
+        let name = "a".repeat(u8::MAX as usize + 1);
+        let mut buf = BytesMut::new();
+
+        assert!(param(&name).encode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn encode_param_name_length_counts_utf16_code_units() {
+        // A non-BMP char is two UTF-16 code units, so 128 of them are exactly
+        // 256 units and must be rejected even though the name is 128 chars.
+        let name = "😀".repeat(128);
+        let mut buf = BytesMut::new();
+
+        assert_eq!(name.chars().count(), 128);
+        assert!(param(&name).encode(&mut buf).is_err());
     }
 }

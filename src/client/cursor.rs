@@ -605,6 +605,7 @@ impl Cursor {
         let rpc_params = vec![RpcParam {
             name: Cow::Borrowed(""),
             flags: BitFlags::empty(),
+            type_info: None,
             value: ColumnData::I32(Some(self.handle.as_i32())),
         }];
         client.send_rpc(RpcProcId::CursorClose, rpc_params).await?;
@@ -626,21 +627,25 @@ pub(crate) fn build_cursorfetch_params(
         RpcParam {
             name: Cow::Borrowed(""),
             flags: BitFlags::empty(),
+            type_info: None,
             value: ColumnData::I32(Some(handle.as_i32())),
         },
         RpcParam {
             name: Cow::Borrowed(""),
             flags: BitFlags::empty(),
+            type_info: None,
             value: ColumnData::I32(Some(fetch_bits)),
         },
         RpcParam {
             name: Cow::Borrowed(""),
             flags: BitFlags::empty(),
+            type_info: None,
             value: ColumnData::I32(Some(row_num)),
         },
         RpcParam {
             name: Cow::Borrowed(""),
             flags: BitFlags::empty(),
+            type_info: None,
             value: ColumnData::I32(Some(count)),
         },
     ]
@@ -675,26 +680,31 @@ pub(crate) fn build_cursoropen_params<'a>(
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: RpcStatus::ByRefValue.into(),
+        type_info: None,
         value: ColumnData::I32(Some(0)),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: BitFlags::empty(),
+        type_info: None,
         value: ColumnData::String(Some(sql)),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: RpcStatus::ByRefValue.into(),
+        type_info: None,
         value: ColumnData::I32(Some(flags_to_i32(options.scroll.bits()))),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: RpcStatus::ByRefValue.into(),
+        type_info: None,
         value: ColumnData::I32(Some(flags_to_i32(options.concurrency.bits()))),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: RpcStatus::ByRefValue.into(),
+        type_info: None,
         value: ColumnData::I32(Some(0)),
     });
     // @paramdef and bound params only get sent when the statement actually
@@ -704,12 +714,14 @@ pub(crate) fn build_cursoropen_params<'a>(
         rpc_params.push(RpcParam {
             name: Cow::Borrowed(""),
             flags: BitFlags::empty(),
+            type_info: None,
             value: ColumnData::String(Some(param_defs)),
         });
         for (i, p) in params.iter().enumerate() {
             rpc_params.push(RpcParam {
                 name: Cow::Owned(format!("@P{}", i + 1)),
                 flags: BitFlags::empty(),
+                type_info: None,
                 value: p.to_sql(),
             });
         }
@@ -730,11 +742,13 @@ pub(crate) fn build_cursorprepexec_params<'a>(
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: RpcStatus::ByRefValue.into(),
+        type_info: None,
         value: ColumnData::I32(Some(0)),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: RpcStatus::ByRefValue.into(),
+        type_info: None,
         value: ColumnData::I32(Some(0)),
     });
     let param_defs = if param_defs.is_empty() {
@@ -745,32 +759,38 @@ pub(crate) fn build_cursorprepexec_params<'a>(
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: BitFlags::empty(),
+        type_info: None,
         value: ColumnData::String(param_defs),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: BitFlags::empty(),
+        type_info: None,
         value: ColumnData::String(Some(sql)),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: RpcStatus::ByRefValue.into(),
+        type_info: None,
         value: ColumnData::I32(Some(flags_to_i32(options.scroll.bits()))),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: RpcStatus::ByRefValue.into(),
+        type_info: None,
         value: ColumnData::I32(Some(flags_to_i32(options.concurrency.bits()))),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: RpcStatus::ByRefValue.into(),
+        type_info: None,
         value: ColumnData::I32(Some(0)),
     });
     for (i, p) in params.iter().enumerate() {
         rpc_params.push(RpcParam {
             name: Cow::Owned(format!("@P{}", i + 1)),
             flags: BitFlags::empty(),
+            type_info: None,
             value: p.to_sql(),
         });
     }
@@ -781,6 +801,7 @@ pub(crate) fn build_unprepare_param(handle: PreparedHandle) -> RpcParam<'static>
     RpcParam {
         name: Cow::Borrowed(""),
         flags: BitFlags::empty(),
+        type_info: None,
         value: ColumnData::I32(Some(handle.as_i32())),
     }
 }

@@ -121,6 +121,7 @@ pub use auth::{
     TdsAuthHandler,
     METADATA_APPLICATION, METADATA_DATABASE, METADATA_SERVER, METADATA_USER,
 };
+pub use crate::tds::codec::{RpcOption, RpcProcId, RpcStatus};
 pub use codec::{decode_rpc_params, DecodedRpcParam, RpcParamSet, TdsCodec};
 pub use connection::TdsConnection;
 pub use handler::{

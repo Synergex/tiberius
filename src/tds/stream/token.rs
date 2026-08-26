@@ -45,6 +45,7 @@ pub(crate) struct TokenStream<'a, S: AsyncRead + AsyncWrite + Unpin + Send> {
     conn: &'a mut Connection<S>,
     last_error: Option<Error>,
     attention_sent: bool,
+    canceled: bool,
 }
 
 impl<'a, S> TokenStream<'a, S>
@@ -56,6 +57,7 @@ where
             conn,
             last_error: None,
             attention_sent: false,
+            canceled: false,
         }
     }
 
@@ -67,6 +69,7 @@ where
             conn,
             last_error: None,
             attention_sent: true,
+            canceled: false,
         }
     }
 
@@ -363,6 +366,7 @@ where
                         Some(byte) => byte,
                         None => {
                             this.attention_sent = true;
+                            this.canceled = true;
                             continue;
                         }
                     }
@@ -406,7 +410,11 @@ where
                         | ReceivedToken::DoneInProc(done)
                             if done.status().contains(DoneStatus::Attention) =>
                         {
-                            return Ok(None);
+                            return if this.canceled {
+                                Err(Error::Canceled)
+                            } else {
+                                Ok(None)
+                            };
                         }
                         _ => continue,
                     }

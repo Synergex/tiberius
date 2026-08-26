@@ -130,6 +130,14 @@ impl PacketHeader {
         self.ty = ty;
     }
 
+    /// Set the total packet length, header included. Written by
+    /// [`Packet::encode`], which is the only place the final length is known.
+    ///
+    /// [`Packet::encode`]: super::Packet
+    pub(crate) fn set_length(&mut self, length: u16) {
+        self.length = length;
+    }
+
     pub fn status(&self) -> PacketStatus {
         self.status
     }

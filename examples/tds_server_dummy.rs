@@ -28,7 +28,7 @@ mod server {
     use tiberius::server::{
         process_connection, AttentionHandler, AuthBuilder, AuthError, AuthHandler, AuthSuccess,
         BulkLoadHandler, DefaultEnvChangeProvider, EnvChangeProvider, ErrorHandler, FedAuthValidator,
-        LoginInfo, ResultSetWriter, RpcHandler, SqlAuthSource, SqlBatchHandler, SspiAcceptor,
+        LoginInfo, ResultSetWriter, RpcHandler, RpcStatus, SqlAuthSource, SqlBatchHandler, SspiAcceptor,
         SspiStart, SspiStep, TdsAuthHandler, TdsBackendMessage, TdsConnectionContext, TdsConnectionState,
         TdsServerHandlers,
     };
@@ -37,7 +37,7 @@ mod server {
         time::{Date, DateTime, DateTime2, DateTimeOffset, SmallDateTime, Time},
         xml::XmlData,
         AltMetaDataColumn, BaseMetaDataColumn, Collation, ColumnData, ColumnFlag, DoneStatus,
-        FedAuthInfoOption, FixedLenType, LoginMessage, MetaDataColumn, PreloginMessage, RpcStatus,
+        FedAuthInfoOption, FixedLenType, LoginMessage, MetaDataColumn, PreloginMessage,
         SessionStateEntry, SsVariantInfo, TokenAltMetaData, TokenAltRow, TokenColInfo,
         TokenColMetaData, TokenColName, TokenDone, TokenEnvChange, TokenError, TokenFedAuthInfo,
         TokenFeatureExtAck, TokenInfo, TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,

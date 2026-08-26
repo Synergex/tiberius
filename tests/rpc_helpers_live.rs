@@ -4,9 +4,38 @@
 //! rather than a silent "0 passed".
 
 use futures_util::stream::TryStreamExt;
+use std::borrow::Cow;
 use std::env;
-use tiberius::{Client, Config, CursorOpenOptions, Fetch, QueryItem};
+use tiberius::numeric::Numeric;
+use tiberius::{
+    Client, ColumnData, Config, CursorOpenOptions, Fetch, ProcedureParameter, QueryItem, TypeInfo,
+    VarLenContext, VarLenType,
+};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+fn int_type() -> TypeInfo {
+    TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None))
+}
+
+fn nvarchar_type(len: usize) -> TypeInfo {
+    TypeInfo::VarLenSized(VarLenContext::new(
+        VarLenType::NVarchar,
+        len,
+        Some(tiberius::Collation::new(13632521, 52)),
+    ))
+}
+
+fn nvarchar_max_type() -> TypeInfo {
+    nvarchar_type(u16::MAX as usize)
+}
+
+fn varbinary_max_type() -> TypeInfo {
+    TypeInfo::VarLenSized(VarLenContext::new(
+        VarLenType::BigVarBin,
+        u16::MAX as usize,
+        None,
+    ))
+}
 
 fn conn_str() -> String {
     env::var("TIBERIUS_TEST_CONNECTION_STRING")
@@ -155,6 +184,673 @@ async fn live_prepared_across_table() -> tiberius::Result<()> {
 
     client
         .simple_query("DROP TABLE ##tiberius_rpc_helpers_live")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_with_output_and_return_status() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+
+    client
+        .simple_query(
+            "IF OBJECT_ID('tempdb..##tiberius_call_procedure_test', 'P') IS NOT NULL \
+             DROP PROCEDURE ##tiberius_call_procedure_test",
+        )
+        .await?
+        .into_results()
+        .await?;
+    client
+        .simple_query(
+            "CREATE PROCEDURE ##tiberius_call_procedure_test \
+                 @in INT, @out INT OUTPUT, @io INT OUTPUT \
+             AS BEGIN \
+                 PRINT 'tiberius_call_procedure_test: running'; \
+                 SET @out = @in * 2; \
+                 SET @io = @io + 1; \
+                 SELECT @in AS v; \
+                 RETURN @in; \
+             END",
+        )
+        .await?
+        .into_results()
+        .await?;
+
+    let result = client
+        .call_procedure(
+            "##tiberius_call_procedure_test",
+            vec![
+                ProcedureParameter::input(int_type(), ColumnData::I32(Some(21))).named("@in"),
+                ProcedureParameter::output(int_type(), ColumnData::I32(Some(0))).named("@out"),
+                ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(9))).named("@io"),
+            ],
+        )
+        .await?;
+
+    assert_eq!(result.result_sets.len(), 1);
+    assert_eq!(result.result_sets[0].rows.len(), 1);
+    assert_eq!(result.result_sets[0].rows[0].get::<i32, _>(0), Some(21));
+    assert_eq!(result.return_status, Some(21));
+    assert!(result.messages.iter().any(|m| m
+        .message()
+        .contains("tiberius_call_procedure_test: running")));
+
+    let out = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@out"))
+        .expect("expected @out output value");
+    assert_eq!(out.get::<i32>()?, Some(42));
+
+    let io = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@io"))
+        .expect("expected @io output value");
+    assert_eq!(io.get::<i32>()?, Some(10));
+
+    // A negative RETURN status must survive the RPC round trip as a signed
+    // value, and the connection must be reusable for another call.
+    let result2 = client
+        .call_procedure(
+            "##tiberius_call_procedure_test",
+            vec![
+                ProcedureParameter::input(int_type(), ColumnData::I32(Some(-3))).named("@in"),
+                ProcedureParameter::output(int_type(), ColumnData::I32(Some(0))).named("@out"),
+                ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(0))).named("@io"),
+            ],
+        )
+        .await?;
+    assert_eq!(result2.return_status, Some(-3));
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_call_procedure_test")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_surfaces_raiserror() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+
+    client
+        .simple_query(
+            "IF OBJECT_ID('tempdb..##tiberius_call_procedure_error', 'P') IS NOT NULL \
+             DROP PROCEDURE ##tiberius_call_procedure_error",
+        )
+        .await?
+        .into_results()
+        .await?;
+    client
+        .simple_query(
+            "CREATE PROCEDURE ##tiberius_call_procedure_error AS \
+             BEGIN RAISERROR('tiberius_call_procedure_error: boom', 16, 1); END",
+        )
+        .await?
+        .into_results()
+        .await?;
+
+    let err = client
+        .call_procedure("##tiberius_call_procedure_error", Vec::new())
+        .await
+        .unwrap_err();
+    match err {
+        tiberius::error::Error::Server(e) => {
+            assert!(e.message().contains("tiberius_call_procedure_error: boom"))
+        }
+        other => panic!("expected Server error, got {:?}", other),
+    }
+
+    // The connection must still be usable after a server-side error.
+    client
+        .simple_query("SELECT 1")
+        .await?
+        .into_results()
+        .await?;
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_call_procedure_error")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_cancellation_leaves_connection_reusable() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+
+    let token = client.cancellation_token();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        token.cancel();
+    });
+
+    let start = std::time::Instant::now();
+    let result = client
+        .call_procedure(
+            "sp_executesql",
+            vec![ProcedureParameter::input(
+                nvarchar_type(0xffff),
+                ColumnData::String(Some(Cow::Borrowed("WAITFOR DELAY '00:00:30'"))),
+            )],
+        )
+        .await;
+    let elapsed = start.elapsed();
+    canceller.await.ok();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "cancellation did not interrupt call_procedure: took {elapsed:?}"
+    );
+    assert!(
+        matches!(&result, Err(tiberius::error::Error::Canceled)),
+        "expected Error::Canceled, got {result:?}"
+    );
+
+    // Connection is still reusable after the cancel drain.
+    let rows = client
+        .simple_query("SELECT 42")
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    assert_eq!(rows.get::<i32, _>(0), Some(42));
+    Ok(())
+}
+
+/// Creates a procedure echoing `@in` back through `@out OUTPUT`, replacing
+/// any existing one of that name.
+async fn create_echo_procedure(
+    client: &mut Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
+    proc_name: &str,
+    sql_type: &str,
+) -> tiberius::Result<()> {
+    client
+        .simple_query(format!(
+            "IF OBJECT_ID('tempdb..{proc_name}', 'P') IS NOT NULL DROP PROCEDURE {proc_name}"
+        ))
+        .await?
+        .into_results()
+        .await?;
+    client
+        .simple_query(format!(
+            "CREATE PROCEDURE {proc_name} @in {sql_type}, @out {sql_type} OUTPUT \
+             AS BEGIN SET @out = @in; END"
+        ))
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_echoes_strings_bounded_and_max() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    create_echo_procedure(&mut client, "##tiberius_echo_nvarchar", "nvarchar(max)").await?;
+
+    // Single-packet sized; multi-packet is covered by
+    // `live_call_procedure_multi_packet_clob_and_blob`.
+    let long_value = "tiberius-".repeat(100);
+
+    let result = client
+        .call_procedure(
+            "##tiberius_echo_nvarchar",
+            vec![
+                ProcedureParameter::input(
+                    nvarchar_type(50),
+                    ColumnData::String(Some(Cow::Borrowed("hello"))),
+                )
+                .named("@in"),
+                ProcedureParameter::output(nvarchar_type(0xffff), ColumnData::String(None))
+                    .named("@out"),
+            ],
+        )
+        .await?;
+    let out = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@out"))
+        .unwrap();
+    assert_eq!(out.get::<&str>()?, Some("hello"));
+
+    let result = client
+        .call_procedure(
+            "##tiberius_echo_nvarchar",
+            vec![
+                ProcedureParameter::input(
+                    nvarchar_type(0xffff),
+                    ColumnData::String(Some(Cow::Owned(long_value.clone()))),
+                )
+                .named("@in"),
+                ProcedureParameter::output(nvarchar_type(0xffff), ColumnData::String(None))
+                    .named("@out"),
+            ],
+        )
+        .await?;
+    let out = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@out"))
+        .unwrap();
+    assert_eq!(out.get::<&str>()?, Some(long_value.as_str()));
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_echo_nvarchar")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_echoes_binary_bounded_and_max() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    create_echo_procedure(&mut client, "##tiberius_echo_varbinary", "varbinary(max)").await?;
+
+    let bounded_ty = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 50, None));
+    let max_ty = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 0xffff, None));
+    let long_value: Vec<u8> = (0..1500u32).map(|i| (i % 256) as u8).collect();
+
+    let result = client
+        .call_procedure(
+            "##tiberius_echo_varbinary",
+            vec![
+                ProcedureParameter::input(
+                    bounded_ty,
+                    ColumnData::Binary(Some(Cow::Borrowed(&[1u8, 2, 3][..]))),
+                )
+                .named("@in"),
+                ProcedureParameter::output(max_ty.clone(), ColumnData::Binary(None)).named("@out"),
+            ],
+        )
+        .await?;
+    let out = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@out"))
+        .unwrap();
+    assert_eq!(out.get::<&[u8]>()?, Some(&[1u8, 2, 3][..]));
+
+    let result = client
+        .call_procedure(
+            "##tiberius_echo_varbinary",
+            vec![
+                ProcedureParameter::input(
+                    max_ty.clone(),
+                    ColumnData::Binary(Some(Cow::Owned(long_value.clone()))),
+                )
+                .named("@in"),
+                ProcedureParameter::output(max_ty, ColumnData::Binary(None)).named("@out"),
+            ],
+        )
+        .await?;
+    let out = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@out"))
+        .unwrap();
+    assert_eq!(out.get::<&[u8]>()?, Some(long_value.as_slice()));
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_echo_varbinary")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_echoes_null_output() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    create_echo_procedure(&mut client, "##tiberius_echo_null", "int").await?;
+
+    let result = client
+        .call_procedure(
+            "##tiberius_echo_null",
+            vec![
+                ProcedureParameter::input(int_type(), ColumnData::I32(None)).named("@in"),
+                ProcedureParameter::output(int_type(), ColumnData::I32(Some(0))).named("@out"),
+            ],
+        )
+        .await?;
+    let out = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@out"))
+        .unwrap();
+    assert_eq!(out.get::<i32>()?, None);
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_echo_null")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_numeric_precision_scale() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    create_echo_procedure(&mut client, "##tiberius_echo_numeric", "numeric(18,2)").await?;
+
+    let ty = TypeInfo::VarLenSizedPrecision {
+        ty: VarLenType::Numericn,
+        size: 17,
+        precision: 18,
+        scale: 2,
+    };
+    let result = client
+        .call_procedure(
+            "##tiberius_echo_numeric",
+            vec![
+                ProcedureParameter::input(
+                    ty.clone(),
+                    ColumnData::Numeric(Some(Numeric::new_with_scale(123_456, 2))),
+                )
+                .named("@in"),
+                ProcedureParameter::output(ty, ColumnData::Numeric(None)).named("@out"),
+            ],
+        )
+        .await?;
+    let out = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@out"))
+        .unwrap();
+    match out.raw() {
+        ColumnData::Numeric(Some(n)) => {
+            assert_eq!(*n, Numeric::new_with_scale(123_456, 2));
+        }
+        other => panic!("expected Numeric, got {:?}", other),
+    }
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_echo_numeric")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_output_ordinal_mapping() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+
+    client
+        .simple_query(
+            "IF OBJECT_ID('tempdb..##tiberius_ordinal_proc', 'P') IS NOT NULL \
+             DROP PROCEDURE ##tiberius_ordinal_proc",
+        )
+        .await?
+        .into_results()
+        .await?;
+    client
+        .simple_query(
+            "CREATE PROCEDURE ##tiberius_ordinal_proc \
+                 @first INT OUTPUT, @second NVARCHAR(50) OUTPUT, @third INT OUTPUT \
+             AS BEGIN SET @first = 1; SET @second = N'second'; SET @third = 3; END",
+        )
+        .await?
+        .into_results()
+        .await?;
+
+    let result = client
+        .call_procedure(
+            "##tiberius_ordinal_proc",
+            vec![
+                ProcedureParameter::output(int_type(), ColumnData::I32(Some(0))).named("@first"),
+                ProcedureParameter::output(nvarchar_type(50), ColumnData::String(None))
+                    .named("@second"),
+                ProcedureParameter::output(int_type(), ColumnData::I32(Some(0))).named("@third"),
+            ],
+        )
+        .await?;
+
+    assert_eq!(result.output_values.len(), 3);
+    // Strictly increasing rather than a literal base: the starting value is
+    // not a documented contract.
+    assert_eq!(result.output_values[0].name(), "@first");
+    assert_eq!(result.output_values[1].name(), "@second");
+    assert_eq!(result.output_values[2].name(), "@third");
+    assert!(
+        result.output_values[0].ordinal() < result.output_values[1].ordinal()
+            && result.output_values[1].ordinal() < result.output_values[2].ordinal(),
+        "expected strictly increasing ordinals, got {:?}",
+        result
+            .output_values
+            .iter()
+            .map(|o| o.ordinal())
+            .collect::<Vec<_>>()
+    );
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_ordinal_proc")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_multiple_results() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+
+    client
+        .simple_query(
+            "IF OBJECT_ID('tempdb..##tiberius_multi_result_proc', 'P') IS NOT NULL \
+             DROP PROCEDURE ##tiberius_multi_result_proc",
+        )
+        .await?
+        .into_results()
+        .await?;
+    client
+        .simple_query(
+            "CREATE PROCEDURE ##tiberius_multi_result_proc AS BEGIN \
+                 SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3; \
+                 SELECT 4 AS v UNION ALL SELECT 5; \
+             END",
+        )
+        .await?
+        .into_results()
+        .await?;
+
+    let result = client
+        .call_procedure("##tiberius_multi_result_proc", Vec::new())
+        .await?;
+
+    assert_eq!(result.result_sets.len(), 2);
+    let first: Vec<i32> = result.result_sets[0]
+        .rows
+        .iter()
+        .map(|r| r.get::<i32, _>(0).unwrap())
+        .collect();
+    assert_eq!(first, vec![1, 2, 3]);
+    let second: Vec<i32> = result.result_sets[1]
+        .rows
+        .iter()
+        .map(|r| r.get::<i32, _>(0).unwrap())
+        .collect();
+    assert_eq!(second, vec![4, 5]);
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_multi_result_proc")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_positional_binding() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+
+    client
+        .simple_query(
+            "IF OBJECT_ID('tempdb..##tiberius_positional_proc', 'P') IS NOT NULL \
+             DROP PROCEDURE ##tiberius_positional_proc",
+        )
+        .await?
+        .into_results()
+        .await?;
+    client
+        .simple_query(
+            "CREATE PROCEDURE ##tiberius_positional_proc \
+                 @a INT, @b INT OUTPUT, @c INT OUTPUT \
+             AS BEGIN \
+                 SET @b = @a * 2; \
+                 SET @c = @c + 100; \
+                 SELECT @a AS v; \
+                 RETURN @a; \
+             END",
+        )
+        .await?
+        .into_results()
+        .await?;
+
+    // No parameter carries a name, so the server binds purely by descriptor
+    // order. Mixes all three directions to prove order is preserved across
+    // them rather than only across a uniform set.
+    let result = client
+        .call_procedure(
+            "##tiberius_positional_proc",
+            vec![
+                ProcedureParameter::input(int_type(), ColumnData::I32(Some(21))),
+                ProcedureParameter::output(int_type(), ColumnData::I32(None)),
+                ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(5))),
+            ],
+        )
+        .await?;
+
+    assert_eq!(result.return_status, Some(21));
+    assert_eq!(result.result_sets.len(), 1);
+    assert_eq!(result.result_sets[0].rows[0].get::<i32, _>(0), Some(21));
+
+    // Only the two byref parameters come back, in descriptor order.
+    assert_eq!(result.output_values.len(), 2);
+    assert_eq!(result.output_values[0].get::<i32>()?, Some(42)); // @b = @a * 2
+    assert_eq!(result.output_values[1].get::<i32>()?, Some(105)); // @c = 5 + 100
+
+    // Positional outputs carry no name, so consumers must address them by
+    // position; `matches_name` must not match an empty name.
+    for out in &result.output_values {
+        assert_eq!(out.name(), "");
+        assert!(!out.matches_name("@b"));
+    }
+
+    // Ordinals track the descriptor position of each parameter in the
+    // procedure signature (@a, @b, @c), so they stay strictly increasing.
+    assert!(
+        result.output_values[0].ordinal() < result.output_values[1].ordinal(),
+        "expected strictly increasing ordinals, got {:?}",
+        result
+            .output_values
+            .iter()
+            .map(|o| o.ordinal())
+            .collect::<Vec<_>>()
+    );
+
+    // The connection is reusable for a further positional call.
+    let again = client
+        .call_procedure(
+            "##tiberius_positional_proc",
+            vec![
+                ProcedureParameter::input(int_type(), ColumnData::I32(Some(-7))),
+                ProcedureParameter::output(int_type(), ColumnData::I32(None)),
+                ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(0))),
+            ],
+        )
+        .await?;
+    assert_eq!(again.return_status, Some(-7));
+    assert_eq!(again.output_values[0].get::<i32>()?, Some(-14));
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_positional_proc")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_multi_packet_clob_and_blob() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    create_echo_procedure(&mut client, "##tiberius_echo_clob", "nvarchar(max)").await?;
+    create_echo_procedure(&mut client, "##tiberius_echo_blob", "varbinary(max)").await?;
+
+    // Well past a single 4 KiB TDS packet in both directions.
+    let clob = "tiberius-clob-".repeat(4_000); // 56_000 chars / 112_000 bytes
+    assert!(clob.len() * 2 > 4096 * 8);
+
+    let result = client
+        .call_procedure(
+            "##tiberius_echo_clob",
+            vec![
+                ProcedureParameter::input(
+                    nvarchar_max_type(),
+                    ColumnData::String(Some(Cow::Owned(clob.clone()))),
+                )
+                .named("@in"),
+                ProcedureParameter::output(nvarchar_max_type(), ColumnData::String(None))
+                    .named("@out"),
+            ],
+        )
+        .await?;
+    let out = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@out"))
+        .unwrap();
+    assert_eq!(out.get::<&str>()?, Some(clob.as_str()));
+
+    let blob: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let result = client
+        .call_procedure(
+            "##tiberius_echo_blob",
+            vec![
+                ProcedureParameter::input(
+                    varbinary_max_type(),
+                    ColumnData::Binary(Some(Cow::Owned(blob.clone()))),
+                )
+                .named("@in"),
+                ProcedureParameter::output(varbinary_max_type(), ColumnData::Binary(None))
+                    .named("@out"),
+            ],
+        )
+        .await?;
+    let out = result
+        .output_values
+        .iter()
+        .find(|o| o.matches_name("@out"))
+        .unwrap();
+    assert_eq!(out.get::<&[u8]>()?, Some(blob.as_slice()));
+
+    // Connection still usable after bulk transfers.
+    let row = client
+        .simple_query("SELECT 42")
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i32, _>(0), Some(42));
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_echo_clob; DROP PROCEDURE ##tiberius_echo_blob")
         .await?
         .into_results()
         .await?;

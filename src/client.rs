@@ -4,6 +4,7 @@ mod config;
 mod connection;
 mod cursor;
 mod prepared;
+mod rpc_call;
 mod rpc_response;
 
 mod tls;
@@ -24,7 +25,8 @@ pub use cursor::{
     CursorScrollOptions, DirectResultSet, DirectResults, Fetch, PreparedCursor,
 };
 pub use prepared::{PreparedHandle, PreparedStatement};
-pub use rpc_response::OutputValue;
+pub use rpc_call::{ParameterDirection, ProcedureParameter, ProcedureResult};
+pub use rpc_response::{BufferedResultSet, OutputValue};
 
 use crate::tds::stream::ReceivedToken;
 use crate::{
@@ -35,7 +37,7 @@ use crate::{
     },
     BulkLoadRequest, ColumnFlag, SqlReadBytes, ToSql,
 };
-use codec::{BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, TokenRpcRequest};
+use codec::{BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, RpcProcIdValue, TokenRpcRequest};
 use enumflags2::BitFlags;
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::TryStreamExt;
@@ -393,11 +395,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             RpcParam {
                 name: Cow::Borrowed("stmt"),
                 flags: BitFlags::empty(),
+                type_info: None,
                 value: ColumnData::String(Some(query.into())),
             },
             RpcParam {
                 name: Cow::Borrowed("params"),
                 flags: BitFlags::empty(),
+                type_info: None,
                 value: ColumnData::I32(Some(0)),
             },
         ]
@@ -424,6 +428,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             rpc_params.push(RpcParam {
                 name: Cow::Owned(format!("@P{}", i + 1)),
                 flags: BitFlags::empty(),
+                type_info: None,
                 value: param,
             });
         }
@@ -435,15 +440,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         self.send_rpc(proc_id, rpc_params).await
     }
 
-    /// Send an RPC request with the given proc id and already-built parameters.
+    /// Send an RPC request with the given proc id (or arbitrary procedure
+    /// name) and already-built parameters.
     ///
     /// Unlike [`rpc_perform_query`], this does not manipulate the `@params`
     /// definitions string — the caller is fully responsible for the parameter
     /// layout. Used by prepared statement and cursor helpers where the wire
-    /// layout differs from `sp_executesql`.
+    /// layout differs from `sp_executesql`, as well as by
+    /// [`call_procedure`](Self::call_procedure).
     pub(crate) async fn send_rpc<'b>(
         &mut self,
-        proc_id: RpcProcId,
+        proc_id: impl Into<RpcProcIdValue<'b>>,
         rpc_params: Vec<RpcParam<'b>>,
     ) -> crate::Result<()> {
         let req = TokenRpcRequest::new(

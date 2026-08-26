@@ -603,21 +603,24 @@ impl<S: NetStream> Stream for TdsConnection<S> {
             return Poll::Ready(Some(Ok(msg)));
         }
 
-        match this.try_decode() {
-            Ok(Some(msg)) => return Poll::Ready(Some(Ok(msg))),
-            Ok(None) => {}
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        }
+        // Keep reading until a whole message decodes. A read that yields
+        // bytes without completing one (an interior packet of a multi-packet
+        // message) registers no waker, so returning Pending here would park
+        // the task forever.
+        loop {
+            match this.try_decode() {
+                Ok(Some(msg)) => return Poll::Ready(Some(Ok(msg))),
+                Ok(None) => {}
+                Err(e) => return Poll::Ready(Some(Err(e))),
+            }
 
-        match this.poll_read_buf(cx) {
-            Poll::Ready(Ok(0)) => Poll::Ready(None),
-            Poll::Ready(Ok(_)) => match this.try_decode() {
-                Ok(Some(msg)) => Poll::Ready(Some(Ok(msg))),
-                Ok(None) => Poll::Pending,
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Pending => Poll::Pending,
+            match this.poll_read_buf(cx) {
+                Poll::Ready(Ok(0)) => return Poll::Ready(None),
+                Poll::Ready(Ok(_)) => continue,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                // poll_read registered the waker.
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use enumflags2::BitFlags;
 use futures_util::sink::SinkExt;
 
+use tiberius::numeric::Numeric;
 use tiberius::server::sp_cursor::{
     CursorCache, CursorEntry, CursorHandle, ParsedCursorClose, ParsedCursorFetch, ParsedCursorOpen,
     SpCursorCloseHandler, SpCursorFetchHandler, SpCursorOpenHandler,
@@ -24,14 +25,14 @@ use tiberius::server::{
     AuthError, AuthHandler, AuthSuccess, BackendToken, BoxFuture, DefaultEnvChangeProvider,
     LoginInfo, NoOpAttention, NoOpError, OutputParameter, ParsedExecute, ParsedPrepExec,
     ParsedPrepare, ParsedUnprepare, PreparedHandle, ProcedureCache, RejectBulkLoad,
-    ResultSetWriter, RpcHandler, SpExecuteHandler, SpPrepExecHandler, SpPrepareHandler,
+    ResultSetWriter, RpcHandler, RpcProcId, SpExecuteHandler, SpPrepExecHandler, SpPrepareHandler,
     SpUnprepareHandler, SqlAuthSource, SqlBatchHandler, SystemProcRouter, SystemProcRouterBuilder,
     TdsAuthHandler, TdsBackendMessage, TdsClient, TdsServerHandlers,
 };
 use tiberius::{
     BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions,
-    CursorScrollOptions, EncryptionLevel, FixedLenType, MetaDataColumn, RpcProcId,
-    TokenColMetaData, TokenDone, TokenInfo, TypeInfo,
+    CursorScrollOptions, EncryptionLevel, FixedLenType, MetaDataColumn, ProcedureParameter,
+    TokenColMetaData, TokenDone, TokenInfo, TypeInfo, VarLenContext, VarLenType,
 };
 
 // =============================================================================
@@ -825,6 +826,89 @@ impl RpcHandler for SpecialRpc {
                         .await?;
                     Ok(())
                 }
+                None if message.proc_name.as_deref() == Some("tiberius_echo_proc") => {
+                    // Echoes every byref parameter back unchanged, so tests
+                    // can exercise any type/direction without a bespoke
+                    // handler per case.
+                    let params = message.into_param_set().await?;
+                    let all = params.all();
+
+                    client
+                        .send(TdsBackendMessage::TokenPartial(BackendToken::Info(
+                            TokenInfo::new(
+                                5000,
+                                1,
+                                5,
+                                "tiberius_echo_proc: running",
+                                "test-server",
+                                "tiberius_echo_proc",
+                                1,
+                            ),
+                        )))
+                        .await?;
+
+                    let outputs: Vec<OutputParameter<'static>> = all
+                        .iter()
+                        .filter(|p| p.is_output())
+                        .map(|p| OutputParameter::from_input(p, p.value.clone()))
+                        .collect();
+                    if !outputs.is_empty() {
+                        send_output_params(client, outputs).await?;
+                    }
+                    send_return_status(client, all.len() as i32).await?;
+                    client
+                        .send(TdsBackendMessage::Token(BackendToken::DoneProc(
+                            TokenDone::with_rows(0),
+                        )))
+                        .await?;
+                    Ok(())
+                }
+                None if message.proc_name.as_deref() == Some("tiberius_multi_result_proc") => {
+                    write_int_result_set(client, &[1, 2, 3], FinalDone::InProc).await?;
+                    write_int_result_set(client, &[4, 5], FinalDone::InProc).await?;
+                    send_return_status(client, 0).await?;
+                    client
+                        .send(TdsBackendMessage::Token(BackendToken::DoneProc(
+                            TokenDone::with_rows(0),
+                        )))
+                        .await?;
+                    Ok(())
+                }
+                None if message.proc_name.as_deref() == Some("tiberius_test_proc_error") => {
+                    client
+                        .send(TdsBackendMessage::TokenPartial(BackendToken::Error(
+                            tiberius::TokenError::new(
+                                50001,
+                                1,
+                                16,
+                                "tiberius_test_proc_error: boom",
+                                "test-server",
+                                "tiberius_test_proc_error",
+                                1,
+                            ),
+                        )))
+                        .await?;
+                    client
+                        .send(TdsBackendMessage::Token(BackendToken::DoneProc(
+                            TokenDone::with_rows(0),
+                        )))
+                        .await?;
+                    Ok(())
+                }
+                None if message.proc_name.as_deref() == Some("tiberius_test_proc_cancel") => {
+                    // A packet-less "long-running" procedure: emit nothing and
+                    // wait for an attention, mirroring `NoopSqlBatch`'s
+                    // `WAITFOR DELAY` simulation. Used to prove
+                    // `call_procedure` honors cancellation and leaves the
+                    // connection reusable afterward.
+                    for _ in 0..500 {
+                        if client.poll_attention().await? {
+                            return Ok(());
+                        }
+                        smol::Timer::after(std::time::Duration::from_millis(10)).await;
+                    }
+                    Ok(())
+                }
                 _ => Err(tiberius::error::Error::Protocol(
                     "test harness: unexpected RPC".into(),
                 )),
@@ -1010,16 +1094,19 @@ where
     let listener = async_net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let server_task = smol::spawn({
-        let handlers = handlers.clone();
-        async move {
-            let _ = run_server_once(listener, handlers).await;
-        }
+    // Each server gets its own thread and executor. smol's global executor
+    // defaults to a single thread shared by the whole test binary, so one
+    // test moving bulk data would starve every other test's server.
+    let handlers_bg = handlers.clone();
+    std::thread::spawn(move || {
+        smol::block_on(async move {
+            let _ = run_server_once(listener, handlers_bg).await;
+        });
     });
 
-    let result = test(addr, state).await;
-    server_task.cancel().await;
-    result
+    // The server serves one connection and returns once the client (dropped
+    // when `test` completes) disconnects.
+    test(addr, state).await
 }
 
 // =============================================================================
@@ -1627,6 +1714,582 @@ fn prepared_statement_is_marked_released_after_unprepare() {
             // Explicitly drop without unprepare — exercises the Drop warn
             // path. Test passes as long as this doesn't panic / hang.
             drop(stmt);
+        })
+        .await;
+    });
+}
+
+// =============================================================================
+// call_procedure — arbitrary stored procedure RPC calls
+//
+// Most of these drive `tiberius_echo_proc`, so what is under test is the
+// client's wire round trip for each parameter shape.
+// =============================================================================
+
+fn int_type() -> TypeInfo {
+    TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None))
+}
+
+fn nvarchar_type(len: usize) -> TypeInfo {
+    TypeInfo::VarLenSized(VarLenContext::new(
+        VarLenType::NVarchar,
+        len,
+        Some(tiberius::Collation::new(13632521, 52)),
+    ))
+}
+
+#[test]
+fn call_procedure_echoes_integers_input_output_inout() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let result = client
+                .call_procedure(
+                    "tiberius_echo_proc",
+                    vec![
+                        ProcedureParameter::input(int_type(), ColumnData::I32(Some(21)))
+                            .named("@in"),
+                        ProcedureParameter::output(int_type(), ColumnData::I32(Some(0)))
+                            .named("@out"),
+                        ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(9)))
+                            .named("@io"),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.messages.len(), 1);
+            assert_eq!(result.messages[0].number(), 5000);
+            // The echo proc returns the input param count as its status.
+            assert_eq!(result.return_status, Some(3));
+
+            let out = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@out"))
+                .expect("expected @out output value");
+            assert_eq!(out.get::<i32>().unwrap(), Some(0));
+
+            let io = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@io"))
+                .expect("expected @io output value");
+            assert_eq!(io.get::<i32>().unwrap(), Some(9));
+
+            // The connection is immediately reusable for another call. A
+            // negative return status must survive as a signed value, not
+            // wrap around to a large unsigned one.
+            let result2 = client
+                .call_procedure("tiberius_echo_proc", Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(result2.return_status, Some(0));
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_echoes_strings_bounded_and_max() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let bounded_ty = nvarchar_type(50);
+            let max_ty = nvarchar_type(0xffff);
+            // Small enough to stay in one TDS packet; the multi-packet case
+            // is covered by `call_procedure_echoes_multi_packet_value`.
+            let long_value: String = "tiberius-".repeat(100);
+
+            let result = client
+                .call_procedure(
+                    "tiberius_echo_proc",
+                    vec![
+                        ProcedureParameter::output(
+                            bounded_ty,
+                            ColumnData::String(Some(Cow::Borrowed("hello"))),
+                        )
+                        .named("@bounded"),
+                        ProcedureParameter::output(
+                            max_ty,
+                            ColumnData::String(Some(Cow::Owned(long_value.clone()))),
+                        )
+                        .named("@max"),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let bounded = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@bounded"))
+                .unwrap();
+            assert_eq!(bounded.get::<&str>().unwrap(), Some("hello"));
+
+            let max = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@max"))
+                .unwrap();
+            assert_eq!(max.get::<&str>().unwrap(), Some(long_value.as_str()));
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_echoes_binary_bounded_and_max() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let bounded_ty =
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 50, None));
+            let max_ty =
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 0xffff, None));
+            // Single-packet sized; the multi-packet case is covered by
+            // `call_procedure_echoes_multi_packet_value`.
+            let long_value: Vec<u8> = (0..1500u32).map(|i| (i % 256) as u8).collect();
+
+            let result = client
+                .call_procedure(
+                    "tiberius_echo_proc",
+                    vec![
+                        ProcedureParameter::output(
+                            bounded_ty,
+                            ColumnData::Binary(Some(Cow::Borrowed(&[1u8, 2, 3][..]))),
+                        )
+                        .named("@bounded"),
+                        ProcedureParameter::output(
+                            max_ty,
+                            ColumnData::Binary(Some(Cow::Owned(long_value.clone()))),
+                        )
+                        .named("@max"),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let bounded = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@bounded"))
+                .unwrap();
+            assert_eq!(bounded.get::<&[u8]>().unwrap(), Some(&[1u8, 2, 3][..]));
+
+            let max = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@max"))
+                .unwrap();
+            assert_eq!(max.get::<&[u8]>().unwrap(), Some(long_value.as_slice()));
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_echoes_null_output() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            // A real SQL NULL placeholder, decoupled from the wire type via
+            // the parameter's explicit `TypeInfo` — this is exactly the case
+            // that breaks if the wire type is inferred from the value
+            // instead of declared explicitly.
+            let result = client
+                .call_procedure(
+                    "tiberius_echo_proc",
+                    vec![
+                        ProcedureParameter::output(int_type(), ColumnData::I32(None)).named("@out"),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let out = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@out"))
+                .unwrap();
+            assert_eq!(out.get::<i32>().unwrap(), None);
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_echoes_numeric_precision_scale() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let ty = TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Numericn,
+                size: 17,
+                precision: 18,
+                scale: 2,
+            };
+            let result = client
+                .call_procedure(
+                    "tiberius_echo_proc",
+                    vec![ProcedureParameter::output(
+                        ty,
+                        ColumnData::Numeric(Some(Numeric::new_with_scale(123_456, 2))),
+                    )
+                    .named("@out")],
+                )
+                .await
+                .unwrap();
+
+            let out = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@out"))
+                .unwrap();
+            match out.raw() {
+                ColumnData::Numeric(Some(n)) => {
+                    assert_eq!(n.scale(), 2);
+                    assert_eq!(*n, Numeric::new_with_scale(123_456, 2));
+                }
+                other => panic!("expected Numeric, got {:?}", other),
+            }
+            assert_eq!(
+                out.type_info(),
+                &TypeInfo::VarLenSizedPrecision {
+                    ty: VarLenType::Numericn,
+                    size: 17,
+                    precision: 18,
+                    scale: 2,
+                }
+            );
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_output_ordinal_mapping() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let result = client
+                .call_procedure(
+                    "tiberius_echo_proc",
+                    vec![
+                        ProcedureParameter::output(int_type(), ColumnData::I32(Some(1)))
+                            .named("@first"),
+                        ProcedureParameter::output(
+                            nvarchar_type(50),
+                            ColumnData::String(Some(Cow::Borrowed("second"))),
+                        )
+                        .named("@second"),
+                        ProcedureParameter::output(int_type(), ColumnData::I32(Some(3)))
+                            .named("@third"),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.output_values.len(), 3);
+            // Ordinals are asserted as strictly increasing rather than
+            // against a literal base: SQL Server numbers them from 0, this
+            // test server from 1, and neither is a contract.
+            assert_eq!(result.output_values[0].name(), "@first");
+            assert_eq!(result.output_values[1].name(), "@second");
+            assert_eq!(result.output_values[2].name(), "@third");
+            assert!(
+                result.output_values[0].ordinal() < result.output_values[1].ordinal()
+                    && result.output_values[1].ordinal() < result.output_values[2].ordinal(),
+                "expected strictly increasing ordinals, got {:?}",
+                result
+                    .output_values
+                    .iter()
+                    .map(|o| o.ordinal())
+                    .collect::<Vec<_>>()
+            );
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_multiple_results() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let result = client
+                .call_procedure("tiberius_multi_result_proc", Vec::new())
+                .await
+                .unwrap();
+
+            assert_eq!(result.result_sets.len(), 2);
+            let first: Vec<i32> = result.result_sets[0]
+                .rows
+                .iter()
+                .map(|r| r.get::<i32, _>(0).unwrap())
+                .collect();
+            assert_eq!(first, vec![1, 2, 3]);
+            let second: Vec<i32> = result.result_sets[1]
+                .rows
+                .iter()
+                .map(|r| r.get::<i32, _>(0).unwrap())
+                .collect();
+            assert_eq!(second, vec![4, 5]);
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_without_rows_discards_rows_but_preserves_response_data() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let result = client
+                .call_procedure_without_rows("tiberius_multi_result_proc", Vec::new())
+                .await
+                .unwrap();
+
+            assert_eq!(result.result_sets.len(), 2);
+            assert_eq!(result.result_sets[0].columns[0].name(), "v");
+            assert_eq!(result.result_sets[1].columns[0].name(), "v");
+            assert!(result
+                .result_sets
+                .iter()
+                .all(|result_set| result_set.rows.is_empty()));
+            assert_eq!(result.return_status, Some(0));
+
+            let output_result = client
+                .call_procedure_without_rows(
+                    "tiberius_echo_proc",
+                    vec![
+                        ProcedureParameter::output(int_type(), ColumnData::I32(Some(7)))
+                            .named("@out"),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            assert!(output_result.result_sets.is_empty());
+            assert_eq!(output_result.messages.len(), 1);
+            assert_eq!(output_result.messages[0].number(), 5000);
+            assert_eq!(output_result.return_status, Some(1));
+            assert_eq!(
+                output_result.output_values[0].get::<i32>().unwrap(),
+                Some(7)
+            );
+
+            // The new collector must leave the connection ready for another
+            // operation after draining all rows and trailing RPC tokens.
+            let reusable = client
+                .call_procedure_without_rows("tiberius_echo_proc", Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(reusable.return_status, Some(0));
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_surfaces_server_error() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let err = client
+                .call_procedure("tiberius_test_proc_error", Vec::new())
+                .await
+                .unwrap_err();
+            match err {
+                tiberius::error::Error::Server(e) => assert_eq!(e.code(), 50001),
+                other => panic!("expected Server error, got {:?}", other),
+            }
+
+            // The connection must still be reusable after an error response.
+            let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
+            let row = stmt
+                .query(&mut client, &[&1i32])
+                .await
+                .unwrap()
+                .into_row()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i32, _>(0), Some(1));
+            stmt.unprepare(&mut client).await.unwrap();
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_cancellation_leaves_connection_reusable() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let token = client.cancellation_token();
+            let canceller = smol::spawn(async move {
+                smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                token.cancel();
+            });
+
+            let start = std::time::Instant::now();
+            let result = client
+                .call_procedure("tiberius_test_proc_cancel", Vec::new())
+                .await;
+            let elapsed = start.elapsed();
+            canceller.await;
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "cancellation did not interrupt call_procedure: took {elapsed:?}"
+            );
+            assert!(
+                matches!(&result, Err(tiberius::error::Error::Canceled)),
+                "expected Error::Canceled, got {result:?}"
+            );
+
+            // Connection is still reusable after the cancel drain.
+            let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
+            let row = stmt
+                .query(&mut client, &[&42i32])
+                .await
+                .unwrap()
+                .into_row()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i32, _>(0), Some(42));
+            stmt.unprepare(&mut client).await.unwrap();
+        })
+        .await;
+    });
+}
+
+#[test]
+fn call_procedure_positional_binding_preserves_descriptor_order() {
+    // No parameter carries a name, so binding is by declaration order alone.
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let result = client
+                .call_procedure(
+                    "tiberius_echo_proc",
+                    vec![
+                        ProcedureParameter::input(int_type(), ColumnData::I32(Some(10))),
+                        ProcedureParameter::output(int_type(), ColumnData::I32(Some(20))),
+                        ProcedureParameter::input_output(int_type(), ColumnData::I32(Some(30))),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            // Only the byref (output / input-output) params come back, in
+            // declaration order, and they must be addressable by position.
+            assert_eq!(result.output_values.len(), 2);
+            assert_eq!(result.output_values[0].get::<i32>().unwrap(), Some(20));
+            assert_eq!(result.output_values[1].get::<i32>().unwrap(), Some(30));
+            assert!(
+                result.output_values[0].ordinal() < result.output_values[1].ordinal(),
+                "expected strictly increasing ordinals, got {:?}",
+                result
+                    .output_values
+                    .iter()
+                    .map(|o| o.ordinal())
+                    .collect::<Vec<_>>()
+            );
+
+            // Connection stays reusable after a positional call.
+            let again = client
+                .call_procedure(
+                    "tiberius_echo_proc",
+                    vec![ProcedureParameter::output(
+                        int_type(),
+                        ColumnData::I32(Some(99)),
+                    )],
+                )
+                .await
+                .unwrap();
+            assert_eq!(again.output_values[0].get::<i32>().unwrap(), Some(99));
+        })
+        .await;
+    });
+}
+#[test]
+fn call_procedure_echoes_multi_packet_value() {
+    // Values spanning several TDS packets must survive the round trip in
+    // both directions; regressions here stall the connection rather than
+    // failing an assertion.
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            // 40_000 UTF-16 bytes => ~10 packets each way.
+            let long_value: String = "abcdefghij".repeat(2_000);
+            assert!(long_value.len() * 2 > 4096 * 4);
+
+            let long_binary: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+
+            let result = client
+                .call_procedure(
+                    "tiberius_echo_proc",
+                    vec![
+                        ProcedureParameter::output(
+                            nvarchar_type(0xffff),
+                            ColumnData::String(Some(Cow::Owned(long_value.clone()))),
+                        )
+                        .named("@text"),
+                        ProcedureParameter::output(
+                            TypeInfo::VarLenSized(VarLenContext::new(
+                                VarLenType::BigVarBin,
+                                0xffff,
+                                None,
+                            )),
+                            ColumnData::Binary(Some(Cow::Owned(long_binary.clone()))),
+                        )
+                        .named("@bin"),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let text = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@text"))
+                .unwrap();
+            assert_eq!(text.get::<&str>().unwrap(), Some(long_value.as_str()));
+
+            let bin = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@bin"))
+                .unwrap();
+            assert_eq!(bin.get::<&[u8]>().unwrap(), Some(long_binary.as_slice()));
+
+            // Connection remains usable after a multi-packet exchange.
+            let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
+            let row = stmt
+                .query(&mut client, &[&7i32])
+                .await
+                .unwrap()
+                .into_row()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i32, _>(0), Some(7));
+            stmt.unprepare(&mut client).await.unwrap();
         })
         .await;
     });
