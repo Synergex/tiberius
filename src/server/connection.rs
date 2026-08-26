@@ -502,12 +502,8 @@ impl<S: NetStream> TdsConnection<S> {
             }
 
             let packet = Packet::new(header, split_payload);
-            // `Packet::encode` back-patches the length at absolute offsets
-            // 2..4, so it must always be handed an empty buffer.
-            let mut framed = BytesMut::new();
             self.codec
-                .encode(TdsBackendMessage::Packet(packet), &mut framed)?;
-            self.write_buf.extend_from_slice(&framed);
+                .encode(TdsBackendMessage::Packet(packet), &mut self.write_buf)?;
         }
 
         self.message_in_progress = !end_of_message;
