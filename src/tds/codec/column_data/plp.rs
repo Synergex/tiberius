@@ -25,40 +25,47 @@ where
             }
         }
         // Unknown size, length-prefixed blobs
-        _ => {
-            let len = src.read_u64_le().await?;
+        _ => decode_unknown_size(src).await,
+    }
+}
 
-            let mut data = match len {
-                // NULL
-                0xffffffffffffffff => return Ok(None),
-                // Unknown size
-                0xfffffffffffffffe => Vec::new(),
-                // Known size
-                _ => Vec::with_capacity(len as usize),
-            };
+/// Decode a value that is always PLP-encoded, for types whose `MAX_LEN` does
+/// not select the wire format the way [`decode`] assumes (notably UDTs).
+pub(crate) async fn decode_unknown_size<R>(src: &mut R) -> crate::Result<Option<Vec<u8>>>
+where
+    R: SqlReadBytes + Unpin,
+{
+    let len = src.read_u64_le().await?;
 
-            let mut chunk_data_left = 0;
+    let mut data = match len {
+        // NULL
+        0xffffffffffffffff => return Ok(None),
+        // Unknown size
+        0xfffffffffffffffe => Vec::new(),
+        // Known size
+        _ => Vec::with_capacity(len as usize),
+    };
 
-            loop {
-                if chunk_data_left == 0 {
-                    // We have no chunk. Start a new one.
-                    let chunk_size = src.read_u32_le().await? as usize;
+    let mut chunk_data_left = 0;
 
-                    if chunk_size == 0 {
-                        break; // found a sentinel, we're done
-                    } else {
-                        chunk_data_left = chunk_size
-                    }
-                } else {
-                    // Just read a byte
-                    let byte = src.read_u8().await?;
-                    chunk_data_left -= 1;
+    loop {
+        if chunk_data_left == 0 {
+            // We have no chunk. Start a new one.
+            let chunk_size = src.read_u32_le().await? as usize;
 
-                    data.push(byte);
-                }
+            if chunk_size == 0 {
+                break; // found a sentinel, we're done
+            } else {
+                chunk_data_left = chunk_size
             }
+        } else {
+            // Just read a byte
+            let byte = src.read_u8().await?;
+            chunk_data_left -= 1;
 
-            Ok(Some(data))
+            data.push(byte);
         }
     }
+
+    Ok(Some(data))
 }
