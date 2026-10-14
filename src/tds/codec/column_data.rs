@@ -649,12 +649,14 @@ fn encode_variant_payload(ty: TypeInfo, value: ColumnData<'_>) -> crate::Result<
                     .into(),
                 ));
             }
-            if num.precision() != precision {
+            // The value only has to fit the declared precision: numeric(18,2)
+            // holds 1.23 even though 1.23 needs just three digits.
+            if num.precision() > precision {
                 return Err(crate::Error::BulkInput(
                     format!(
-                        "numeric precision mismatch: expected {} got {}",
-                        precision,
-                        num.precision()
+                        "numeric precision overflow: {} digits exceed declared precision {}",
+                        num.precision(),
+                        precision
                     )
                     .into(),
                 ));
@@ -2665,6 +2667,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn numeric_below_one_fits_declared_size() {
+        for (scale, size) in [(1, 5), (9, 5), (19, 9), (28, 13), (37, 17)] {
+            let ti = TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Numericn,
+                size,
+                precision: scale,
+                scale,
+            };
+
+            for value in [1, 10i128.pow(scale as u32) - 1] {
+                let d = ColumnData::Numeric(Some(Numeric::new_with_scale(value, scale)));
+
+                let mut buf = BytesMut::new();
+                let mut buf_with_ti = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+                d.clone().encode(&mut buf_with_ti).expect("encode");
+                assert_eq!(usize::from(buf[0]), size, "numeric({scale},{scale}) {d:?}");
+
+                test_round_trip(ti.clone(), d).await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn none_numeric_with_varlen_sized_precision() {
         test_round_trip(
             TypeInfo::VarLenSizedPrecision {
@@ -3174,6 +3199,47 @@ mod tests {
             .expect("decode typed variant");
         assert_eq!(decoded_ty, ty);
         assert_eq!(decoded_value, value);
+    }
+
+    #[tokio::test]
+    async fn ssvariant_typed_numeric_fits_declared_precision() {
+        let cases = [
+            (18, 9, Numeric::new_with_scale(123, 2)),
+            (1, 5, Numeric::new_with_scale(5, 1)),
+            (2, 5, Numeric::new_with_scale(5, 1)),
+            (9, 5, Numeric::new_with_scale(1, 9)),
+            (38, 17, Numeric::new_with_scale(-12_345, 4)),
+        ];
+
+        for (precision, size, num) in cases {
+            let ty = TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Numericn,
+                size,
+                precision,
+                scale: num.scale(),
+            };
+            let value = ColumnData::Numeric(Some(num));
+            let payload = VariantData::from_typed(ty.clone(), value.clone())
+                .unwrap_or_else(|e| panic!("numeric({precision}) {num:?}: {e}"));
+            let (decoded_ty, decoded_value) =
+                payload.decode_typed().await.expect("decode typed variant");
+            assert_eq!(decoded_ty, ty);
+            assert_eq!(decoded_value, value);
+        }
+    }
+
+    #[test]
+    fn ssvariant_typed_numeric_exceeding_precision_fails() {
+        let ty = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Numericn,
+            size: 5,
+            precision: 4,
+            scale: 2,
+        };
+        let value = ColumnData::Numeric(Some(Numeric::new_with_scale(12_345, 2)));
+
+        let err = VariantData::from_typed(ty, value).expect_err("123.45 overflows numeric(4,2)");
+        assert!(matches!(err, Error::BulkInput(_)), "{err:?}");
     }
 
     #[tokio::test]

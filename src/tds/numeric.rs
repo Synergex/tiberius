@@ -74,8 +74,10 @@ impl Numeric {
             result += 1;
         }
 
+        // A value below one needs no integer digit: numeric(s,s) holds it, and
+        // counting one would push the encoded length past that declaration's.
         if result == 0 {
-            1 + self.scale()
+            self.scale().max(1)
         } else {
             result + self.scale()
         }
@@ -361,6 +363,24 @@ mod tests {
     fn calculates_precision_correctly() {
         let n = Numeric::new_with_scale(57705, 2);
         assert_eq!(5, n.precision());
+    }
+
+    #[test]
+    fn values_below_one_need_no_integer_digit() {
+        let cases = [
+            (Numeric::new_with_scale(0, 0), 1, 5),
+            (Numeric::new_with_scale(5, 1), 1, 5),
+            (Numeric::new_with_scale(-5, 2), 2, 5),
+            (Numeric::new_with_scale(1, 9), 9, 5),
+            (Numeric::new_with_scale(1, 19), 19, 9),
+            (Numeric::new_with_scale(1, 28), 28, 13),
+            (Numeric::new_with_scale(1, 37), 37, 17),
+        ];
+
+        for (numeric, precision, len) in cases {
+            assert_eq!(numeric.precision(), precision, "{numeric:?}");
+            assert_eq!(numeric.len(), len, "{numeric:?}");
+        }
     }
 
     #[test]

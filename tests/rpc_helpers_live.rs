@@ -586,6 +586,61 @@ async fn live_call_procedure_numeric_precision_scale() -> tiberius::Result<()> {
 
 #[tokio::test]
 #[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_call_procedure_numeric_below_one() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+
+    // A numeric(s,s) parameter declares no room for an integer digit, so a
+    // value below one has to encode within that declaration's size.
+    for (scale, size) in [(9u8, 5usize), (19, 9), (28, 13), (37, 17)] {
+        create_echo_procedure(
+            &mut client,
+            "##tiberius_echo_numeric_below_one",
+            &format!("numeric({scale},{scale})"),
+        )
+        .await?;
+
+        let ty = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Numericn,
+            size,
+            precision: scale,
+            scale,
+        };
+
+        for value in [1, 10i128.pow(scale as u32) - 1] {
+            let num = Numeric::new_with_scale(value, scale);
+            let result = client
+                .call_procedure(
+                    "##tiberius_echo_numeric_below_one",
+                    vec![
+                        ProcedureParameter::input(ty.clone(), ColumnData::Numeric(Some(num)))
+                            .named("@in"),
+                        ProcedureParameter::output(ty.clone(), ColumnData::Numeric(None))
+                            .named("@out"),
+                    ],
+                )
+                .await?;
+            let out = result
+                .output_values
+                .iter()
+                .find(|o| o.matches_name("@out"))
+                .unwrap();
+            match out.raw() {
+                ColumnData::Numeric(Some(n)) => assert_eq!(*n, num),
+                other => panic!("expected Numeric, got {:?}", other),
+            }
+        }
+    }
+
+    client
+        .simple_query("DROP PROCEDURE ##tiberius_echo_numeric_below_one")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
 async fn live_call_procedure_output_ordinal_mapping() -> tiberius::Result<()> {
     let mut client = connect().await?;
 

@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::env;
 use std::sync::Once;
-use tiberius::{IntoSql, Result, TokenRow};
+use tiberius::{numeric::Numeric, IntoSql, Result, TokenRow};
 
 #[cfg(all(feature = "tds73", feature = "chrono"))]
 use chrono::DateTime;
@@ -146,6 +146,26 @@ test_bulk_type!(varchar_limited(
     "VARCHAR(255)",
     1000,
     vec!["aaaaaaaaaaaaaaaaaaaaaaa"; 1000].into_iter()
+));
+
+// Values below one fill a numeric(s,s) column, whose declared size leaves no
+// room for an integer digit. Run from the largest value each column holds.
+test_bulk_type!(numeric_9_9(
+    "NUMERIC(9,9)",
+    100,
+    (0..100).map(|i| Numeric::new_with_scale(10i128.pow(9) - 1 - i, 9))
+));
+
+test_bulk_type!(numeric_19_19(
+    "NUMERIC(19,19)",
+    100,
+    (0..100).map(|i| Numeric::new_with_scale(10i128.pow(19) - 1 - i, 19))
+));
+
+test_bulk_type!(numeric_28_28(
+    "NUMERIC(28,28)",
+    100,
+    (0..100).map(|i| Numeric::new_with_scale(10i128.pow(28) - 1 - i, 28))
 ));
 
 #[cfg(all(feature = "tds73", feature = "chrono"))]
