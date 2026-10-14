@@ -2667,6 +2667,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn numeric_below_one_fits_declared_size() {
+        for (scale, size) in [(1, 5), (9, 5), (19, 9), (28, 13), (37, 17)] {
+            let ti = TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Numericn,
+                size,
+                precision: scale,
+                scale,
+            };
+
+            for value in [1, 10i128.pow(scale as u32) - 1] {
+                let d = ColumnData::Numeric(Some(Numeric::new_with_scale(value, scale)));
+
+                let mut buf = BytesMut::new();
+                let mut buf_with_ti = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+                d.clone().encode(&mut buf_with_ti).expect("encode");
+                assert_eq!(usize::from(buf[0]), size, "numeric({scale},{scale}) {d:?}");
+
+                test_round_trip(ti.clone(), d).await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn none_numeric_with_varlen_sized_precision() {
         test_round_trip(
             TypeInfo::VarLenSizedPrecision {

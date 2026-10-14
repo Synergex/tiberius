@@ -1861,7 +1861,8 @@ async fn numeric_type_u96_presentation<S>(mut conn: tiberius::Client<S>) -> Resu
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let num = Numeric::new_with_scale(std::i64::MAX as i128, 19);
+    // 1.84…: precision 20, so 13 bytes on the wire.
+    let num = Numeric::new_with_scale(u64::MAX as i128 + 1, 19);
 
     let row = conn
         .query("SELECT @P1", &[&num])
@@ -1890,6 +1891,37 @@ where
         .unwrap();
 
     assert_eq!(Some(num), row.get(0));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn numeric_type_below_one_presentation<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // A value below one is declared numeric(s,s): it needs no integer digit,
+    // so each scale here sits at the top of its length band.
+    for scale in [1u8, 9, 19, 28, 37] {
+        let largest = 10i128.pow(scale as u32) - 1;
+
+        for value in [1, largest, -largest] {
+            let num = Numeric::new_with_scale(value, scale);
+
+            let row = conn
+                .query(
+                    "SELECT @P1, CAST(SQL_VARIANT_PROPERTY(@P1, 'Precision') AS int)",
+                    &[&num],
+                )
+                .await?
+                .into_row()
+                .await?
+                .unwrap();
+
+            assert_eq!(Some(num), row.get(0));
+            assert_eq!(Some(scale as i32), row.get(1), "{num:?}");
+        }
+    }
 
     Ok(())
 }
@@ -1946,7 +1978,8 @@ mod rust_decimal {
     {
         use tiberius::numeric::Decimal;
 
-        let num = Decimal::from_i128_with_scale(i64::MAX as i128, 19);
+        // 1.84…: precision 20, so 13 bytes on the wire.
+        let num = Decimal::from_i128_with_scale(u64::MAX as i128 + 1, 19);
         let row = conn
             .query("SELECT @P1", &[&num])
             .await?
@@ -1966,7 +1999,9 @@ mod rust_decimal {
     {
         use tiberius::numeric::Decimal;
 
-        let num = Decimal::from_i128_with_scale(i64::MAX as i128, 28);
+        // 7.92…: precision 29, so 17 bytes on the wire. 2^96 itself does not
+        // fit in a Decimal, so use its largest mantissa.
+        let num = Decimal::from_i128_with_scale(Decimal::MAX.mantissa(), 28);
         let row = conn
             .query("SELECT @P1", &[&num])
             .await?
@@ -2063,7 +2098,8 @@ mod bigdecimal {
         use num_traits::FromPrimitive;
         use tiberius::numeric::BigDecimal;
 
-        let int = BigInt::from_i128(i64::MAX as i128 + 10).unwrap();
+        // 1.84…: precision 20, so 13 bytes on the wire.
+        let int = BigInt::from_i128(u64::MAX as i128 + 1).unwrap();
         let num = BigDecimal::new(int, 19);
 
         let row = conn
@@ -2087,7 +2123,8 @@ mod bigdecimal {
         use num_traits::FromPrimitive;
         use tiberius::numeric::BigDecimal;
 
-        let int = BigInt::from_i128(i64::MAX as i128).unwrap();
+        // 7.92…: precision 29, so 17 bytes on the wire.
+        let int = BigInt::from_i128(1i128 << 96).unwrap();
         let num = BigDecimal::new(int, 28);
 
         let row = conn
@@ -3235,6 +3272,50 @@ where
 
     let (_, inner) = read_back.unwrap().decode_typed().await?;
     assert_eq!(inner, ColumnData::I32(Some(99)));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn sql_variant_numeric_write_as_param<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // Each value needs fewer digits than its declared precision, or none at
+    // all before the decimal point.
+    let cases = [
+        (18, 9, Numeric::new_with_scale(123, 2)),
+        (2, 5, Numeric::new_with_scale(5, 1)),
+        (9, 5, Numeric::new_with_scale(1, 9)),
+        (38, 17, Numeric::new_with_scale(-12_345, 4)),
+    ];
+
+    for (precision, size, num) in cases {
+        let ty = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Numericn,
+            size,
+            precision,
+            scale: num.scale(),
+        };
+        let variant = VariantData::from_typed(ty.clone(), ColumnData::Numeric(Some(num)))?;
+
+        let row = conn
+            .query(
+                "SELECT @P1, CAST(SQL_VARIANT_PROPERTY(@P1, 'Precision') AS int)",
+                &[&variant],
+            )
+            .await?
+            .into_row()
+            .await?
+            .unwrap();
+
+        assert_eq!(Some(precision as i32), row.get(1), "{num:?}");
+
+        let read_back: &VariantData<'static> = row.get(0).unwrap();
+        let (read_ty, inner) = read_back.decode_typed().await?;
+        assert_eq!(read_ty, ty);
+        assert_eq!(inner, ColumnData::Numeric(Some(num)));
+    }
 
     Ok(())
 }
