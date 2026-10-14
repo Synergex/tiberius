@@ -315,11 +315,35 @@ impl PreparedCursor {
     }
 
     /// Release the prepared handle, closing the cursor first if needed.
+    ///
+    /// The handle is released even when closing the cursor fails, as long as
+    /// the connection can still carry a request, so a cursor the server has
+    /// already closed does not strand its prepared statement. When both
+    /// fail, the error is [`CleanupFailed`](crate::error::Error::CleanupFailed),
+    /// which keeps the close's error and its code. Whenever the error's
+    /// [`leaves_connection_usable`](crate::error::Error::leaves_connection_usable)
+    /// is `false`, the connection should be discarded.
     pub async fn unprepare<S>(mut self, client: &mut Client<S>) -> crate::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        self.close_cursor(client).await?;
+        let closed = self.close_cursor(client).await;
+        if let Err(error) = &closed {
+            if !error.leaves_connection_usable() {
+                return closed;
+            }
+        }
+        let released = self.release(client).await;
+        match crate::Error::with_cleanup(closed.err(), released) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn release<S>(&mut self, client: &mut Client<S>) -> crate::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         client.connection.flush_stream().await?;
         let handle_param = build_unprepare_param(self.prepared_handle);
         client

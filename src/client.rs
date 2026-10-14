@@ -37,7 +37,10 @@ use crate::{
     },
     BulkLoadRequest, ColumnFlag, SqlReadBytes, ToSql,
 };
-use codec::{BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, RpcProcIdValue, TokenRpcRequest};
+use codec::{
+    BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, RpcProcIdValue, TokenRpcRequest,
+    TransactionOutcome, TransactionRequest,
+};
 use enumflags2::BitFlags;
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::TryStreamExt;
@@ -145,6 +148,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .await?;
 
         ExecuteResult::new(&mut self.connection).await
+    }
+
+    /// Executes `query` through `sp_executesql` with the caller's parameter
+    /// declarations, such as `"@P1 int, @P2 nvarchar(10)"`, rather than ones
+    /// derived from each value. Values are passed as `@P1` onward, in order.
+    ///
+    /// Returns the row counts the server reported before the first error,
+    /// with that error, or `None` when the execution succeeded. Counts
+    /// reported after the error are dropped, even when later statements of a
+    /// multi-statement batch ran.
+    pub async fn execute_declared_until_error<'a>(
+        &mut self,
+        query: impl Into<Cow<'a, str>>,
+        param_defs: impl Into<Cow<'a, str>>,
+        params: &[&dyn ToSql],
+    ) -> (ExecuteResult, Option<crate::Error>) {
+        if let Err(error) = self.connection.flush_stream().await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        let mut rpc_params = Self::rpc_params(query);
+        rpc_params[1].value = ColumnData::String(Some(param_defs.into()));
+        for (index, param) in params.iter().enumerate() {
+            rpc_params.push(RpcParam {
+                name: Cow::Owned(format!("@P{}", index + 1)),
+                flags: BitFlags::empty(),
+                type_info: None,
+                value: param.to_sql(),
+            });
+        }
+        if let Err(error) = self.send_rpc(RpcProcId::ExecuteSQL, rpc_params).await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        ExecuteResult::until_error(&mut self.connection).await
     }
 
     /// Executes SQL statements in the SQL Server, returning resulting rows.
@@ -263,6 +299,48 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         result.forward_to_metadata().await?;
 
         Ok(result)
+    }
+
+    /// Whether the server has reported an open transaction on this
+    /// connection. It sends the transaction's descriptor when one begins,
+    /// including an implicit transaction, and clears it when one ends.
+    pub fn transaction_open(&self) -> bool {
+        self.connection.context().transaction_descriptor() != [0; 8]
+    }
+
+    /// Commits the session's transaction with a transaction manager request,
+    /// which the server runs without compiling a batch. Returns `false`
+    /// without contacting the server when the server has reported no open
+    /// transaction on this connection.
+    pub async fn commit_transaction(&mut self) -> crate::Result<bool> {
+        self.end_transaction(TransactionOutcome::Commit).await
+    }
+
+    /// Rolls back the session's transaction as
+    /// [`commit_transaction`](Self::commit_transaction) commits it.
+    pub async fn rollback_transaction(&mut self) -> crate::Result<bool> {
+        self.end_transaction(TransactionOutcome::Rollback).await
+    }
+
+    async fn end_transaction(&mut self, outcome: TransactionOutcome) -> crate::Result<bool> {
+        self.connection.flush_stream().await?;
+        let descriptor = self.connection.context().transaction_descriptor();
+        if descriptor == [0; 8] {
+            return Ok(false);
+        }
+
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection
+            .send(
+                PacketHeader::transaction_manager(id),
+                TransactionRequest::new(outcome, descriptor),
+            )
+            .await?;
+        // The server's ENVCHANGE for the commit or rollback clears the
+        // descriptor while the response is read.
+        let mut tokens = TokenStream::new(&mut self.connection).try_unfold();
+        while tokens.try_next().await?.is_some() {}
+        Ok(true)
     }
 
     /// Execute a `BULK INSERT` statement, efficiantly storing a large number of
@@ -611,6 +689,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             results,
         ))
     }
+
+    /// Prepares and executes `sql` in one round trip, like
+    /// [`prep_exec`](Self::prep_exec), but returns the first execution's row
+    /// counts instead of its rows, as
+    /// [`execute_declared_until_error`](Self::execute_declared_until_error)
+    /// does.
+    ///
+    /// The statement is returned whenever the server assigned a handle, even
+    /// when the execution failed, so the caller can still release it.
+    pub async fn prep_exec_until_error<'a>(
+        &mut self,
+        sql: impl Into<Cow<'a, str>>,
+        param_defs: impl Into<Cow<'a, str>>,
+        params: &[&'a dyn ToSql],
+    ) -> (
+        Option<PreparedStatement>,
+        ExecuteResult,
+        Option<crate::Error>,
+    ) {
+        let sql: Cow<'a, str> = sql.into();
+        let param_defs: Cow<'a, str> = param_defs.into();
+        let sql_owned = sql.to_string();
+        let defs_owned = param_defs.to_string();
+
+        if let Err(error) = self.connection.flush_stream().await {
+            return (None, ExecuteResult::empty(), Some(error));
+        }
+        let rpc_params = prepared::build_prepexec_params(sql, param_defs, params);
+        if let Err(error) = self.send_rpc(RpcProcId::PrepExec, rpc_params).await {
+            return (None, ExecuteResult::empty(), Some(error));
+        }
+
+        let mut outputs: Vec<OutputValue> = Vec::new();
+        let (result, error) = ExecuteResult::until_error_visiting(&mut self.connection, |token| {
+            if let ReceivedToken::ReturnValue(value) = token {
+                outputs.push((*value).into());
+            }
+        })
+        .await;
+        let statement = prepared::extract_handle(&outputs)
+            .ok()
+            .map(|handle| PreparedStatement::new(handle, sql_owned, defs_owned));
+        (statement, result, error)
+    }
 }
 
 /// Drain the response of an `sp_prepexec` call: collect all result sets into
@@ -656,7 +778,7 @@ where
                     });
                 }
             }
-            ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
+            ReceivedToken::ReturnValue(rv) => outputs.push((*rv).into()),
             ReceivedToken::Error(e) => {
                 last_error.get_or_insert(crate::Error::Server(e));
             }
