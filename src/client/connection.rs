@@ -138,6 +138,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     fn post_login_encryption(mut self, encryption: EncryptionLevel) -> Self {
         if let EncryptionLevel::Off = encryption {
             event!(
+                name: "tiberius.tls_off",
                 Level::WARN,
                 "Turning TLS off after a login. All traffic from here on is not encrypted.",
             );
@@ -308,14 +309,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
 
         event!(
+            name: "tiberius.attention_flush",
             Level::WARN,
             "Flushing unhandled stream via attention signal. Please consume your streams!",
         );
 
         if self.flushed {
             // Server already finished sending all data (EOM seen), but some
-            // token data remains buffered. Just discard it.
+            // token data remains buffered. Just discard it. A database change
+            // in the discarded tokens is never seen, so the tracked database
+            // becomes unknown rather than stale.
             self.buf.truncate(0);
+            self.context.clear_database();
             return Ok(());
         }
 
@@ -594,6 +599,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Stream for Connection<S> {
         match ready!(this.transport.try_poll_next_unpin(cx)) {
             Some(Ok(packet)) => {
                 this.flushed = packet.is_last();
+                let spid = packet.header().spid();
+                if spid != 0 {
+                    this.context.set_spid(spid);
+                }
                 Poll::Ready(Some(Ok(packet)))
             }
             Some(Err(e)) => Poll::Ready(Some(Err(e))),

@@ -168,6 +168,7 @@ impl Drop for PreparedStatement {
     fn drop(&mut self) {
         if !self.released {
             event!(
+                name: "tiberius.handle_leaked",
                 Level::WARN,
                 handle = self.handle.as_i32(),
                 "PreparedStatement dropped without unprepare; server-side handle will leak until the connection closes"

@@ -89,6 +89,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         })
     }
 
+    /// The server session ID (SPID) from the server's packet headers, for
+    /// matching client activity to server-side traces.
+    pub fn spid(&self) -> Option<u16> {
+        self.connection.context().spid()
+    }
+
+    /// The server version from the login acknowledgement, as
+    /// `major.minor.build`.
+    pub fn server_version(&self) -> Option<&str> {
+        self.connection.context().server_version()
+    }
+
+    /// The current database, as last reported by the server. `None` until
+    /// the server reports one, and again after unread results were
+    /// discarded, since they may have held a database change.
+    pub fn database(&self) -> Option<&str> {
+        self.connection.context().database()
+    }
+
     /// Executes SQL statements in the SQL Server, returning the number rows
     /// affected. Useful for `INSERT`, `UPDATE` and `DELETE` statements. The
     /// `query` can define the parameter placement by annotating them with
