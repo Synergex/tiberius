@@ -228,6 +228,7 @@ impl From<CursorHandle> for i32 {
 #[derive(Debug)]
 pub struct PreparedCursor {
     prepared_handle: PreparedHandle,
+    requested_options: CursorOpenOptions,
     cursor: Option<Cursor>,
     cursor_handle: CursorHandle,
     scrollopt: BitFlags<CursorScrollOptions>,
@@ -301,6 +302,91 @@ impl PreparedCursor {
         collect_metadata_only_rpc(&mut client.connection).await
     }
 
+    /// Opens another cursor from the prepared statement with
+    /// `sp_cursorexecute`, using the options it was prepared with, so the
+    /// statement is not sent or compiled again.
+    ///
+    /// When the server opens a cursor, it becomes this statement's current
+    /// cursor and the one it replaces is returned still open, for the caller
+    /// to close once the new one is in use. When the server executes the
+    /// statement directly instead, or the request fails, the current cursor
+    /// is left as it was.
+    pub async fn execute<S>(
+        &mut self,
+        client: &mut Client<S>,
+        params: &[&dyn ToSql],
+    ) -> crate::Result<CursorExecuteOutcome>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        client.connection.flush_stream().await?;
+        let rpc_params =
+            build_cursorexecute_params(self.prepared_handle, self.requested_options, params);
+        client
+            .send_rpc(RpcProcId::CursorExecute, rpc_params)
+            .await?;
+        let (result_sets, outputs, _status, infos) =
+            crate::client::rpc_response::collect_rpc_result_sets(&mut client.connection).await?;
+
+        if infos
+            .iter()
+            .any(|info| info.number == SQL_SERVER_INFO_EXECUTED_DIRECTLY)
+        {
+            return Ok(CursorExecuteOutcome::Direct(
+                result_sets
+                    .into_iter()
+                    .map(|rs| DirectResultSet {
+                        columns: rs.columns,
+                        rows: rs.rows,
+                    })
+                    .collect(),
+            ));
+        }
+
+        let lookup_named = |name: &str| -> Option<i32> {
+            outputs
+                .iter()
+                .find(|o| !o.name().is_empty() && o.matches_name(name))
+                .and_then(|o| o.get::<i32>().ok().flatten())
+        };
+        let by_pos = |idx: usize| -> Option<i32> {
+            outputs.get(idx).and_then(|o| o.get::<i32>().ok().flatten())
+        };
+        let cursor_handle = lookup_named("cursor")
+            .or_else(|| by_pos(0))
+            .filter(|handle| *handle != 0)
+            .ok_or_else(|| {
+                crate::Error::Protocol("sp_cursorexecute: missing @cursor output parameter".into())
+            })?;
+        let scrollopt = lookup_named("scrollopt").or_else(|| by_pos(1)).unwrap_or(0);
+        let ccopt = lookup_named("ccopt").or_else(|| by_pos(2)).unwrap_or(0);
+        let row_count = lookup_named("rowcount").or_else(|| by_pos(3)).unwrap_or(-1);
+
+        // Without columns in the response, ask the server rather than trust the
+        // previous execution's: the table may have changed since.
+        self.metadata = result_sets.first().map(|rs| (*rs.columns).clone());
+        let previous = self.replace_cursor(Cursor {
+            handle: CursorHandle(cursor_handle),
+            scrollopt: i32_to_scroll_flags(scrollopt),
+            ccopt: i32_to_cc_flags(ccopt),
+            row_count,
+            closed: false,
+        });
+        Ok(CursorExecuteOutcome::Cursor { previous })
+    }
+
+    /// Makes `cursor`, opened from this statement, the current cursor and
+    /// returns the one it replaces, still open. A caller that abandons a new
+    /// cursor from [`execute`](Self::execute) uses this to restore the
+    /// previous one.
+    pub fn replace_cursor(&mut self, cursor: Cursor) -> Option<Cursor> {
+        self.cursor_handle = cursor.handle;
+        self.scrollopt = cursor.scrollopt;
+        self.ccopt = cursor.ccopt;
+        self.row_count = cursor.row_count;
+        self.cursor.replace(cursor)
+    }
+
     /// Close the cursor if it is still open.
     ///
     /// This is idempotent at the wrapper level.
@@ -315,11 +401,35 @@ impl PreparedCursor {
     }
 
     /// Release the prepared handle, closing the cursor first if needed.
+    ///
+    /// The handle is released even when closing the cursor fails, as long as
+    /// the connection can still carry a request, so a cursor the server has
+    /// already closed does not strand its prepared statement. When both
+    /// fail, the error is [`CleanupFailed`](crate::error::Error::CleanupFailed),
+    /// which keeps the close's error and its code. Whenever the error's
+    /// [`leaves_connection_usable`](crate::error::Error::leaves_connection_usable)
+    /// is `false`, the connection should be discarded.
     pub async fn unprepare<S>(mut self, client: &mut Client<S>) -> crate::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        self.close_cursor(client).await?;
+        let closed = self.close_cursor(client).await;
+        if let Err(error) = &closed {
+            if !error.leaves_connection_usable() {
+                return closed;
+            }
+        }
+        let released = self.release(client).await;
+        match crate::Error::with_cleanup(closed.err(), released) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn release<S>(&mut self, client: &mut Client<S>) -> crate::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         client.connection.flush_stream().await?;
         let handle_param = build_unprepare_param(self.prepared_handle);
         client
@@ -351,6 +461,20 @@ impl Drop for PreparedCursor {
             );
         }
     }
+}
+
+/// The outcome of [`PreparedCursor::execute`].
+#[derive(Debug)]
+pub enum CursorExecuteOutcome {
+    /// The server opened a new cursor, now the statement's current one. The
+    /// cursor it replaced, if any, is still open and must be closed.
+    Cursor {
+        /// The cursor the new one replaced.
+        previous: Option<Cursor>,
+    },
+    /// The server executed the statement directly and returned its result
+    /// sets; the statement's current cursor is unchanged.
+    Direct(Vec<DirectResultSet>),
 }
 
 /// The outcome of [`Client::cursor_prep_exec`](crate::Client::cursor_prep_exec).
@@ -800,6 +924,45 @@ pub(crate) fn build_cursorprepexec_params<'a>(
     rpc_params
 }
 
+pub(crate) fn build_cursorexecute_params<'a>(
+    prepared_handle: PreparedHandle,
+    options: CursorOpenOptions,
+    params: &[&'a dyn ToSql],
+) -> Vec<RpcParam<'a>> {
+    let mut rpc_params: Vec<RpcParam<'a>> = Vec::with_capacity(params.len() + 5);
+    rpc_params.push(RpcParam {
+        name: Cow::Borrowed(""),
+        flags: BitFlags::empty(),
+        type_info: None,
+        value: ColumnData::I32(Some(prepared_handle.as_i32())),
+    });
+    // The statement's parameters were declared when it was prepared; SQL
+    // Server rejects PARAMETERIZED_STMT on `sp_cursorexecute` (16902).
+    let scroll = options.scroll & !CursorScrollOptions::ParameterizedStmt;
+    for value in [
+        0,
+        flags_to_i32(scroll.bits()),
+        flags_to_i32(options.concurrency.bits()),
+        0,
+    ] {
+        rpc_params.push(RpcParam {
+            name: Cow::Borrowed(""),
+            flags: RpcStatus::ByRefValue.into(),
+            type_info: None,
+            value: ColumnData::I32(Some(value)),
+        });
+    }
+    for (i, p) in params.iter().enumerate() {
+        rpc_params.push(RpcParam {
+            name: Cow::Owned(format!("@P{}", i + 1)),
+            flags: BitFlags::empty(),
+            type_info: None,
+            value: p.to_sql(),
+        });
+    }
+    rpc_params
+}
+
 pub(crate) fn build_unprepare_param(handle: PreparedHandle) -> RpcParam<'static> {
     RpcParam {
         name: Cow::Borrowed(""),
@@ -854,6 +1017,7 @@ pub(crate) fn cursor_from_outputs(outputs: &[OutputValue]) -> crate::Result<Curs
 pub(crate) fn prepared_cursor_from_outputs(
     outputs: &[OutputValue],
     metadata: Option<Vec<Column>>,
+    requested_options: CursorOpenOptions,
 ) -> crate::Result<PreparedCursor> {
     let lookup_named = |name: &str| -> Option<i32> {
         outputs
@@ -904,6 +1068,7 @@ pub(crate) fn prepared_cursor_from_outputs(
 
     Ok(PreparedCursor {
         prepared_handle: PreparedHandle::from_i32(prepared_handle),
+        requested_options,
         cursor: Some(cursor),
         cursor_handle: CursorHandle(cursor_handle),
         scrollopt: i32_to_scroll_flags(scrollopt),
@@ -991,7 +1156,9 @@ pub(crate) fn cursor_prep_exec_outcome(
     // `first` is the first non-empty COLMETADATA).
     let metadata = result_sets.first().map(|rs| (*rs.columns).clone());
     Ok(CursorPrepExecOutcome::Cursor(prepared_cursor_from_outputs(
-        outputs, metadata,
+        outputs,
+        metadata,
+        requested_options,
     )?))
 }
 
@@ -1001,6 +1168,39 @@ mod tests {
     use crate::tds::codec::{
         BaseMetaDataColumn, FixedLenType, TokenReturnValue, TokenRow, TypeInfo,
     };
+
+    #[test]
+    fn cursor_execute_params_drop_the_parameterized_statement_flag() {
+        let options = CursorOpenOptions::new(
+            CursorScrollOptions::Dynamic | CursorScrollOptions::ParameterizedStmt,
+            CursorConcurrencyOptions::ReadOnly | CursorConcurrencyOptions::AllowDirect,
+        );
+        let key = 7i32;
+        let params = build_cursorexecute_params(PreparedHandle::from_i32(9), options, &[&key]);
+        let values = params
+            .iter()
+            .map(|param| match param.value {
+                ColumnData::I32(value) => value,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [
+                Some(9),
+                Some(0),
+                Some(0x0002),
+                Some(0x2001),
+                Some(0),
+                Some(7)
+            ]
+        );
+        assert!(params[0].flags.is_empty());
+        assert!(params[1..5]
+            .iter()
+            .all(|param| param.flags.contains(RpcStatus::ByRefValue)));
+        assert_eq!(params[5].name, "@P1");
+    }
 
     #[test]
     fn fetch_encodes_next() {
@@ -1178,7 +1378,12 @@ mod tests {
             output_at("", 5, 3),
         ];
 
-        let pc = prepared_cursor_from_outputs(&outputs, None).unwrap();
+        let pc = prepared_cursor_from_outputs(
+            &outputs,
+            None,
+            CursorOpenOptions::forward_only_read_only(),
+        )
+        .unwrap();
         assert_eq!(pc.prepared_handle().as_i32(), 11);
         assert_eq!(pc.cursor_handle().as_i32(), 22);
         assert!(pc
@@ -1200,7 +1405,12 @@ mod tests {
             output("@scrollopt", CursorScrollOptions::ForwardOnly as i32),
         ];
 
-        let pc = prepared_cursor_from_outputs(&outputs, None).unwrap();
+        let pc = prepared_cursor_from_outputs(
+            &outputs,
+            None,
+            CursorOpenOptions::forward_only_read_only(),
+        )
+        .unwrap();
         assert_eq!(pc.prepared_handle().as_i32(), 11);
         assert_eq!(pc.cursor_handle().as_i32(), 22);
         assert_eq!(pc.row_count(), 3);
@@ -1217,7 +1427,12 @@ mod tests {
         ];
         let metadata = vec![Column::new("v".to_string(), crate::ColumnType::Int4)];
 
-        let pc = prepared_cursor_from_outputs(&outputs, Some(metadata)).unwrap();
+        let pc = prepared_cursor_from_outputs(
+            &outputs,
+            Some(metadata),
+            CursorOpenOptions::forward_only_read_only(),
+        )
+        .unwrap();
 
         let metadata = pc.metadata.as_ref().unwrap();
         assert_eq!(metadata.len(), 1);

@@ -911,3 +911,381 @@ async fn live_call_procedure_multi_packet_clob_and_blob() -> tiberius::Result<()
         .await?;
     Ok(())
 }
+
+type LiveClient = Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+
+async fn batch_error(client: &mut LiveClient, sql: String) -> Option<tiberius::error::Error> {
+    match client.simple_query(sql).await {
+        Ok(stream) => stream.into_results().await.err(),
+        Err(error) => Some(error),
+    }
+}
+
+async fn assert_prepared_handle_released(client: &mut LiveClient, handle: i32) {
+    let error = batch_error(client, format!("EXEC sp_execute {handle}, 0")).await;
+    // 8179: Could not find prepared statement with handle.
+    assert_eq!(
+        error.and_then(|error| error.code()),
+        Some(8179),
+        "prepared handle {handle} is still allocated"
+    );
+}
+
+async fn count_rows(client: &mut LiveClient, table: &str) -> tiberius::Result<i32> {
+    let row = client
+        .simple_query(format!("SELECT COUNT(*) FROM {table}"))
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    Ok(row.get::<i32, _>(0).unwrap())
+}
+
+/// Prepares `sql` with one int parameter, executing it once with `first`.
+async fn prepare_with_first_row(
+    client: &mut LiveClient,
+    sql: &'static str,
+    first: &'static i32,
+) -> tiberius::PreparedStatement {
+    let (statement, result, error) = client.prep_exec_until_error(sql, "@P1 int", &[first]).await;
+    assert!(error.is_none(), "unexpected error: {error:?}");
+    assert_eq!(result.total(), 1);
+    statement.expect("sp_prepexec assigned a handle")
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_execute_and_unprepare_releases_the_handle() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    client
+        .simple_query("CREATE TABLE #release (id int PRIMARY KEY)")
+        .await?
+        .into_results()
+        .await?;
+    let statement =
+        prepare_with_first_row(&mut client, "INSERT INTO #release VALUES (@P1)", &1).await;
+    let handle = statement.handle().as_i32();
+
+    let (result, error) = statement.execute_and_unprepare(&mut client, &[&2i32]).await;
+
+    assert!(error.is_none(), "unexpected error: {error:?}");
+    assert_eq!(result.total(), 1);
+    assert_prepared_handle_released(&mut client, handle).await;
+    assert_eq!(count_rows(&mut client, "#release").await?, 2);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_execute_and_unprepare_releases_the_handle_after_an_error() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    client
+        .simple_query("CREATE TABLE #release_error (id int PRIMARY KEY)")
+        .await?
+        .into_results()
+        .await?;
+    let statement =
+        prepare_with_first_row(&mut client, "INSERT INTO #release_error VALUES (@P1)", &1).await;
+    let handle = statement.handle().as_i32();
+
+    let (result, error) = statement.execute_and_unprepare(&mut client, &[&1i32]).await;
+
+    assert_eq!(result.total(), 0);
+    assert_eq!(error.and_then(|error| error.code()), Some(2627));
+    assert_prepared_handle_released(&mut client, handle).await;
+    assert_eq!(count_rows(&mut client, "#release_error").await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_execute_and_unprepare_releases_the_handle_after_a_cancel() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    client
+        .simple_query("CREATE TABLE #release_cancel (id int PRIMARY KEY)")
+        .await?
+        .into_results()
+        .await?;
+    let statement = prepare_with_first_row(
+        &mut client,
+        "IF @P1 = 1 WAITFOR DELAY '00:00:30'; INSERT INTO #release_cancel VALUES (@P1)",
+        &0,
+    )
+    .await;
+    let handle = statement.handle().as_i32();
+
+    let token = client.cancellation_token();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        token.cancel();
+    });
+    let start = std::time::Instant::now();
+    let (_result, error) = statement.execute_and_unprepare(&mut client, &[&1i32]).await;
+    let elapsed = start.elapsed();
+    canceller.await.ok();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "cancellation did not interrupt the execution: took {elapsed:?}"
+    );
+    assert!(
+        matches!(&error, Some(tiberius::error::Error::Canceled)),
+        "expected Error::Canceled, got {error:?}"
+    );
+    assert_prepared_handle_released(&mut client, handle).await;
+    assert_eq!(count_rows(&mut client, "#release_cancel").await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_prepared_cursor_unprepare_closes_an_open_cursor() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    let cursor = client
+        .cursor_prep_exec(
+            "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
+            CursorOpenOptions::default(),
+            "",
+            &[],
+        )
+        .await?
+        .into_cursor()
+        .expect("expected a server cursor");
+    let cursor_handle = cursor.cursor_handle().as_i32();
+
+    cursor.unprepare(&mut client).await?;
+
+    assert!(
+        batch_error(&mut client, format!("EXEC sp_cursorfetch {cursor_handle}"))
+            .await
+            .is_some(),
+        "cursor {cursor_handle} is still open"
+    );
+    let row = client
+        .simple_query("SELECT 42")
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i32, _>(0), Some(42));
+    Ok(())
+}
+
+/// Under implicit transactions `SELECT 1` starts none, so the INSERT's BEGIN
+/// ENVCHANGE arrives after the first row. Reading only that row and dropping
+/// the stream discards it; ending the transaction must still reach the server.
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_end_transaction_after_discarded_begin() -> tiberius::Result<()> {
+    for commit in [true, false] {
+        let mut client = connect().await?;
+        client
+            .simple_query("CREATE TABLE #discarded_begin (v INT)")
+            .await?
+            .into_results()
+            .await?;
+        client
+            .simple_query("SET IMPLICIT_TRANSACTIONS ON")
+            .await?
+            .into_results()
+            .await?;
+        {
+            let mut stream = client
+                .simple_query(
+                    "SELECT 1 AS v; INSERT INTO #discarded_begin VALUES (1); SELECT 2 AS v",
+                )
+                .await?;
+            while let Some(item) = stream.try_next().await? {
+                if matches!(item, QueryItem::Row(_)) {
+                    break;
+                }
+            }
+        }
+
+        let ended = if commit {
+            client.commit_transaction().await?
+        } else {
+            client.rollback_transaction().await?
+        };
+
+        assert!(ended, "commit={commit}: the open transaction was not ended");
+        let trancount = client
+            .simple_query("SELECT @@TRANCOUNT")
+            .await?
+            .into_row()
+            .await?
+            .unwrap()
+            .get::<i32, _>(0);
+        assert_eq!(trancount, Some(0), "commit={commit}");
+        let expected = if commit { 1 } else { 0 };
+        assert_eq!(count_rows(&mut client, "#discarded_begin").await?, expected);
+    }
+    Ok(())
+}
+
+/// Transaction manager requests nest as `COMMIT TRANSACTION` and
+/// `ROLLBACK TRANSACTION` do: a commit gives up one level, a rollback all.
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_transaction_manager_requests_nest_like_tsql() -> tiberius::Result<()> {
+    async fn trancount(client: &mut LiveClient) -> tiberius::Result<Option<i32>> {
+        Ok(client
+            .simple_query("SELECT @@TRANCOUNT")
+            .await?
+            .into_row()
+            .await?
+            .unwrap()
+            .get::<i32, _>(0))
+    }
+
+    let mut client = connect().await?;
+    client
+        .simple_query("BEGIN TRANSACTION; BEGIN TRANSACTION")
+        .await?
+        .into_results()
+        .await?;
+    assert_eq!(trancount(&mut client).await?, Some(2));
+
+    assert!(client.commit_transaction().await?);
+    assert_eq!(trancount(&mut client).await?, Some(1));
+    assert!(client.transaction_open());
+
+    assert!(client.rollback_transaction().await?);
+    assert_eq!(trancount(&mut client).await?, Some(0));
+    assert!(!client.commit_transaction().await?);
+    Ok(())
+}
+
+/// Re-executing a prepared cursor reuses its handle, and the cursor it
+/// replaces stays usable until it is closed, so a caller can open the new
+/// cursor before giving up the old one.
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_prepared_cursor_executes_again_with_new_parameters() -> tiberius::Result<()> {
+    use tiberius::{CursorConcurrencyOptions, CursorExecuteOutcome, CursorScrollOptions};
+
+    let mut client = connect().await?;
+    for scroll in [CursorScrollOptions::Dynamic, CursorScrollOptions::Fast] {
+        let options = CursorOpenOptions::new(
+            scroll | CursorScrollOptions::ParameterizedStmt,
+            CursorConcurrencyOptions::ReadOnly | CursorConcurrencyOptions::AllowDirect,
+        );
+        let sql = "SELECT v FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(v, s) WHERE v = @P1";
+        let mut cursor = client
+            .cursor_prep_exec(sql, options, "@P1 int", &[&1i32])
+            .await?
+            .into_cursor()
+            .expect("expected a server cursor");
+        let handle = cursor.prepared_handle();
+
+        for key in [2i32, 3] {
+            let previous = match cursor.execute(&mut client, &[&key]).await? {
+                CursorExecuteOutcome::Cursor { previous } => previous,
+                CursorExecuteOutcome::Direct(_) => panic!("{scroll:?}: executed directly"),
+            };
+            assert_eq!(cursor.prepared_handle(), handle);
+            let rows = cursor
+                .fetch(&mut client, Fetch::Next { count: 10 })
+                .await?
+                .into_first_result()
+                .await?;
+            assert_eq!(rows.len(), 1, "{scroll:?}");
+            assert_eq!(rows[0].get::<i32, _>(0), Some(key), "{scroll:?}");
+            previous.expect("the replaced cursor").close(&mut client).await?;
+        }
+        cursor.close_and_unprepare(&mut client).await?;
+    }
+    let row = client.simple_query("SELECT 42").await?.into_row().await?.unwrap();
+    assert_eq!(row.get::<i32, _>(0), Some(42));
+    Ok(())
+}
+
+/// A caller that abandons a re-executed cursor can make the replaced one
+/// current again and keep reading it.
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_prepared_cursor_restores_the_replaced_cursor() -> tiberius::Result<()> {
+    use tiberius::{CursorConcurrencyOptions, CursorExecuteOutcome, CursorScrollOptions};
+
+    let mut client = connect().await?;
+    let options = CursorOpenOptions::new(
+        CursorScrollOptions::Dynamic | CursorScrollOptions::ParameterizedStmt,
+        CursorConcurrencyOptions::ReadOnly | CursorConcurrencyOptions::AllowDirect,
+    );
+    let sql = "SELECT v FROM (VALUES (1, 'a'), (2, 'b')) t(v, s) WHERE v = @P1";
+    let mut cursor = client
+        .cursor_prep_exec(sql, options, "@P1 int", &[&1i32])
+        .await?
+        .into_cursor()
+        .expect("expected a server cursor");
+    let CursorExecuteOutcome::Cursor { previous } = cursor.execute(&mut client, &[&2i32]).await?
+    else {
+        panic!("executed directly");
+    };
+    let abandoned = cursor
+        .replace_cursor(previous.expect("the replaced cursor"))
+        .expect("the new cursor");
+    abandoned.close(&mut client).await?;
+    let rows = cursor
+        .fetch(&mut client, Fetch::Next { count: 10 })
+        .await?
+        .into_first_result()
+        .await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+    cursor.close_and_unprepare(&mut client).await?;
+    Ok(())
+}
+
+/// A table change between executions reaches the re-executed cursor's
+/// columns rather than leaving the first execution's.
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_prepared_cursor_execute_sees_changed_columns() -> tiberius::Result<()> {
+    use tiberius::{CursorConcurrencyOptions, CursorExecuteOutcome, CursorScrollOptions};
+
+    let mut client = connect().await?;
+    client
+        .simple_query("CREATE TABLE #reshaped (id int); INSERT INTO #reshaped VALUES (1)")
+        .await?
+        .into_results()
+        .await?;
+    let options = CursorOpenOptions::new(
+        CursorScrollOptions::Dynamic | CursorScrollOptions::ParameterizedStmt,
+        CursorConcurrencyOptions::ReadOnly | CursorConcurrencyOptions::AllowDirect,
+    );
+    let mut cursor = client
+        .cursor_prep_exec("SELECT * FROM #reshaped WHERE id >= @P1", options, "@P1 int", &[&0i32])
+        .await?
+        .into_cursor()
+        .expect("expected a server cursor");
+    let names = |columns: Vec<tiberius::Column>| {
+        columns
+            .iter()
+            .map(|column| column.name().to_string())
+            .filter(|name| name != "ROWSTAT")
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(cursor.fetch_metadata(&mut client).await?), ["id"]);
+    cursor.close_cursor(&mut client).await?;
+
+    client
+        .simple_query("ALTER TABLE #reshaped ADD extra varchar(5) NULL")
+        .await?
+        .into_results()
+        .await?;
+    let CursorExecuteOutcome::Cursor { previous } = cursor.execute(&mut client, &[&0i32]).await?
+    else {
+        panic!("executed directly");
+    };
+    assert!(previous.is_none());
+    assert_eq!(names(cursor.fetch_metadata(&mut client).await?), ["id", "extra"]);
+    let rows = cursor
+        .fetch(&mut client, Fetch::Next { count: 10 })
+        .await?
+        .into_first_result()
+        .await?;
+    assert_eq!(names(rows[0].columns().to_vec()), ["id", "extra"]);
+    cursor.close_and_unprepare(&mut client).await?;
+    Ok(())
+}

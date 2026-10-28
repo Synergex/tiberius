@@ -17,7 +17,7 @@ use crate::{
     EncryptionLevel, SqlReadBytes,
 };
 use asynchronous_codec::Framed;
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
 use codec::TokenSspi;
 use futures_util::future::{select, Either};
@@ -57,6 +57,10 @@ where
 {
     transport: Framed<MaybeTlsStream<S>, PacketCodec>,
     flushed: bool,
+    /// Set while decoding the tail of a fully received response, so a token
+    /// that runs past the buffered bytes fails instead of waiting on the
+    /// network for data the server will never send.
+    buffered_only: bool,
     context: Context,
     buf: BytesMut,
     cancellation: Arc<CancellationState>,
@@ -88,6 +92,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             transport,
             context,
             flushed: false,
+            buffered_only: false,
             buf: BytesMut::new(),
             cancellation: Arc::new(CancellationState::new()),
         };
@@ -315,12 +320,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         );
 
         if self.flushed {
-            // Server already finished sending all data (EOM seen), but some
-            // token data remains buffered. Just discard it. A database change
-            // in the discarded tokens is never seen, so the tracked database
-            // becomes unknown rather than stale.
-            self.buf.truncate(0);
-            self.context.clear_database();
+            // Server already finished sending all data (EOM seen), so the rest
+            // of the response is buffered. Decode it rather than discard it: a
+            // transaction it began or ended changes the descriptor every later
+            // request must carry, and SQL Server rejects a stale one.
+            if !self.drain_buffered_tokens().await {
+                // Undecodable tokens are dropped. The tracked database becomes
+                // unknown and the transaction descriptor untrusted.
+                self.buf.truncate(0);
+                self.context.clear_database();
+                self.context.set_transaction_uncertain(true);
+            }
             return Ok(());
         }
 
@@ -336,6 +346,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         ts.flush_to_attention().await?;
 
         Ok(())
+    }
+
+    /// Decodes the buffered tokens of a fully received response without
+    /// reading the network. Returns whether all of them were consumed.
+    async fn drain_buffered_tokens(&mut self) -> bool {
+        self.buffered_only = true;
+        let mut tokens = TokenStream::new(self).try_unfold();
+        // A server error in the tail surfaces only once the stream ends.
+        while let Ok(Some(_)) = tokens.try_next().await {}
+        drop(tokens);
+        self.buffered_only = false;
+        self.buf.is_empty()
     }
 
     /// True if the underlying stream has no more data and is consumed
@@ -557,6 +579,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 transport,
                 context,
                 flushed: false,
+                buffered_only: false,
                 buf: BytesMut::new(),
                 cancellation,
             })
@@ -621,11 +644,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> futures_util::io::AsyncRead for C
         let size = buf.len();
 
         if this.buf.len() < size {
+            if this.buffered_only {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "token runs past the buffered response",
+                )));
+            }
             while let Some(item) = ready!(Pin::new(&mut this).try_poll_next(cx)) {
                 match item {
                     Ok(packet) => {
                         let (_, payload) = packet.into_parts();
-                        this.buf.extend(payload);
+                        this.buf.extend_from_slice(&payload);
 
                         if this.buf.len() >= size {
                             break;
@@ -649,7 +678,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> futures_util::io::AsyncRead for C
             }
         }
 
-        buf.copy_from_slice(this.buf.split_to(size).as_ref());
+        buf.copy_from_slice(&this.buf[..size]);
+        this.buf.advance(size);
         Poll::Ready(Ok(size))
     }
 }
