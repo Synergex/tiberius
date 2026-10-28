@@ -26,7 +26,8 @@ pub enum ReceivedToken {
     DoneInProc(TokenDone),
     DoneProc(TokenDone),
     ReturnStatus(u32),
-    ReturnValue(TokenReturnValue),
+    // Boxed: an inline return value would make every row token 304 bytes.
+    ReturnValue(Box<TokenReturnValue>),
     Order(TokenOrder),
     ColName(TokenColName),
     TabName(TokenTabName),
@@ -184,7 +185,7 @@ where
     async fn get_return_value(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenReturnValue::decode(self.conn).await?;
         event!(Level::TRACE, message = ?return_value);
-        Ok(ReceivedToken::ReturnValue(return_value))
+        Ok(ReceivedToken::ReturnValue(Box::new(return_value)))
     }
 
     async fn get_return_status(&mut self) -> crate::Result<ReceivedToken> {
@@ -199,7 +200,16 @@ where
             self.last_error = Some(Error::Server(err.clone()));
         }
 
-        event!(Level::ERROR, message = %err.message, code = err.code);
+        event!(
+            name: "tiberius.error",
+            Level::ERROR,
+            number = err.code,
+            class = err.class,
+            state = err.state,
+            line = err.line,
+            procedure = %err.procedure,
+            message = %err.message
+        );
         Ok(ReceivedToken::Error(err))
     }
 
@@ -276,6 +286,9 @@ where
             TokenEnvChange::ResetConnection => {
                 self.conn.context_mut().set_transaction_descriptor([0; 8]);
             }
+            TokenEnvChange::Database(new, _) => {
+                self.conn.context_mut().set_database(new.clone());
+            }
             _ => (),
         }
 
@@ -296,13 +309,26 @@ where
 
     async fn get_info(&mut self) -> crate::Result<ReceivedToken> {
         let info = TokenInfo::decode(self.conn).await?;
-        event!(Level::INFO, "{}", info.message);
+        event!(
+            name: "tiberius.info",
+            Level::INFO,
+            number = info.number,
+            class = info.class,
+            state = info.state,
+            message = %info.message
+        );
         Ok(ReceivedToken::Info(info))
     }
 
     async fn get_login_ack(&mut self) -> crate::Result<ReceivedToken> {
         let ack = TokenLoginAck::decode(self.conn).await?;
         self.conn.context_mut().set_version(ack.tds_version);
+        // ProgVersion bytes are major, minor, build high, build low.
+        let [major, minor, build_high, build_low] = ack.version.to_le_bytes();
+        let build = u16::from_be_bytes([build_high, build_low]);
+        self.conn
+            .context_mut()
+            .set_server_version(format!("{major}.{minor}.{build}"));
         event!(Level::INFO, "{} version {}", ack.prog_name, ack.version);
         Ok(ReceivedToken::LoginAck(ack))
     }

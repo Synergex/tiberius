@@ -145,6 +145,67 @@ impl PreparedStatement {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        self.release(client).await
+    }
+
+    /// Executes the statement a last time and then releases it, as
+    /// [`execute`](Self::execute) followed by [`unprepare`](Self::unprepare)
+    /// would. Returns the row counts reported before the execution's first
+    /// error, with that error.
+    ///
+    /// The release is attempted even when the execution fails or is
+    /// canceled, as long as the connection can still carry a request. When
+    /// both fail, the error is [`CleanupFailed`](crate::error::Error::CleanupFailed),
+    /// which keeps the execution's error and its code. An execution error
+    /// that leaves the connection unusable, such as an I/O or protocol error,
+    /// is returned without attempting the release. Whenever the error's
+    /// [`leaves_connection_usable`](crate::error::Error::leaves_connection_usable)
+    /// is `false`, the connection should be discarded, which frees the
+    /// handle.
+    pub async fn execute_and_unprepare<S>(
+        mut self,
+        client: &mut Client<S>,
+        params: &[&dyn ToSql],
+    ) -> (ExecuteResult, Option<crate::Error>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        // The release is not sent in the execution's request: an attention
+        // aborts the whole request it interrupts, so a release that had not
+        // yet run would be lost along with this consumed statement.
+        let (result, error) = self.execute_until_error(client, params).await;
+        if error
+            .as_ref()
+            .is_some_and(|error| !error.leaves_connection_usable())
+        {
+            return (result, error);
+        }
+        let released = self.release(client).await;
+        (result, crate::Error::with_cleanup(error, released))
+    }
+
+    async fn execute_until_error<S>(
+        &self,
+        client: &mut Client<S>,
+        params: &[&dyn ToSql],
+    ) -> (ExecuteResult, Option<crate::Error>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        if let Err(error) = client.connection.flush_stream().await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        let rpc_params = build_execute_params(self.handle, params);
+        if let Err(error) = client.send_rpc(RpcProcId::Execute, rpc_params).await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        ExecuteResult::until_error(&mut client.connection).await
+    }
+
+    async fn release<S>(&mut self, client: &mut Client<S>) -> crate::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         client.connection.flush_stream().await?;
         let handle_param = RpcParam {
             name: Cow::Borrowed(""),
@@ -168,6 +229,7 @@ impl Drop for PreparedStatement {
     fn drop(&mut self) {
         if !self.released {
             event!(
+                name: "tiberius.handle_leaked",
                 Level::WARN,
                 handle = self.handle.as_i32(),
                 "PreparedStatement dropped without unprepare; server-side handle will leak until the connection closes"

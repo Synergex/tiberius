@@ -18,9 +18,13 @@ pub(crate) struct Context {
     packet_size: u32,
     packet_id: u8,
     transaction_desc: [u8; 8],
+    transaction_uncertain: bool,
     last_meta: Option<Arc<TokenColMetaData<'static>>>,
     alt_meta: HashMap<u16, Arc<TokenAltMetaData<'static>>>,
     spn: Option<String>,
+    spid: Option<u16>,
+    server_version: Option<String>,
+    database: Option<String>,
 }
 
 impl Context {
@@ -30,9 +34,13 @@ impl Context {
             packet_size: 4096,
             packet_id: 0,
             transaction_desc: [0; 8],
+            transaction_uncertain: false,
             last_meta: None,
             alt_meta: HashMap::new(),
             spn: None,
+            spid: None,
+            server_version: None,
+            database: None,
         }
     }
 
@@ -92,12 +100,50 @@ impl Context {
         self.transaction_desc = desc;
     }
 
+    /// Whether undecodable response tokens were discarded, so the transaction
+    /// descriptor may be stale.
+    pub fn transaction_uncertain(&self) -> bool {
+        self.transaction_uncertain
+    }
+
+    pub fn set_transaction_uncertain(&mut self, uncertain: bool) {
+        self.transaction_uncertain = uncertain;
+    }
+
     pub fn version(&self) -> FeatureLevel {
         self.version
     }
 
     pub fn set_version(&mut self, version: FeatureLevel) {
         self.version = version;
+    }
+
+    pub fn spid(&self) -> Option<u16> {
+        self.spid
+    }
+
+    pub fn set_spid(&mut self, spid: u16) {
+        self.spid = Some(spid);
+    }
+
+    pub fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
+    }
+
+    pub fn set_server_version(&mut self, version: String) {
+        self.server_version = Some(version);
+    }
+
+    pub fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+
+    pub fn set_database(&mut self, database: String) {
+        self.database = Some(database);
+    }
+
+    pub fn clear_database(&mut self) {
+        self.database = None;
     }
 
     pub fn set_spn(&mut self, host: impl AsRef<str>, port: u16) {
