@@ -13,6 +13,10 @@ impl Packet {
         Self { header, payload }
     }
 
+    pub(crate) fn header(&self) -> &PacketHeader {
+        &self.header
+    }
+
     pub(crate) fn is_last(&self) -> bool {
         self.header.status() == PacketStatus::EndOfMessage
     }

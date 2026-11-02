@@ -343,6 +343,7 @@ impl Drop for PreparedCursor {
     fn drop(&mut self) {
         if !self.released {
             event!(
+                name: "tiberius.handle_leaked",
                 Level::WARN,
                 prepared_handle = self.prepared_handle.as_i32(),
                 cursor_handle = self.cursor_handle.as_i32(),
@@ -492,6 +493,7 @@ impl Drop for DirectResults {
     fn drop(&mut self) {
         if !self.released {
             event!(
+                name: "tiberius.handle_leaked",
                 Level::WARN,
                 prepared_handle = self.prepared_handle.as_i32(),
                 "DirectResults dropped without unprepare; server-side prepared handle will leak until the connection closes"
@@ -655,6 +657,7 @@ impl Drop for Cursor {
     fn drop(&mut self) {
         if !self.closed {
             event!(
+                name: "tiberius.handle_leaked",
                 Level::WARN,
                 handle = self.handle.as_i32(),
                 "Cursor dropped without close; server-side handle will leak until the connection closes"

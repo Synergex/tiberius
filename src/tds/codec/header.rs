@@ -112,6 +112,10 @@ impl PacketHeader {
         header
     }
 
+    pub fn spid(&self) -> u16 {
+        self.spid
+    }
+
     pub fn set_status(&mut self, status: PacketStatus) {
         self.status = status;
         self.raw_status = status as u8;
