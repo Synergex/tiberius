@@ -403,29 +403,30 @@ where
                 })?;
 
                 let token = match ty {
-                    TokenType::ReturnStatus => this.get_return_status().await?,
-                    TokenType::AltMetaData => this.get_alt_metadata().await?,
-                    TokenType::ColMetaData => this.get_col_metadata().await?,
-                    TokenType::ColName => this.get_col_name().await?,
-                    TokenType::Row => this.get_row().await?,
-                    TokenType::NbcRow => this.get_nbc_row().await?,
-                    TokenType::AltRow => this.get_alt_row().await?,
-                    TokenType::Done => this.get_done_value().await?,
-                    TokenType::DoneProc => this.get_done_proc_value().await?,
-                    TokenType::DoneInProc => this.get_done_in_proc_value().await?,
-                    TokenType::ReturnValue => this.get_return_value().await?,
-                    TokenType::Error => this.get_error().await?,
-                    TokenType::Order => this.get_order().await?,
-                    TokenType::TabName => this.get_tab_name().await?,
-                    TokenType::ColInfo => this.get_col_info().await?,
-                    TokenType::EnvChange => this.get_env_change().await?,
-                    TokenType::SessionState => this.get_session_state().await?,
-                    TokenType::Info => this.get_info().await?,
-                    TokenType::LoginAck => this.get_login_ack().await?,
-                    TokenType::Sspi => this.get_sspi().await?,
-                    TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
-                    TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
-                };
+                    TokenType::ReturnStatus => this.get_return_status().await,
+                    TokenType::AltMetaData => this.get_alt_metadata().await,
+                    TokenType::ColMetaData => this.get_col_metadata().await,
+                    TokenType::ColName => this.get_col_name().await,
+                    TokenType::Row => this.get_row().await,
+                    TokenType::NbcRow => this.get_nbc_row().await,
+                    TokenType::AltRow => this.get_alt_row().await,
+                    TokenType::Done => this.get_done_value().await,
+                    TokenType::DoneProc => this.get_done_proc_value().await,
+                    TokenType::DoneInProc => this.get_done_in_proc_value().await,
+                    TokenType::ReturnValue => this.get_return_value().await,
+                    TokenType::Error => this.get_error().await,
+                    TokenType::Order => this.get_order().await,
+                    TokenType::TabName => this.get_tab_name().await,
+                    TokenType::ColInfo => this.get_col_info().await,
+                    TokenType::EnvChange => this.get_env_change().await,
+                    TokenType::SessionState => this.get_session_state().await,
+                    TokenType::Info => this.get_info().await,
+                    TokenType::LoginAck => this.get_login_ack().await,
+                    TokenType::Sspi => this.get_sspi().await,
+                    TokenType::FeatureExtAck => this.get_feature_ext_ack().await,
+                    TokenType::FedAuthInfo => this.get_fed_auth_info().await,
+                }
+                .map_err(Error::into_decode_failure)?;
 
                 // When draining after attention, skip all tokens until we see
                 // Done+Attention, then terminate the stream.

@@ -123,6 +123,21 @@ impl Error {
         }
     }
 
+    /// A token that fails to decode leaves the rest of the response unread,
+    /// so any failure other than a transport one is reported as a protocol
+    /// error, which callers treat as ending the connection.
+    pub(crate) fn into_decode_failure(self) -> Self {
+        match &self {
+            Error::Io { kind, .. }
+                if !matches!(kind, IoErrorKind::InvalidData | IoErrorKind::InvalidInput) =>
+            {
+                self
+            }
+            Error::Protocol(_) => self,
+            _ => Error::Protocol(self.to_string().into()),
+        }
+    }
+
     /// Returns a request's error together with that of the cleanup that
     /// followed it: the request's error alone when the cleanup succeeded, the
     /// cleanup's when only it failed, and [`CleanupFailed`](Self::CleanupFailed)
@@ -286,5 +301,28 @@ mod tests {
         assert!(server_error_of_severity(19).leaves_connection_usable());
         assert!(!server_error_of_severity(20).leaves_connection_usable());
         assert!(!server_error_of_severity(25).leaves_connection_usable());
+    }
+
+    #[test]
+    fn decode_failures_become_protocol_errors_and_transport_errors_stay() {
+        let io = |kind| Error::Io {
+            kind,
+            message: "m".into(),
+        };
+        for error in [
+            Error::Utf16,
+            Error::Encoding("invalid sequence".into()),
+            Error::Conversion("bad value".into()),
+            io(IoErrorKind::InvalidData),
+        ] {
+            let text = error.to_string();
+            assert_eq!(error.into_decode_failure(), Error::Protocol(text.into()));
+        }
+        for error in [
+            io(IoErrorKind::UnexpectedEof),
+            Error::Protocol("bad token".into()),
+        ] {
+            assert_eq!(error.clone().into_decode_failure(), error);
+        }
     }
 }

@@ -700,3 +700,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
         &mut self.context
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_token_that_fails_to_decode_is_a_protocol_error() {
+        // ENVCHANGE database change whose new name is an unpaired surrogate.
+        let bytes = [0xe3, 5, 0, 1, 1, 0x00, 0xd8, 0, 0xfd];
+        let mut connection = Connection {
+            transport: Framed::new(
+                MaybeTlsStream::Raw(futures_util::io::Cursor::new(Vec::new())),
+                PacketCodec,
+            ),
+            flushed: true,
+            buffered_only: false,
+            context: Context::new(),
+            buf: BytesMut::from(&bytes[..]),
+            cancellation: Arc::new(CancellationState::new()),
+        };
+        let mut tokens = TokenStream::new(&mut connection).try_unfold();
+        let error = tokens.try_next().await.unwrap_err();
+        assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
+        assert!(!error.leaves_connection_usable());
+    }
+}

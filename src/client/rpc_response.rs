@@ -401,7 +401,9 @@ where
 
         match ty {
             TokenType::ColMetaData => {
-                let metadata = TokenColMetaData::decode(conn).await?;
+                let metadata = TokenColMetaData::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
                 if !metadata.columns.is_empty() {
                     let columns = metadata.columns().collect();
                     conn.context_mut().set_last_meta(Arc::new(metadata));
@@ -413,43 +415,65 @@ where
                 let _ = conn.read_u32_le().await?;
             }
             TokenType::ReturnValue => {
-                let _ = TokenReturnValue::decode(conn).await?;
+                let _ = TokenReturnValue::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::DoneInProc => {
-                let _ = TokenDone::decode(conn).await?;
+                let _ = TokenDone::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::DoneProc | TokenType::Done => {
-                let done = TokenDone::decode(conn).await?;
+                let done = TokenDone::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
                 if !done.status().contains(DoneStatus::More) {
                     break;
                 }
             }
             TokenType::Error => {
-                let err = TokenError::decode(conn).await?;
+                let err = TokenError::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
                 if last_error.is_none() {
                     last_error = Some(crate::Error::Server(err));
                 }
             }
             TokenType::Info => {
-                let _ = TokenInfo::decode(conn).await?;
+                let _ = TokenInfo::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::Order => {
-                let _ = TokenOrder::decode(conn).await?;
+                let _ = TokenOrder::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::ColName => {
-                let _ = TokenColName::decode(conn).await?;
+                let _ = TokenColName::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::ColInfo => {
-                let _ = TokenColInfo::decode(conn).await?;
+                let _ = TokenColInfo::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::TabName => {
-                let _ = TokenTabName::decode(conn).await?;
+                let _ = TokenTabName::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::EnvChange => {
-                let _ = TokenEnvChange::decode(conn).await?;
+                let _ = TokenEnvChange::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::SessionState => {
-                let _ = TokenSessionState::decode(conn).await?;
+                let _ = TokenSessionState::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::Row | TokenType::NbcRow => {
                 return Err(crate::Error::Protocol(

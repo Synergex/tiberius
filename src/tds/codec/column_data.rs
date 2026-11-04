@@ -1034,7 +1034,7 @@ async fn decode_variant_payload(
                 .chunks(2)
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect();
-            let s = String::from_utf16(&buf)?;
+            let s = String::from_utf16_lossy(&buf);
             let ty = TypeInfo::VarLenSized(VarLenContext::new(var_ty, max_len, Some(collation)));
             Ok((ty, ColumnData::String(Some(s.into()))))
         }

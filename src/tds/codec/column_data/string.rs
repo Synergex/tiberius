@@ -46,7 +46,7 @@ where
             }
 
             let buf: Vec<_> = buf.chunks(2).map(LittleEndian::read_u16).collect();
-            Ok(Some(String::from_utf16(&buf)?.into()))
+            Ok(Some(String::from_utf16_lossy(&buf).into()))
         }
         _ => Ok(None),
     }
@@ -116,5 +116,22 @@ mod tests {
             assert_eq!(value.as_deref(), Some(expected));
             assert_eq!(reader.read_u8().await.unwrap(), 0xad);
         }
+    }
+
+    #[tokio::test]
+    async fn unpaired_surrogates_decode_as_replacement_characters() {
+        let units = [0x41, 0xd83d, 0x42, 0xdc00];
+        let mut wire = BytesMut::new();
+        wire.put_u16_le((units.len() * 2) as u16);
+        for unit in units {
+            wire.put_u16_le(unit);
+        }
+        wire.put_u8(0xad);
+        let mut reader = wire.into_sql_read_bytes();
+        let value = decode(&mut reader, VarLenType::NVarchar, 8000, None)
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some("A\u{fffd}B\u{fffd}"));
+        assert_eq!(reader.read_u8().await.unwrap(), 0xad);
     }
 }
