@@ -11,7 +11,7 @@ use crate::{
             self, Encode, LoginMessage, Packet, PacketCodec, PacketHeader, PacketStatus,
             PreloginMessage, TokenDone,
         },
-        stream::TokenStream,
+        stream::{ReceivedToken, TokenStream},
         Context, HEADER_BYTES,
     },
     EncryptionLevel, SqlReadBytes,
@@ -325,8 +325,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             // transaction it began or ended changes the descriptor every later
             // request must carry, and SQL Server rejects a stale one.
             if !self.drain_buffered_tokens().await {
-                // Undecodable tokens are dropped. The tracked database becomes
-                // unknown and the transaction descriptor untrusted.
+                // Undecodable tokens are dropped, or a fatal error ended the
+                // session. The tracked database becomes unknown and the
+                // transaction descriptor untrusted.
                 self.buf.truncate(0);
                 self.context.clear_database();
                 self.context.set_transaction_uncertain(true);
@@ -349,15 +350,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     }
 
     /// Decodes the buffered tokens of a fully received response without
-    /// reading the network. Returns whether all of them were consumed.
+    /// reading the network. Returns whether all of them decoded and none was
+    /// a fatal server error; consuming the bytes alone does not show that.
     async fn drain_buffered_tokens(&mut self) -> bool {
         self.buffered_only = true;
         let mut tokens = TokenStream::new(self).try_unfold();
-        // A server error in the tail surfaces only once the stream ends.
-        while let Ok(Some(_)) = tokens.try_next().await {}
+        let mut usable = true;
+        loop {
+            match tokens.try_next().await {
+                Ok(Some(ReceivedToken::Error(error))) => {
+                    usable &= crate::Error::Server(error).leaves_connection_usable();
+                }
+                Ok(Some(_)) => (),
+                // The token stream raises its first server error again at the end.
+                Ok(None) | Err(crate::Error::Server(_)) => break,
+                Err(_) => {
+                    usable = false;
+                    break;
+                }
+            }
+        }
         drop(tokens);
         self.buffered_only = false;
-        self.buf.is_empty()
+        usable && self.buf.is_empty()
     }
 
     /// True if the underlying stream has no more data and is consumed
@@ -704,12 +719,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tds::codec::TokenError;
 
-    #[tokio::test]
-    async fn a_token_that_fails_to_decode_is_a_protocol_error() {
-        // ENVCHANGE database change whose new name is an unpaired surrogate.
-        let bytes = [0xe3, 5, 0, 1, 1, 0x00, 0xd8, 0, 0xfd];
-        let mut connection = Connection {
+    fn buffered(bytes: &[u8]) -> Connection<futures_util::io::Cursor<Vec<u8>>> {
+        Connection {
             transport: Framed::new(
                 MaybeTlsStream::Raw(futures_util::io::Cursor::new(Vec::new())),
                 PacketCodec,
@@ -717,12 +730,60 @@ mod tests {
             flushed: true,
             buffered_only: false,
             context: Context::new(),
-            buf: BytesMut::from(&bytes[..]),
+            buf: BytesMut::from(bytes),
             cancellation: Arc::new(CancellationState::new()),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_that_fails_to_decode_is_a_protocol_error() {
+        // ENVCHANGE database change whose new name is an unpaired surrogate.
+        let mut connection = buffered(&[0xe3, 5, 0, 1, 1, 0x00, 0xd8, 0, 0xfd]);
         let mut tokens = TokenStream::new(&mut connection).try_unfold();
         let error = tokens.try_next().await.unwrap_err();
         assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
         assert!(!error.leaves_connection_usable());
+    }
+
+    #[tokio::test]
+    async fn commit_fails_after_an_undecodable_buffered_tail() {
+        let mut client = crate::Client {
+            connection: buffered(&[0xe3, 0, 0]),
+        };
+        let result = client.commit_transaction().await;
+        assert!(
+            matches!(result, Err(crate::Error::Protocol(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_fails_after_a_fatal_error_in_the_buffered_tail() {
+        let mut bytes = BytesMut::new();
+        TokenError::new(50001, 1, 20, "fatal", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        let result = client.commit_transaction().await;
+        assert!(
+            matches!(result, Err(crate::Error::Protocol(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nonfatal_error_in_the_buffered_tail_keeps_the_connection() {
+        let mut bytes = BytesMut::new();
+        TokenError::new(2627, 1, 14, "duplicate", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        assert!(matches!(client.commit_transaction().await, Ok(false)));
     }
 }

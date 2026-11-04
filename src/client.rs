@@ -333,7 +333,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// without contacting the server when the server has reported no open
     /// transaction on this connection. Fails with a protocol error, which
     /// leaves the connection unusable, when an undecodable response was
-    /// discarded and the transaction state is unknown.
+    /// discarded or ended with a fatal error, and the transaction state is
+    /// unknown.
     pub async fn commit_transaction(&mut self) -> crate::Result<bool> {
         self.end_transaction(TransactionOutcome::Commit).await
     }
@@ -348,7 +349,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         self.connection.flush_stream().await?;
         if self.connection.context().transaction_uncertain() {
             return Err(crate::Error::Protocol(
-                "transaction state was lost with an undecodable response".into(),
+                "transaction state was lost with an undecodable or fatal response".into(),
             ));
         }
         let descriptor = self.connection.context().transaction_descriptor();

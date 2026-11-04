@@ -70,7 +70,8 @@ pub enum Error {
     Canceled,
     #[error("{error}; the cleanup that followed also failed: {cleanup}")]
     /// A request failed with `error`, and the cleanup that followed it, such
-    /// as releasing a prepared statement, failed with `cleanup`.
+    /// as draining the rest of its response or releasing a prepared statement,
+    /// failed with `cleanup`.
     /// [`code`](Self::code) reports `error`'s code, and
     /// [`leaves_connection_usable`](Self::leaves_connection_usable) accounts
     /// for both.
