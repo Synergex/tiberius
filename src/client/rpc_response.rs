@@ -165,9 +165,8 @@ where
             ReceivedToken::ReturnValue(rv) => outputs.push((*rv).into()),
             ReceivedToken::ReturnStatus(s) => status = Some(s),
             ReceivedToken::Error(e) => {
-                if last_error.is_none() {
-                    last_error = Some(crate::Error::Server(e));
-                }
+                last_error =
+                    crate::Error::add_server_error(last_error.take(), crate::Error::Server(e));
             }
             ReceivedToken::DoneProc(done) | ReceivedToken::Done(done) => {
                 // DoneProc/Done without the `More` flag marks the end of the
@@ -333,9 +332,8 @@ where
             ReceivedToken::ReturnStatus(s) => status = Some(s),
             ReceivedToken::Info(info) => infos.push(info),
             ReceivedToken::Error(e) => {
-                if last_error.is_none() {
-                    last_error = Some(crate::Error::Server(e));
-                }
+                last_error =
+                    crate::Error::add_server_error(last_error.take(), crate::Error::Server(e));
             }
             ReceivedToken::DoneInProc(done) => {
                 if done.status().contains(DoneStatus::Attention) {
@@ -436,9 +434,8 @@ where
                 let err = TokenError::decode(conn)
                     .await
                     .map_err(crate::Error::into_decode_failure)?;
-                if last_error.is_none() {
-                    last_error = Some(crate::Error::Server(err));
-                }
+                last_error =
+                    crate::Error::add_server_error(last_error.take(), crate::Error::Server(err));
             }
             TokenType::Info => {
                 let _ = TokenInfo::decode(conn)

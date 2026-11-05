@@ -139,6 +139,22 @@ impl Error {
         }
     }
 
+    /// Adds a server error to the one a response already reported: the first
+    /// stays the response's error, and a later fatal one is kept with it as
+    /// [`CleanupFailed`](Self::CleanupFailed), so the response reports the
+    /// connection unusable.
+    pub(crate) fn add_server_error(first: Option<Error>, error: Error) -> Option<Error> {
+        match first {
+            None => Some(error),
+            Some(first)
+                if first.leaves_connection_usable() && !error.leaves_connection_usable() =>
+            {
+                Error::with_cleanup(Some(first), Err(error))
+            }
+            first => first,
+        }
+    }
+
     /// Returns a request's error together with that of the cleanup that
     /// followed it: the request's error alone when the cleanup succeeded, the
     /// cleanup's when only it failed, and [`CleanupFailed`](Self::CleanupFailed)

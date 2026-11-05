@@ -121,18 +121,10 @@ impl<'a> ExecuteResult {
         loop {
             match tokens.try_next().await {
                 Ok(Some(ReceivedToken::Error(error))) => {
-                    let error = crate::Error::Server(error);
-                    server_error = match server_error.take() {
-                        None => Some(error),
-                        // A later fatal error ends the session the first one left usable.
-                        Some(first)
-                            if first.leaves_connection_usable()
-                                && !error.leaves_connection_usable() =>
-                        {
-                            crate::Error::with_cleanup(Some(first), Err(error))
-                        }
-                        first => first,
-                    };
+                    server_error = crate::Error::add_server_error(
+                        server_error.take(),
+                        crate::Error::Server(error),
+                    );
                 }
                 Ok(Some(
                     ReceivedToken::DoneProc(_)
@@ -151,7 +143,11 @@ impl<'a> ExecuteResult {
                 Ok(Some(token)) => visit(token),
                 Ok(None) => break,
                 // The token stream raises its first server error again at the end.
-                Err(crate::Error::Server(_)) if server_error.is_some() => break,
+                Err(crate::Error::Server(_) | crate::Error::CleanupFailed { .. })
+                    if server_error.is_some() =>
+                {
+                    break
+                }
                 Err(error) => {
                     let error = match server_error {
                         Some(first) if !error.leaves_connection_usable() => {

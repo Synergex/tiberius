@@ -327,10 +327,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             if !self.drain_buffered_tokens().await {
                 // Undecodable tokens are dropped, or a fatal error ended the
                 // session. The tracked database becomes unknown and the
-                // transaction descriptor untrusted.
+                // transaction descriptor untrusted, so the request fails, and
+                // a commit or rollback keeps failing if the caller goes on.
                 self.buf.truncate(0);
                 self.context.clear_database();
                 self.context.set_transaction_uncertain(true);
+                return Err(crate::Error::Protocol(
+                    "the rest of the previous response could not be decoded".into(),
+                ));
             }
             return Ok(());
         }
@@ -785,5 +789,40 @@ mod tests {
             connection: buffered(&bytes),
         };
         assert!(matches!(client.commit_transaction().await, Ok(false)));
+    }
+
+    #[tokio::test]
+    async fn a_request_fails_after_an_undecodable_buffered_tail() {
+        let mut client = crate::Client {
+            connection: buffered(&[0xe3, 0, 0]),
+        };
+        let (_, error) = client
+            .execute_declared_until_error("SELECT 1", "", &[])
+            .await;
+        let error = error.expect("the request must fail");
+        assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
+        assert!(!error.leaves_connection_usable());
+        assert!(matches!(
+            client.commit_transaction().await,
+            Err(crate::Error::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_later_fatal_error_keeps_the_first_code_and_ends_the_connection() {
+        let mut bytes = BytesMut::new();
+        TokenError::new(16917, 1, 16, "cursor is not open", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenError::new(50002, 1, 20, "fatal", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut connection = buffered(&bytes);
+        let error = crate::client::rpc_response::collect_rpc_outputs(&mut connection)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(16917));
+        assert!(!error.leaves_connection_usable(), "{error:?}");
     }
 }

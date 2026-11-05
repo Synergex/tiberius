@@ -813,7 +813,8 @@ where
             }
             ReceivedToken::ReturnValue(rv) => outputs.push((*rv).into()),
             ReceivedToken::Error(e) => {
-                last_error.get_or_insert(crate::Error::Server(e));
+                last_error =
+                    crate::Error::add_server_error(last_error.take(), crate::Error::Server(e));
             }
             ReceivedToken::DoneInProc(ref done)
                 if !done.status().contains(DoneStatus::More) =>

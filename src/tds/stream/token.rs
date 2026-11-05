@@ -196,9 +196,8 @@ where
     async fn get_error(&mut self) -> crate::Result<ReceivedToken> {
         let err = TokenError::decode(self.conn).await?;
 
-        if self.last_error.is_none() {
-            self.last_error = Some(Error::Server(err.clone()));
-        }
+        self.last_error =
+            Error::add_server_error(self.last_error.take(), Error::Server(err.clone()));
 
         event!(
             name: "tiberius.error",
