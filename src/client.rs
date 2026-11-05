@@ -172,7 +172,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
 
     /// Executes `query` through `sp_executesql` with the caller's parameter
     /// declarations, such as `"@P1 int, @P2 nvarchar(10)"`, rather than ones
-    /// derived from each value. Values are passed as `@P1` onward, in order.
+    /// derived from each value. Values are passed positionally, so they bind
+    /// to the declarations in order.
     ///
     /// Returns the row counts the server reported before the first error,
     /// with that error, or `None` when the execution succeeded. Counts
@@ -187,16 +188,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         if let Err(error) = self.connection.flush_stream().await {
             return (ExecuteResult::empty(), Some(error));
         }
-        let mut rpc_params = Self::rpc_params(query);
-        rpc_params[1].value = ColumnData::String(Some(param_defs.into()));
-        for (index, param) in params.iter().enumerate() {
-            rpc_params.push(RpcParam {
-                name: Cow::Owned(format!("@P{}", index + 1)),
-                flags: BitFlags::empty(),
-                type_info: None,
-                value: param.to_sql(),
-            });
-        }
+        // A positional value cannot follow a named one, so the statement and
+        // declarations go positionally too.
+        let mut rpc_params = Vec::with_capacity(params.len() + 2);
+        rpc_params.push(prepared::positional_param(ColumnData::String(Some(
+            query.into(),
+        ))));
+        rpc_params.push(prepared::positional_param(ColumnData::String(Some(
+            param_defs.into(),
+        ))));
+        rpc_params.extend(
+            params
+                .iter()
+                .map(|param| prepared::positional_param(param.to_sql())),
+        );
         if let Err(error) = self.send_rpc(RpcProcId::ExecuteSQL, rpc_params).await {
             return (ExecuteResult::empty(), Some(error));
         }
@@ -576,8 +581,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// [`PreparedStatement::query`] / [`PreparedStatement::execute`].
     ///
     /// `param_defs` is the parameter declaration string in SQL Server syntax,
-    /// e.g. `"@P1 int, @P2 nvarchar(50)"`. Parameter names passed to
-    /// subsequent `execute` / `query` calls must match those declarations.
+    /// e.g. `"@P1 int, @P2 nvarchar(50)"`. Values passed to subsequent
+    /// `execute` / `query` calls bind to those declarations in order.
     ///
     /// # Example
     ///

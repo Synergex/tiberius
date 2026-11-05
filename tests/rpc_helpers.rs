@@ -315,12 +315,11 @@ impl SpPrepareHandler for TestPrepare {
     {
         Box::pin(async move {
             let sql = request.sql().to_string();
-            let handle = self
-                .0
-                .procs
-                .lock()
-                .unwrap()
-                .prepare(sql, Vec::new(), Vec::new());
+            let handle = self.0.procs.lock().unwrap().prepare(
+                sql,
+                Vec::new(),
+                declared_int_names(request.param_defs()),
+            );
 
             send_output_param(
                 client,
@@ -379,10 +378,10 @@ impl SpExecuteHandler for TestExecute {
     {
         Box::pin(async move {
             let handle = request.handle();
-            let sql = {
+            let (sql, param_names) = {
                 let mut cache = self.0.procs.lock().unwrap();
                 match cache.get_and_record(&handle) {
-                    Some(stmt) => stmt.sql.clone(),
+                    Some(stmt) => (stmt.sql.clone(), stmt.param_names.clone()),
                     None => {
                         return Err(tiberius::error::Error::Protocol(
                             format!("unknown prepared handle {}", handle.as_i32()).into(),
@@ -427,7 +426,7 @@ impl SpExecuteHandler for TestExecute {
             if sql == FATAL_EXECUTE_SQL {
                 return fail_fatally(client).await;
             }
-            let params = collect_params(&request);
+            let params = collect_params(&request, &param_names);
             let rows = eval_sql(&sql, &params);
 
             write_int_result_set(client, &rows, FinalDone::InProcMore).await?;
@@ -498,17 +497,18 @@ impl SpPrepExecHandler for TestPrepExec {
         Box::pin(async move {
             let sql = request.sql().to_string();
             let handle_type = request.handle_type_info().clone();
-            let handle = self
-                .0
-                .procs
-                .lock()
-                .unwrap()
-                .prepare(sql.clone(), Vec::new(), Vec::new());
+            let param_names = declared_int_names(request.param_defs());
+            let handle =
+                self.0
+                    .procs
+                    .lock()
+                    .unwrap()
+                    .prepare(sql.clone(), Vec::new(), param_names.clone());
 
             let mut params: HashMap<String, i32> = HashMap::new();
-            for p in request.params() {
+            for (i, p) in request.params().iter().enumerate() {
                 if let Some(v) = p.get_i32() {
-                    params.insert(p.name().to_string(), v);
+                    params.insert(param_name(p.name(), i, &param_names), v);
                 }
             }
             let rows = eval_sql(&sql, &params);
@@ -531,14 +531,36 @@ impl SpPrepExecHandler for TestPrepExec {
     }
 }
 
-fn collect_params(request: &ParsedExecute<'_>) -> HashMap<String, i32> {
+fn collect_params(request: &ParsedExecute<'_>, param_names: &[String]) -> HashMap<String, i32> {
     let mut out = HashMap::new();
-    for p in request.params() {
+    for (i, p) in request.params().iter().enumerate() {
         if let Some(v) = p.get_i32() {
-            out.insert(p.name().to_string(), v);
+            out.insert(param_name(p.name(), i, param_names), v);
         }
     }
     out
+}
+
+// This harness supports only int declarations, so commas cannot occur in a type.
+fn declared_int_names(param_defs: Option<&str>) -> Vec<String> {
+    param_defs
+        .into_iter()
+        .flat_map(|defs| defs.split(','))
+        .map(|declaration| {
+            let parts: Vec<_> = declaration.split_whitespace().collect();
+            assert_eq!(parts.len(), 2, "unsupported declaration: {declaration}");
+            assert!(parts[1].eq_ignore_ascii_case("int"));
+            parts[0].to_string()
+        })
+        .collect()
+}
+
+fn param_name(name: &str, index: usize, param_names: &[String]) -> String {
+    if name.is_empty() {
+        param_names[index].clone()
+    } else {
+        name.to_string()
+    }
 }
 
 // =============================================================================
@@ -1266,6 +1288,49 @@ fn prepare_execute_unprepare_round_trip() {
             // Handle is stable across executes.
             assert_eq!(stmt.handle(), handle);
 
+            stmt.unprepare(&mut client).await.unwrap();
+        })
+        .await;
+    });
+}
+
+#[test]
+fn prepared_values_bind_in_declaration_order() {
+    smol::block_on(async {
+        with_server(|addr, _state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+            let sql = "SELECT @P1 AS v";
+            let declarations = "@P2 int, @P1 int";
+
+            let stmt = client.prepare(sql, declarations).await.unwrap();
+            let row = stmt
+                .query(&mut client, &[&10i32, &20i32])
+                .await
+                .unwrap()
+                .into_row()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i32, _>(0), Some(20));
+            stmt.unprepare(&mut client).await.unwrap();
+
+            let (stmt, results) = client
+                .prep_exec(sql, declarations, &[&30i32, &40i32])
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].len(), 1);
+            assert_eq!(results[0][0].get::<i32, _>(0), Some(40));
+
+            let row = stmt
+                .query(&mut client, &[&50i32, &60i32])
+                .await
+                .unwrap()
+                .into_row()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i32, _>(0), Some(60));
             stmt.unprepare(&mut client).await.unwrap();
         })
         .await;

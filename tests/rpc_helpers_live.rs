@@ -78,6 +78,48 @@ async fn live_prepare_execute_unprepare() -> tiberius::Result<()> {
 
 #[tokio::test]
 #[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_values_bind_in_declaration_order() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+
+    for (declarations, sql) in [
+        (
+            "@P2 int, @P1 int",
+            "IF @P1 <> 20 OR @P2 <> 10 THROW 50000, 'Incorrect parameter binding', 1;",
+        ),
+        (
+            "@second int, @first int",
+            "IF @first <> 20 OR @second <> 10 THROW 50000, 'Incorrect parameter binding', 1;",
+        ),
+    ] {
+        let params: &[&dyn tiberius::ToSql] = &[&10i32, &20i32];
+        let (_, error) = client
+            .execute_declared_until_error(sql, declarations, params)
+            .await;
+        assert!(error.is_none(), "sp_executesql: {error:?}");
+
+        let stmt = client.prepare(sql, declarations).await?;
+        stmt.execute(&mut client, params).await?;
+        let (_, error) = stmt.execute_until_error(&mut client, params).await;
+        assert!(error.is_none(), "sp_execute: {error:?}");
+        stmt.unprepare(&mut client).await?;
+
+        let (stmt, _) = client.prep_exec(sql, declarations, params).await?;
+        stmt.unprepare(&mut client).await?;
+
+        let (stmt, _, error) = client
+            .prep_exec_until_error(sql, declarations, params)
+            .await;
+        assert!(error.is_none(), "sp_prepexec: {error:?}");
+        stmt.expect("sp_prepexec assigned a handle")
+            .unprepare(&mut client)
+            .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
 async fn live_prep_exec_returns_handle_and_rows() -> tiberius::Result<()> {
     let mut client = connect().await?;
 

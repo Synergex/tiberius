@@ -93,7 +93,7 @@ impl PreparedStatement {
 
     /// The parameter definitions string supplied at prepare time — the
     /// verbatim T-SQL declaration (e.g. `"@P1 int, @P2 nvarchar(50)"`).
-    /// Parameter names passed at execute time must match these declarations.
+    /// Values passed at execute time bind to these declarations in order.
     pub fn param_defs(&self) -> &str {
         &self.param_defs
     }
@@ -184,7 +184,12 @@ impl PreparedStatement {
         (result, crate::Error::with_cleanup(error, released))
     }
 
-    async fn execute_until_error<S>(
+    /// Executes the statement like [`execute`](Self::execute), but returns
+    /// the row counts the server reported before the first error, with that
+    /// error, as
+    /// [`Client::execute_declared_until_error`](crate::Client::execute_declared_until_error)
+    /// does.
+    pub async fn execute_until_error<S>(
         &self,
         client: &mut Client<S>,
         params: &[&dyn ToSql],
@@ -238,6 +243,18 @@ impl Drop for PreparedStatement {
     }
 }
 
+/// A value bound by position rather than by name. SQL Server matches each
+/// named value against the declarations, which costs more with every
+/// parameter; positional values bind to the declarations in order.
+pub(crate) fn positional_param(value: ColumnData<'_>) -> RpcParam<'_> {
+    RpcParam {
+        name: Cow::Borrowed(""),
+        flags: BitFlags::empty(),
+        type_info: None,
+        value,
+    }
+}
+
 /// Build the RPC parameter list for `sp_execute`: `[@handle, @P1, @P2, ...]`.
 fn build_execute_params<'a>(
     handle: PreparedHandle,
@@ -250,14 +267,7 @@ fn build_execute_params<'a>(
         type_info: None,
         value: ColumnData::I32(Some(handle.as_i32())),
     });
-    for (i, p) in params.iter().enumerate() {
-        rpc_params.push(RpcParam {
-            name: Cow::Owned(format!("@P{}", i + 1)),
-            flags: BitFlags::empty(),
-            type_info: None,
-            value: p.to_sql(),
-        });
-    }
+    rpc_params.extend(params.iter().map(|p| positional_param(p.to_sql())));
     rpc_params
 }
 
@@ -325,14 +335,7 @@ pub(crate) fn build_prepexec_params<'a>(
         type_info: None,
         value: ColumnData::String(Some(sql)),
     });
-    for (i, p) in params.iter().enumerate() {
-        rpc_params.push(RpcParam {
-            name: Cow::Owned(format!("@P{}", i + 1)),
-            flags: BitFlags::empty(),
-            type_info: None,
-            value: p.to_sql(),
-        });
-    }
+    rpc_params.extend(params.iter().map(|p| positional_param(p.to_sql())));
     rpc_params
 }
 
