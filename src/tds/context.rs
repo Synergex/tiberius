@@ -18,6 +18,7 @@ pub(crate) struct Context {
     packet_size: u32,
     packet_id: u8,
     transaction_desc: [u8; 8],
+    transaction_uncertain: bool,
     last_meta: Option<Arc<TokenColMetaData<'static>>>,
     alt_meta: HashMap<u16, Arc<TokenAltMetaData<'static>>>,
     spn: Option<String>,
@@ -33,6 +34,7 @@ impl Context {
             packet_size: 4096,
             packet_id: 0,
             transaction_desc: [0; 8],
+            transaction_uncertain: false,
             last_meta: None,
             alt_meta: HashMap::new(),
             spn: None,
@@ -96,6 +98,16 @@ impl Context {
 
     pub fn set_transaction_descriptor(&mut self, desc: [u8; 8]) {
         self.transaction_desc = desc;
+    }
+
+    /// Whether undecodable response tokens were discarded, so the transaction
+    /// descriptor may be stale.
+    pub fn transaction_uncertain(&self) -> bool {
+        self.transaction_uncertain
+    }
+
+    pub fn set_transaction_uncertain(&mut self, uncertain: bool) {
+        self.transaction_uncertain = uncertain;
     }
 
     pub fn version(&self) -> FeatureLevel {

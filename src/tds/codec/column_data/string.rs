@@ -23,10 +23,19 @@ where
             let collation = collation.as_ref().unwrap();
             let encoder = collation.encoding()?;
 
-            let s = encoder
-                .decode_without_bom_handling_and_without_replacement(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
-                .to_string();
+            // A borrowed result means the bytes are already the UTF-8 text, so
+            // keep the buffer instead of copying it.
+            let transcoded =
+                match encoder.decode_without_bom_handling_and_without_replacement(buf.as_ref()) {
+                    Some(Cow::Owned(text)) => Some(text),
+                    Some(Cow::Borrowed(_)) => None,
+                    None => return Err(Error::Encoding("invalid sequence".into())),
+                };
+            let s = match transcoded {
+                Some(text) => text,
+                None => String::from_utf8(buf)
+                    .map_err(|_| Error::Encoding("invalid sequence".into()))?,
+            };
 
             Ok(Some(s.into()))
         }
@@ -37,7 +46,7 @@ where
             }
 
             let buf: Vec<_> = buf.chunks(2).map(LittleEndian::read_u16).collect();
-            Ok(Some(String::from_utf16(&buf)?.into()))
+            Ok(Some(String::from_utf16_lossy(&buf).into()))
         }
         _ => Ok(None),
     }
@@ -79,5 +88,50 @@ where
             Ok(Some(s.into()))
         }
         _ => Err(Error::Protocol("varchar: unsupported type".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+    use bytes::{BufMut, BytesMut};
+
+    #[tokio::test]
+    async fn code_page_text_keeps_ascii_and_transcodes_other_bytes() {
+        let collation = Some(Collation::new(13632521, 52));
+        for (bytes, expected) in [
+            (&b"plain text"[..], "plain text"),
+            (&b""[..], ""),
+            (&[b'c', b'a', b'f', 0xe9][..], "caf\u{e9}"),
+        ] {
+            let mut wire = BytesMut::new();
+            wire.put_u16_le(bytes.len() as u16);
+            wire.put_slice(bytes);
+            wire.put_u8(0xad);
+            let mut reader = wire.into_sql_read_bytes();
+            let value = decode(&mut reader, VarLenType::BigVarChar, 8000, collation)
+                .await
+                .unwrap();
+            assert_eq!(value.as_deref(), Some(expected));
+            assert_eq!(reader.read_u8().await.unwrap(), 0xad);
+        }
+    }
+
+    #[tokio::test]
+    async fn unpaired_surrogates_decode_as_replacement_characters() {
+        let units = [0x41, 0xd83d, 0x42, 0xdc00];
+        let mut wire = BytesMut::new();
+        wire.put_u16_le((units.len() * 2) as u16);
+        for unit in units {
+            wire.put_u16_le(unit);
+        }
+        wire.put_u8(0xad);
+        let mut reader = wire.into_sql_read_bytes();
+        let value = decode(&mut reader, VarLenType::NVarchar, 8000, None)
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some("A\u{fffd}B\u{fffd}"));
+        assert_eq!(reader.read_u8().await.unwrap(), 0xad);
     }
 }

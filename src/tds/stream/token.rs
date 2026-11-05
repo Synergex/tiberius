@@ -26,7 +26,8 @@ pub enum ReceivedToken {
     DoneInProc(TokenDone),
     DoneProc(TokenDone),
     ReturnStatus(u32),
-    ReturnValue(TokenReturnValue),
+    // Boxed: an inline return value would make every row token 304 bytes.
+    ReturnValue(Box<TokenReturnValue>),
     Order(TokenOrder),
     ColName(TokenColName),
     TabName(TokenTabName),
@@ -184,7 +185,7 @@ where
     async fn get_return_value(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenReturnValue::decode(self.conn).await?;
         event!(Level::TRACE, message = ?return_value);
-        Ok(ReceivedToken::ReturnValue(return_value))
+        Ok(ReceivedToken::ReturnValue(Box::new(return_value)))
     }
 
     async fn get_return_status(&mut self) -> crate::Result<ReceivedToken> {
@@ -195,9 +196,8 @@ where
     async fn get_error(&mut self) -> crate::Result<ReceivedToken> {
         let err = TokenError::decode(self.conn).await?;
 
-        if self.last_error.is_none() {
-            self.last_error = Some(Error::Server(err.clone()));
-        }
+        self.last_error =
+            Error::add_server_error(self.last_error.take(), Error::Server(err.clone()));
 
         event!(
             name: "tiberius.error",
@@ -402,29 +402,30 @@ where
                 })?;
 
                 let token = match ty {
-                    TokenType::ReturnStatus => this.get_return_status().await?,
-                    TokenType::AltMetaData => this.get_alt_metadata().await?,
-                    TokenType::ColMetaData => this.get_col_metadata().await?,
-                    TokenType::ColName => this.get_col_name().await?,
-                    TokenType::Row => this.get_row().await?,
-                    TokenType::NbcRow => this.get_nbc_row().await?,
-                    TokenType::AltRow => this.get_alt_row().await?,
-                    TokenType::Done => this.get_done_value().await?,
-                    TokenType::DoneProc => this.get_done_proc_value().await?,
-                    TokenType::DoneInProc => this.get_done_in_proc_value().await?,
-                    TokenType::ReturnValue => this.get_return_value().await?,
-                    TokenType::Error => this.get_error().await?,
-                    TokenType::Order => this.get_order().await?,
-                    TokenType::TabName => this.get_tab_name().await?,
-                    TokenType::ColInfo => this.get_col_info().await?,
-                    TokenType::EnvChange => this.get_env_change().await?,
-                    TokenType::SessionState => this.get_session_state().await?,
-                    TokenType::Info => this.get_info().await?,
-                    TokenType::LoginAck => this.get_login_ack().await?,
-                    TokenType::Sspi => this.get_sspi().await?,
-                    TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
-                    TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
-                };
+                    TokenType::ReturnStatus => this.get_return_status().await,
+                    TokenType::AltMetaData => this.get_alt_metadata().await,
+                    TokenType::ColMetaData => this.get_col_metadata().await,
+                    TokenType::ColName => this.get_col_name().await,
+                    TokenType::Row => this.get_row().await,
+                    TokenType::NbcRow => this.get_nbc_row().await,
+                    TokenType::AltRow => this.get_alt_row().await,
+                    TokenType::Done => this.get_done_value().await,
+                    TokenType::DoneProc => this.get_done_proc_value().await,
+                    TokenType::DoneInProc => this.get_done_in_proc_value().await,
+                    TokenType::ReturnValue => this.get_return_value().await,
+                    TokenType::Error => this.get_error().await,
+                    TokenType::Order => this.get_order().await,
+                    TokenType::TabName => this.get_tab_name().await,
+                    TokenType::ColInfo => this.get_col_info().await,
+                    TokenType::EnvChange => this.get_env_change().await,
+                    TokenType::SessionState => this.get_session_state().await,
+                    TokenType::Info => this.get_info().await,
+                    TokenType::LoginAck => this.get_login_ack().await,
+                    TokenType::Sspi => this.get_sspi().await,
+                    TokenType::FeatureExtAck => this.get_feature_ext_ack().await,
+                    TokenType::FedAuthInfo => this.get_fed_auth_info().await,
+                }
+                .map_err(Error::into_decode_failure)?;
 
                 // When draining after attention, skip all tokens until we see
                 // Done+Attention, then terminate the stream.

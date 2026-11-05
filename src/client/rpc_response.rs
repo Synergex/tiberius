@@ -162,12 +162,11 @@ where
                     }
                 }
             }
-            ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
+            ReceivedToken::ReturnValue(rv) => outputs.push((*rv).into()),
             ReceivedToken::ReturnStatus(s) => status = Some(s),
             ReceivedToken::Error(e) => {
-                if last_error.is_none() {
-                    last_error = Some(crate::Error::Server(e));
-                }
+                last_error =
+                    crate::Error::add_server_error(last_error.take(), crate::Error::Server(e));
             }
             ReceivedToken::DoneProc(done) | ReceivedToken::Done(done) => {
                 // DoneProc/Done without the `More` flag marks the end of the
@@ -329,13 +328,12 @@ where
                     }
                 }
             }
-            ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
+            ReceivedToken::ReturnValue(rv) => outputs.push((*rv).into()),
             ReceivedToken::ReturnStatus(s) => status = Some(s),
             ReceivedToken::Info(info) => infos.push(info),
             ReceivedToken::Error(e) => {
-                if last_error.is_none() {
-                    last_error = Some(crate::Error::Server(e));
-                }
+                last_error =
+                    crate::Error::add_server_error(last_error.take(), crate::Error::Server(e));
             }
             ReceivedToken::DoneInProc(done) => {
                 if done.status().contains(DoneStatus::Attention) {
@@ -401,7 +399,9 @@ where
 
         match ty {
             TokenType::ColMetaData => {
-                let metadata = TokenColMetaData::decode(conn).await?;
+                let metadata = TokenColMetaData::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
                 if !metadata.columns.is_empty() {
                     let columns = metadata.columns().collect();
                     conn.context_mut().set_last_meta(Arc::new(metadata));
@@ -413,43 +413,64 @@ where
                 let _ = conn.read_u32_le().await?;
             }
             TokenType::ReturnValue => {
-                let _ = TokenReturnValue::decode(conn).await?;
+                let _ = TokenReturnValue::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::DoneInProc => {
-                let _ = TokenDone::decode(conn).await?;
+                let _ = TokenDone::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::DoneProc | TokenType::Done => {
-                let done = TokenDone::decode(conn).await?;
+                let done = TokenDone::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
                 if !done.status().contains(DoneStatus::More) {
                     break;
                 }
             }
             TokenType::Error => {
-                let err = TokenError::decode(conn).await?;
-                if last_error.is_none() {
-                    last_error = Some(crate::Error::Server(err));
-                }
+                let err = TokenError::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
+                last_error =
+                    crate::Error::add_server_error(last_error.take(), crate::Error::Server(err));
             }
             TokenType::Info => {
-                let _ = TokenInfo::decode(conn).await?;
+                let _ = TokenInfo::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::Order => {
-                let _ = TokenOrder::decode(conn).await?;
+                let _ = TokenOrder::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::ColName => {
-                let _ = TokenColName::decode(conn).await?;
+                let _ = TokenColName::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::ColInfo => {
-                let _ = TokenColInfo::decode(conn).await?;
+                let _ = TokenColInfo::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::TabName => {
-                let _ = TokenTabName::decode(conn).await?;
+                let _ = TokenTabName::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::EnvChange => {
-                let _ = TokenEnvChange::decode(conn).await?;
+                let _ = TokenEnvChange::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::SessionState => {
-                let _ = TokenSessionState::decode(conn).await?;
+                let _ = TokenSessionState::decode(conn)
+                    .await
+                    .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::Row | TokenType::NbcRow => {
                 return Err(crate::Error::Protocol(
@@ -510,6 +531,10 @@ mod tests {
                 col_name: std::borrow::Cow::Borrowed(name),
             }],
         })
+    }
+
+    fn return_value_token(value: TokenReturnValue) -> ReceivedToken {
+        ReceivedToken::ReturnValue(Box::new(value))
     }
 
     fn mk_return_value(name: &str, ordinal: u16, value: ColumnData<'static>) -> TokenReturnValue {
@@ -588,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn collect_drains_return_value_plus_status_plus_doneproc() {
         let s = synthetic(vec![
-            ReceivedToken::ReturnValue(mk_return_value("@handle", 1, ColumnData::I32(Some(42)))),
+            return_value_token(mk_return_value("@handle", 1, ColumnData::I32(Some(42)))),
             ReceivedToken::ReturnStatus(0),
             mk_done_proc_final(),
         ]);
@@ -605,7 +630,7 @@ mod tests {
                 columns: Vec::new(),
             })),
             ReceivedToken::NewResultset(mk_metadata("v")),
-            ReceivedToken::ReturnValue(mk_return_value("@handle", 1, ColumnData::I32(Some(42)))),
+            return_value_token(mk_return_value("@handle", 1, ColumnData::I32(Some(42)))),
             ReceivedToken::ReturnStatus(0),
             mk_done_proc_final(),
         ]);
@@ -659,9 +684,9 @@ mod tests {
     #[tokio::test]
     async fn collect_skips_done_proc_with_more_flag_and_terminates_on_final() {
         let s = synthetic(vec![
-            ReceivedToken::ReturnValue(mk_return_value("@a", 1, ColumnData::I32(Some(1)))),
+            return_value_token(mk_return_value("@a", 1, ColumnData::I32(Some(1)))),
             mk_done_proc_more(),
-            ReceivedToken::ReturnValue(mk_return_value("@b", 2, ColumnData::I32(Some(2)))),
+            return_value_token(mk_return_value("@b", 2, ColumnData::I32(Some(2)))),
             mk_done_proc_final(),
         ]);
         let (outputs, _) = collect_rpc_outputs_from_stream(s).await.unwrap();
@@ -671,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn collect_treats_bare_done_like_done_proc() {
         let s = synthetic(vec![
-            ReceivedToken::ReturnValue(mk_return_value("@a", 1, ColumnData::I32(Some(1)))),
+            return_value_token(mk_return_value("@a", 1, ColumnData::I32(Some(1)))),
             ReceivedToken::Done(TokenDone::with_rows(0)),
         ]);
         let (outputs, _) = collect_rpc_outputs_from_stream(s).await.unwrap();
@@ -684,7 +709,7 @@ mod tests {
         // must not terminate our drain loop.
         let s = synthetic(vec![
             ReceivedToken::DoneInProc(TokenDone::with_rows(0)),
-            ReceivedToken::ReturnValue(mk_return_value("@handle", 1, ColumnData::I32(Some(7)))),
+            return_value_token(mk_return_value("@handle", 1, ColumnData::I32(Some(7)))),
             mk_done_proc_final(),
         ]);
         let (outputs, _) = collect_rpc_outputs_from_stream(s).await.unwrap();
@@ -715,12 +740,12 @@ mod tests {
             mk_row(1),
             mk_row(2),
             mk_row(3),
-            ReceivedToken::ReturnValue(mk_return_value(
+            return_value_token(mk_return_value(
                 "@prepared_handle",
                 1,
                 ColumnData::I32(Some(11)),
             )),
-            ReceivedToken::ReturnValue(mk_return_value("@cursor", 2, ColumnData::I32(Some(0)))),
+            return_value_token(mk_return_value("@cursor", 2, ColumnData::I32(Some(0)))),
             ReceivedToken::ReturnStatus(0),
             mk_done_proc_final(),
         ]);
@@ -786,7 +811,7 @@ mod tests {
                 "proc",
                 1,
             )),
-            ReceivedToken::ReturnValue(mk_return_value("@out", 1, ColumnData::I32(Some(11)))),
+            return_value_token(mk_return_value("@out", 1, ColumnData::I32(Some(11)))),
             ReceivedToken::ReturnStatus(7),
             mk_done_proc_final(),
         ]);
@@ -877,7 +902,7 @@ mod tests {
     async fn collect_result_sets_no_result_sets_outputs_only() {
         // The normal (non-AllowDirect) shape: no inline rows, just outputs.
         let s = synthetic(vec![
-            ReceivedToken::ReturnValue(mk_return_value("@handle", 1, ColumnData::I32(Some(7)))),
+            return_value_token(mk_return_value("@handle", 1, ColumnData::I32(Some(7)))),
             ReceivedToken::ReturnStatus(0),
             mk_done_proc_final(),
         ]);
@@ -903,7 +928,7 @@ mod tests {
                 "",
                 1,
             )),
-            ReceivedToken::ReturnValue(mk_return_value("", 1, ColumnData::I32(Some(11)))),
+            return_value_token(mk_return_value("", 1, ColumnData::I32(Some(11)))),
             mk_done_proc_final(),
         ]);
 

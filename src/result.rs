@@ -1,10 +1,11 @@
 pub use crate::tds::stream::{QueryItem, ResultMetadata};
 use crate::{
     client::Connection,
+    tds::codec::DoneStatus,
     tds::stream::{ReceivedToken, TokenStream},
 };
 use futures_util::io::{AsyncRead, AsyncWrite};
-use futures_util::stream::TryStreamExt;
+use futures_util::stream::{Stream, TryStreamExt};
 use std::fmt::Debug;
 
 /// A result from a query execution, listing the number of affected rows.
@@ -67,6 +68,101 @@ impl<'a> ExecuteResult {
         Ok(Self { rows_affected })
     }
 
+    pub(crate) fn empty() -> Self {
+        Self {
+            rows_affected: Vec::new(),
+        }
+    }
+
+    /// Reads a response like [`new`](Self::new), but keeps the row counts
+    /// that arrived before it failed. They are returned with the first server
+    /// error, or with the transport, protocol, or cancellation error that
+    /// ended the response. A server error does not end the response, so the
+    /// rest of it is drained and its counts are dropped. A fatal server error,
+    /// or a transport or protocol failure, met while draining is returned with
+    /// the first error as [`CleanupFailed`](crate::Error::CleanupFailed), which
+    /// keeps the first error's code and reports the connection unusable.
+    ///
+    /// Unlike `new`, it records a count only from a `DONE` variant flagged
+    /// `DONE_COUNT`, the only ones whose count the server defines. Others,
+    /// such as the end of a nested procedure or of a statement run with
+    /// `NOCOUNT` on, would otherwise add a count of zero.
+    pub(crate) async fn until_error<S: AsyncRead + AsyncWrite + Unpin + Send>(
+        connection: &'a mut Connection<S>,
+    ) -> (Self, Option<crate::Error>) {
+        Self::until_error_visiting(connection, |_| ()).await
+    }
+
+    /// Like [`until_error`](Self::until_error), and passes `visit` every token
+    /// that is neither an error nor a `DONE` variant, including those after
+    /// the error, such as an output parameter at the end of the response.
+    pub(crate) async fn until_error_visiting<S, F>(
+        connection: &'a mut Connection<S>,
+        visit: F,
+    ) -> (Self, Option<crate::Error>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+        F: FnMut(ReceivedToken),
+    {
+        Self::until_error_from_stream(TokenStream::new(connection).try_unfold(), visit).await
+    }
+
+    async fn until_error_from_stream<T, F>(
+        mut tokens: T,
+        mut visit: F,
+    ) -> (Self, Option<crate::Error>)
+    where
+        T: Stream<Item = crate::Result<ReceivedToken>> + Unpin,
+        F: FnMut(ReceivedToken),
+    {
+        let mut rows_affected = Vec::new();
+        let mut server_error = None;
+
+        loop {
+            match tokens.try_next().await {
+                Ok(Some(ReceivedToken::Error(error))) => {
+                    server_error = crate::Error::add_server_error(
+                        server_error.take(),
+                        crate::Error::Server(error),
+                    );
+                }
+                Ok(Some(
+                    ReceivedToken::DoneProc(_)
+                    | ReceivedToken::DoneInProc(_)
+                    | ReceivedToken::Done(_),
+                )) if server_error.is_some() => (),
+                Ok(Some(
+                    ReceivedToken::DoneProc(done)
+                    | ReceivedToken::DoneInProc(done)
+                    | ReceivedToken::Done(done),
+                )) => {
+                    if done.status().contains(DoneStatus::Count) {
+                        rows_affected.push(done.rows());
+                    }
+                }
+                Ok(Some(token)) => visit(token),
+                Ok(None) => break,
+                // The token stream raises its first server error again at the end.
+                Err(crate::Error::Server(_) | crate::Error::CleanupFailed { .. })
+                    if server_error.is_some() =>
+                {
+                    break
+                }
+                Err(error) => {
+                    let error = match server_error {
+                        Some(first) if !error.leaves_connection_usable() => {
+                            crate::Error::with_cleanup(Some(first), Err(error))
+                        }
+                        _ => Some(error),
+                    };
+                    return (Self { rows_affected }, error);
+                }
+            }
+        }
+
+        (Self { rows_affected }, server_error)
+    }
+
     /// A slice of numbers of rows affected in the same order as the given
     /// queries.
     pub fn rows_affected(&self) -> &[u64] {
@@ -111,5 +207,175 @@ impl IntoIterator for ExecuteResult {
 
     fn into_iter(self) -> Self::IntoIter {
         self.rows_affected.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::{TokenDone, TokenError};
+    use enumflags2::BitFlags;
+    use futures_util::stream::iter;
+
+    fn in_proc(rows: u64) -> crate::Result<ReceivedToken> {
+        Ok(ReceivedToken::DoneInProc(TokenDone::with_more_rows(rows)))
+    }
+
+    fn final_done_proc() -> crate::Result<ReceivedToken> {
+        Ok(ReceivedToken::DoneProc(TokenDone::default()))
+    }
+
+    fn server_error(code: u32) -> TokenError {
+        TokenError::new(code, 1, 16, "e", "srv", "", 1)
+    }
+
+    async fn read(tokens: Vec<crate::Result<ReceivedToken>>) -> (Vec<u64>, Option<crate::Error>) {
+        let (result, error) = ExecuteResult::until_error_from_stream(iter(tokens), |_| ()).await;
+        (result.rows_affected, error)
+    }
+
+    #[tokio::test]
+    async fn until_error_visits_other_tokens_after_the_error() {
+        let mut visited = Vec::new();
+        let (result, error) = ExecuteResult::until_error_from_stream(
+            iter(vec![
+                Ok(ReceivedToken::ReturnStatus(0)),
+                Ok(ReceivedToken::Error(server_error(2627))),
+                in_proc(1),
+                Ok(ReceivedToken::ReturnStatus(1)),
+                final_done_proc(),
+                Err(crate::Error::Server(server_error(2627))),
+            ]),
+            |token| {
+                if let ReceivedToken::ReturnStatus(status) = token {
+                    visited.push(status);
+                }
+            },
+        )
+        .await;
+        assert!(result.rows_affected.is_empty());
+        assert!(error.is_some());
+        assert_eq!(visited, [0, 1]);
+    }
+
+    #[tokio::test]
+    async fn until_error_returns_every_count_of_a_successful_response() {
+        let (rows, error) = read(vec![in_proc(1), in_proc(0), in_proc(2), final_done_proc()]).await;
+        assert_eq!(rows, [1, 0, 2]);
+        assert!(error.is_none());
+    }
+
+    fn done_proc(status: BitFlags<DoneStatus>, rows: u64) -> crate::Result<ReceivedToken> {
+        Ok(ReceivedToken::DoneProc(TokenDone::with_status(
+            status, rows,
+        )))
+    }
+
+    #[tokio::test]
+    async fn until_error_skips_done_tokens_without_a_count() {
+        let (rows, error) = read(vec![
+            in_proc(1),
+            // The end of a call that is not the last in an RPC batch.
+            done_proc(DoneStatus::RpcInBatch.into(), 0),
+            in_proc(2),
+            // The end of a procedure the statement called.
+            done_proc(DoneStatus::More.into(), 0),
+            // A statement run with NOCOUNT on.
+            Ok(ReceivedToken::DoneInProc(TokenDone::with_status(
+                DoneStatus::More.into(),
+                0,
+            ))),
+            in_proc(0),
+            final_done_proc(),
+        ])
+        .await;
+        assert_eq!(rows, [1, 2, 0]);
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn until_error_counts_every_done_variant_that_carries_a_count() {
+        // A count does not say which statement it belongs to, so one from a
+        // statement in a called procedure or a trigger is recorded like one
+        // from the executed statement.
+        let (rows, error) = read(vec![
+            in_proc(2),
+            done_proc(DoneStatus::More | DoneStatus::Count, 5),
+            Ok(ReceivedToken::Done(TokenDone::with_rows(1))),
+        ])
+        .await;
+        assert_eq!(rows, [2, 5, 1]);
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn until_error_keeps_counts_before_the_first_server_error() {
+        let (rows, error) = read(vec![
+            in_proc(1),
+            in_proc(1),
+            Ok(ReceivedToken::Error(server_error(2627))),
+            in_proc(0),
+            Ok(ReceivedToken::Error(server_error(3621))),
+            in_proc(1),
+            final_done_proc(),
+            Err(crate::Error::Server(server_error(2627))),
+        ])
+        .await;
+        assert_eq!(rows, [1, 1]);
+        assert!(matches!(error, Some(crate::Error::Server(e)) if e.code() == 2627));
+    }
+
+    #[tokio::test]
+    async fn until_error_returns_a_transport_or_cancel_error_with_earlier_counts() {
+        for failure in [
+            crate::Error::Canceled,
+            crate::Error::Protocol("reset".into()),
+        ] {
+            let (rows, error) = read(vec![in_proc(1), Err(failure)]).await;
+            assert_eq!(rows, [1]);
+            assert!(matches!(
+                error,
+                Some(crate::Error::Canceled | crate::Error::Protocol(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_fatal_error_keeps_the_first_code_and_ends_the_connection() {
+        let (_, error) = ExecuteResult::until_error_from_stream(
+            iter(vec![
+                Ok(ReceivedToken::Error(TokenError::new(
+                    50001, 1, 16, "primary", "srv", "", 1,
+                ))),
+                Ok(ReceivedToken::Error(TokenError::new(
+                    50002, 1, 20, "fatal", "srv", "", 2,
+                ))),
+            ]),
+            |_| (),
+        )
+        .await;
+        let error = error.unwrap();
+        assert_eq!(error.code(), Some(50001));
+        assert!(!error.leaves_connection_usable(), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_while_draining_keeps_the_server_error_code() {
+        let (_, error) = ExecuteResult::until_error_from_stream(
+            iter(vec![
+                Ok(ReceivedToken::Error(TokenError::new(
+                    2627, 1, 14, "primary", "srv", "", 1,
+                ))),
+                Err(crate::Error::Io {
+                    kind: std::io::ErrorKind::UnexpectedEof,
+                    message: "drain".into(),
+                }),
+            ]),
+            |_| (),
+        )
+        .await;
+        let error = error.unwrap();
+        assert_eq!(error.code(), Some(2627));
+        assert!(!error.leaves_connection_usable(), "{error:?}");
     }
 }
