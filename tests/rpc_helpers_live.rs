@@ -1331,3 +1331,55 @@ async fn live_prepared_cursor_execute_sees_changed_columns() -> tiberius::Result
     cursor.close_and_unprepare(&mut client).await?;
     Ok(())
 }
+
+/// A cursor restored after a table change reports its own columns, not those
+/// of the cursor that replaced it.
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_restored_cursor_reports_its_own_columns() -> tiberius::Result<()> {
+    use tiberius::{CursorConcurrencyOptions, CursorExecuteOutcome, CursorScrollOptions};
+
+    let mut client = connect().await?;
+    client
+        .simple_query("CREATE TABLE #restored (id int); INSERT INTO #restored VALUES (1)")
+        .await?
+        .into_results()
+        .await?;
+    let options = CursorOpenOptions::new(
+        CursorScrollOptions::Dynamic | CursorScrollOptions::ParameterizedStmt,
+        CursorConcurrencyOptions::ReadOnly | CursorConcurrencyOptions::AllowDirect,
+    );
+    let mut cursor = client
+        .cursor_prep_exec(
+            "SELECT * FROM #restored WHERE id >= @P1",
+            options,
+            "@P1 int",
+            &[&0i32],
+        )
+        .await?
+        .into_cursor()
+        .expect("expected a server cursor");
+    client
+        .simple_query("ALTER TABLE #restored ADD extra varchar(5) NULL")
+        .await?
+        .into_results()
+        .await?;
+    let CursorExecuteOutcome::Cursor { previous } = cursor.execute(&mut client, &[&0i32]).await?
+    else {
+        panic!("executed directly");
+    };
+    let abandoned = cursor
+        .replace_cursor(previous.expect("the replaced cursor"))
+        .expect("the new cursor");
+    abandoned.close(&mut client).await?;
+    let names = cursor
+        .fetch_metadata(&mut client)
+        .await?
+        .iter()
+        .map(|column| column.name().to_string())
+        .filter(|name| name != "ROWSTAT")
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["id"]);
+    cursor.close_and_unprepare(&mut client).await?;
+    Ok(())
+}

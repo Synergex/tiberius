@@ -234,7 +234,6 @@ pub struct PreparedCursor {
     scrollopt: BitFlags<CursorScrollOptions>,
     ccopt: BitFlags<CursorConcurrencyOptions>,
     row_count: i32,
-    metadata: Option<Vec<Column>>,
     released: bool,
 }
 
@@ -292,7 +291,7 @@ impl PreparedCursor {
             crate::Error::Protocol("prepared cursor: cursor is already closed".into())
         })?;
 
-        if let Some(metadata) = &self.metadata {
+        if let Some(metadata) = &cursor.metadata {
             return Ok(metadata.clone());
         }
 
@@ -364,12 +363,12 @@ impl PreparedCursor {
 
         // Without columns in the response, ask the server rather than trust the
         // previous execution's: the table may have changed since.
-        self.metadata = result_sets.first().map(|rs| (*rs.columns).clone());
         let previous = self.replace_cursor(Cursor {
             handle: CursorHandle(cursor_handle),
             scrollopt: i32_to_scroll_flags(scrollopt),
             ccopt: i32_to_cc_flags(ccopt),
             row_count,
+            metadata: result_sets.first().map(|rs| (*rs.columns).clone()),
             closed: false,
         });
         Ok(CursorExecuteOutcome::Cursor { previous })
@@ -378,7 +377,8 @@ impl PreparedCursor {
     /// Makes `cursor`, opened from this statement, the current cursor and
     /// returns the one it replaces, still open. A caller that abandons a new
     /// cursor from [`execute`](Self::execute) uses this to restore the
-    /// previous one.
+    /// previous one. Each cursor keeps the columns it was opened with, so
+    /// [`fetch_metadata`](Self::fetch_metadata) reports the current cursor's.
     pub fn replace_cursor(&mut self, cursor: Cursor) -> Option<Cursor> {
         self.cursor_handle = cursor.handle;
         self.scrollopt = cursor.scrollopt;
@@ -662,6 +662,8 @@ pub struct Cursor {
     scrollopt: BitFlags<CursorScrollOptions>,
     ccopt: BitFlags<CursorConcurrencyOptions>,
     row_count: i32,
+    /// The columns the server reported when it opened the cursor, if any.
+    metadata: Option<Vec<Column>>,
     /// `true` once the handle has been explicitly closed on the server
     /// (either via [`close`](Self::close) or set when close has at least
     /// reached the wire, so drain-time errors don't trigger a spurious
@@ -1004,6 +1006,7 @@ pub(crate) fn cursor_from_outputs(outputs: &[OutputValue]) -> crate::Result<Curs
         scrollopt: i32_to_scroll_flags(scrollopt),
         ccopt: i32_to_cc_flags(ccopt),
         row_count,
+        metadata: None,
         closed: false,
     })
 }
@@ -1063,6 +1066,7 @@ pub(crate) fn prepared_cursor_from_outputs(
         scrollopt: i32_to_scroll_flags(scrollopt),
         ccopt: i32_to_cc_flags(ccopt),
         row_count,
+        metadata,
         closed: false,
     };
 
@@ -1074,7 +1078,6 @@ pub(crate) fn prepared_cursor_from_outputs(
         scrollopt: i32_to_scroll_flags(scrollopt),
         ccopt: i32_to_cc_flags(ccopt),
         row_count,
-        metadata,
         released: false,
     })
 }
@@ -1434,9 +1437,53 @@ mod tests {
         )
         .unwrap();
 
-        let metadata = pc.metadata.as_ref().unwrap();
+        let metadata = pc.cursor.as_ref().unwrap().metadata.as_ref().unwrap();
         assert_eq!(metadata.len(), 1);
         assert_eq!(metadata[0].name(), "v");
+    }
+
+    #[test]
+    fn a_replaced_cursor_takes_its_columns_with_it() {
+        let outputs = vec![
+            output("", 11),
+            output("", 22),
+            output("", CursorScrollOptions::ForwardOnly as i32),
+            output("", CursorConcurrencyOptions::ReadOnly as i32),
+            output("", 3),
+        ];
+        let metadata = vec![Column::new("v".to_string(), crate::ColumnType::Int4)];
+        let mut pc = prepared_cursor_from_outputs(
+            &outputs,
+            Some(metadata),
+            CursorOpenOptions::forward_only_read_only(),
+        )
+        .unwrap();
+
+        let names = |metadata: &Option<Vec<Column>>| {
+            metadata
+                .iter()
+                .flatten()
+                .map(|column| column.name().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let replaced = pc
+            .replace_cursor(Cursor {
+                handle: CursorHandle(33),
+                scrollopt: BitFlags::empty(),
+                ccopt: BitFlags::empty(),
+                row_count: -1,
+                metadata: Some(vec![Column::new("w".to_string(), crate::ColumnType::Int4)]),
+                closed: false,
+            })
+            .unwrap();
+        assert_eq!(pc.cursor_handle().as_i32(), 33);
+        assert_eq!(names(&pc.cursor.as_ref().unwrap().metadata), ["w"]);
+
+        let abandoned = pc.replace_cursor(replaced).unwrap();
+        assert_eq!(abandoned.handle.as_i32(), 33);
+        assert_eq!(pc.cursor_handle().as_i32(), 22);
+        assert_eq!(names(&pc.cursor.as_ref().unwrap().metadata), ["v"]);
     }
 
     #[test]
