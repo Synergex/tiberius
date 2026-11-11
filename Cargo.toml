@@ -72,6 +72,16 @@ version = "0.4"
 features = ["runtime-async-std"]
 optional = true
 
+[dependencies.native-tls-crate]
+package = "native-tls"
+version = "0.2"
+features = ["alpn"]
+optional = true
+
+[dependencies.base64]
+version = "0.21"
+optional = true
+
 [dependencies.async-rustls]
 version = "0.4"
 optional = true
@@ -216,5 +226,5 @@ server-rustls = ["async-rustls", "rustls-pemfile"]
 integrated-auth-gssapi = ["libgssapi"]
 bigdecimal = ["bigdecimal_"]
 rustls = ["tokio-rustls", "tokio-util", "rustls-pemfile", "rustls-native-certs"]
-native-tls = ["async-native-tls"]
+native-tls = ["async-native-tls", "dep:native-tls-crate", "dep:base64"]
 vendored-openssl = ["opentls"]

@@ -93,6 +93,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         })
     }
 
+    /// Whether the established session currently uses TLS.
+    ///
+    /// Login-only encryption returns `false` after login; full-session and
+    /// Strict encryption return `true`.
+    pub fn is_encrypted(&self) -> bool {
+        self.connection.is_encrypted()
+    }
+
     /// The server session ID (SPID) from the server's packet headers, for
     /// matching client activity to server-side traces.
     pub fn spid(&self) -> Option<u16> {

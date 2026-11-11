@@ -80,6 +80,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Debug for Connection<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Creates a new connection
     pub(crate) async fn connect(config: Config, tcp_stream: S) -> crate::Result<Connection<S>> {
+        config.validate_security()?;
+
         let context = {
             let mut context = Context::new();
             context.set_spn(config.get_host(), config.get_port());
@@ -99,13 +101,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
         let fed_auth_required = matches!(config.auth, AuthMethod::AADToken(_));
 
+        // TDS 8 starts with TLS on the raw transport, before any TDS bytes.
+        // There is deliberately no retry using the TDS 7 handshake.
+        if config.strict_encryption {
+            connection = connection
+                .tls_handshake(&config, EncryptionLevel::Required)
+                .await?;
+        }
+
         let prelogin = connection
             .prelogin(config.encryption, fed_auth_required)
             .await?;
 
-        let encryption = prelogin.negotiated_encryption(config.encryption);
-
-        let connection = connection.tls_handshake(&config, encryption).await?;
+        let encryption = if config.strict_encryption {
+            // PRELOGIN encryption is ignored in TDS 8. Keep TLS for the
+            // complete session, even if the server returns OFF/NOT_SUP.
+            EncryptionLevel::On
+        } else {
+            let encryption = prelogin.negotiated_encryption(config.encryption)?;
+            connection = connection.tls_handshake(&config, encryption).await?;
+            encryption
+        };
 
         let mut connection = connection
             .login(
@@ -122,6 +138,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         connection.flush_done().await?;
 
         Ok(connection)
+    }
+
+    pub(crate) fn is_encrypted(&self) -> bool {
+        match &*self.transport {
+            MaybeTlsStream::Raw(_) => false,
+            #[cfg(any(
+                feature = "rustls",
+                feature = "native-tls",
+                feature = "vendored-openssl"
+            ))]
+            MaybeTlsStream::Tls(_) => true,
+        }
     }
 
     /// Flush the incoming token stream until receiving `DONE` token.
@@ -584,7 +612,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             } = self;
             let mut stream = match transport.into_inner() {
                 MaybeTlsStream::Raw(tcp) => {
-                    create_tls_stream(config, TlsPreloginWrapper::new(tcp)).await?
+                    let stream = if config.strict_encryption {
+                        TlsPreloginWrapper::tls_first(tcp)
+                    } else {
+                        TlsPreloginWrapper::new(tcp)
+                    };
+                    create_tls_stream(config, stream).await?
                 }
                 _ => unreachable!(),
             };
@@ -618,7 +651,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         feature = "native-tls",
         feature = "vendored-openssl"
     )))]
-    async fn tls_handshake(self, _: &Config, _: EncryptionLevel) -> crate::Result<Self> {
+    async fn tls_handshake(self, _: &Config, encryption: EncryptionLevel) -> crate::Result<Self> {
+        if encryption != EncryptionLevel::NotSupported {
+            return Err(crate::Error::Tls(
+                "Server requires TLS, but no TLS backend is enabled.".into(),
+            ));
+        }
         event!(
             Level::WARN,
             "TLS encryption is not enabled. All traffic including the login credentials are not encrypted."
