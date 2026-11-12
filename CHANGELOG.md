@@ -4,9 +4,10 @@
 
 - Add native TLS-first TDS 8.0 via `Config::strict_encryption`, with no fallback and no certificate-validation bypass.
 - Add certificate hostname overrides and exact leaf-certificate file pinning; validate conflicting/unsupported security settings once at connection entry, before protocol I/O.
-- **Breaking (native TLS):** CA and pin files must contain exactly one PEM or DER certificate; bundles and text around the certificate are rejected. Adding a custom CA preserves OS roots.
+- **Breaking (native TLS):** CA and pin files must contain exactly one PEM or DER certificate; bundles and text around the certificate are rejected. Unreadable CA files now return `Error::Tls` instead of `Error::Io`. Adding a custom CA preserves OS roots.
 - Reject required-encryption downgrades and malformed TLS handshake packets with an error instead of panicking; correctly negotiate Optional plaintext and login-only/full-session TLS.
 - Expose actual post-login TLS state through `Client::is_encrypted`.
+- Allow `trust_cert()` without a TLS backend when encryption is explicitly `NotSupported`; the bypass is inert, and conflicting security settings remain errors.
 
 ## Version 0.12.3
 - feat: improve column type accuracy (#347)

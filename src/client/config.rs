@@ -218,7 +218,7 @@ impl Config {
             feature = "rustls",
             feature = "vendored-openssl"
         )))]
-        if bypass
+        if (bypass && self.encryption != EncryptionLevel::NotSupported)
             || matches!(
                 self.encryption,
                 EncryptionLevel::On | EncryptionLevel::Required
@@ -238,6 +238,9 @@ impl Config {
     /// storage (or use `trust_cert_ca` instead), using this setting is potentially dangerous.
     ///
     /// - Defaults to `default`, meaning server certificate is validated against system-truststore.
+    ///
+    /// In builds without a TLS backend, this setting is accepted only with
+    /// [`EncryptionLevel::NotSupported`], where it has no effect.
     pub fn trust_cert(&mut self) {
         self.trust_cert_requested = true;
         if !matches!(self.trust, TrustConfig::CaCertificateLocation(_)) {
@@ -557,6 +560,30 @@ mod security_tests {
                 config.certificate_hostname("sql.test");
             }
             assert!(config.validate_security().is_err());
+        }
+    }
+
+    #[cfg(not(any(
+        feature = "native-tls",
+        feature = "rustls",
+        feature = "vendored-openssl"
+    )))]
+    #[test]
+    fn bypass_without_tls_requires_explicit_plaintext() {
+        for (encryption, accepted) in [
+            (EncryptionLevel::NotSupported, true),
+            (EncryptionLevel::Off, false),
+            (EncryptionLevel::On, false),
+            (EncryptionLevel::Required, false),
+        ] {
+            let mut config = Config::new();
+            config.encryption(encryption);
+            config.trust_cert();
+            assert_eq!(
+                config.validate_security().is_ok(),
+                accepted,
+                "{encryption:?}"
+            );
         }
     }
 
