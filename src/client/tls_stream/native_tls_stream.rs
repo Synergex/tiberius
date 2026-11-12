@@ -83,7 +83,6 @@ pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
     config: &Config,
     stream: S,
 ) -> crate::Result<TlsStream<S>> {
-    config.validate_security()?;
     let mut builder = native_tls_crate::TlsConnector::builder();
     if config.strict_encryption {
         builder.min_protocol_version(Some(native_tls_crate::Protocol::Tlsv12));
