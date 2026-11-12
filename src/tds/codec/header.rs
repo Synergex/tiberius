@@ -91,6 +91,14 @@ impl PacketHeader {
         header
     }
 
+    #[cfg(any(test, all(windows, feature = "winauth")))]
+    pub fn sspi(id: u8) -> Self {
+        let mut header = Self::new(0, id);
+        header.set_type(PacketType::Sspi);
+        header.set_status(PacketStatus::EndOfMessage);
+        header
+    }
+
     pub fn batch(id: u8) -> Self {
         let mut header = Self::new(0, id);
         header.set_type(PacketType::SQLBatch);

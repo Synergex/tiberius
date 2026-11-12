@@ -124,6 +124,43 @@ where
         }
     }
 
+    /// Reads a login response up to the server's next security token or its
+    /// final DONE, reporting errors and routing as `flush_done` does.
+    #[cfg(any(test, all(windows, feature = "winauth")))]
+    pub(crate) async fn flush_sspi_or_done(self) -> crate::Result<Option<TokenSspi>> {
+        let mut stream = self.try_unfold();
+        let mut last_error = None;
+        let mut routing = None;
+
+        loop {
+            match stream.try_next().await? {
+                Some(ReceivedToken::Error(error)) => {
+                    if last_error.is_none() {
+                        last_error = Some(error);
+                    }
+                }
+                Some(ReceivedToken::Sspi(token)) if last_error.is_none() => return Ok(Some(token)),
+                Some(ReceivedToken::Done(_)) => {
+                    return match (last_error, routing) {
+                        (Some(error), _) => Err(Error::Server(error)),
+                        (_, Some(routing)) => Err(routing),
+                        (_, _) => Ok(None),
+                    }
+                }
+                Some(ReceivedToken::EnvChange(TokenEnvChange::Routing { host, port })) => {
+                    routing = Some(Error::Routing { host, port });
+                }
+                Some(_) => (),
+                None => {
+                    return Err(match last_error {
+                        Some(error) => Error::Server(error),
+                        None => Error::Protocol("Never got DONE token.".into()),
+                    })
+                }
+            }
+        }
+    }
+
     #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
     pub(crate) async fn flush_sspi(self) -> crate::Result<TokenSspi> {
         let mut stream = self.try_unfold();

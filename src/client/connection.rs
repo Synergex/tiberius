@@ -40,7 +40,7 @@ use std::{cmp, fmt::Debug, io, pin::Pin, task};
 use task::Poll;
 use tracing::{event, Level};
 #[cfg(all(windows, feature = "winauth"))]
-use winauth::{windows::NtlmSspiBuilder, NextBytes};
+use winauth::NextBytes;
 
 /// A `Connection` is an abstraction between the [`Client`] and the server. It
 /// can be used as a `Stream` to fetch [`Packet`]s from and to `send` packets
@@ -123,7 +123,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             encryption
         };
 
-        let mut connection = connection
+        let connection = connection
             .login(
                 config.auth,
                 encryption,
@@ -134,8 +134,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 prelogin,
             )
             .await?;
-
-        connection.flush_done().await?;
 
         Ok(connection)
     }
@@ -471,31 +469,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         match auth {
             #[cfg(all(windows, feature = "winauth"))]
             AuthMethod::Integrated => {
-                let mut client = NtlmSspiBuilder::new()
-                    .target_spn(self.context.spn())
-                    .build()?;
-
-                login_message.integrated_security(client.next_bytes(None)?);
-
-                let id = self.context.next_packet_id();
-                self.send(PacketHeader::login(id), login_message).await?;
-
-                self = self.post_login_encryption(encryption);
-
-                let sspi_bytes = self.flush_sspi().await?;
-
-                match client.next_bytes(Some(sspi_bytes.as_ref()))? {
-                    Some(sspi_response) => {
-                        event!(Level::TRACE, sspi_response_len = sspi_response.len());
-
-                        let id = self.context.next_packet_id();
-                        let header = PacketHeader::login(id);
-
-                        let token = TokenSspi::new(sspi_response);
-                        self.send(header, token).await?;
-                    }
-                    None => unreachable!(),
-                }
+                let negotiate = super::sspi::Negotiate::new(self.context.spn())?;
+                return self.sspi_login(negotiate, login_message, encryption).await;
             }
             #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
             AuthMethod::Integrated => {
@@ -584,6 +559,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 let id = self.context.next_packet_id();
                 self.send(PacketHeader::login(id), login_message).await?;
                 self = self.post_login_encryption(encryption);
+            }
+        }
+
+        self.flush_done().await?;
+        Ok(self)
+    }
+
+    /// Exchanges security tokens until the login response ends. Kerberos may
+    /// finish with no server token, or with a final one before LOGINACK; NTLM
+    /// answers a challenge.
+    #[cfg(any(test, all(windows, feature = "winauth")))]
+    async fn sspi_login(
+        mut self,
+        mut sspi: impl super::sspi::SspiClient,
+        mut login_message: LoginMessage<'_>,
+        encryption: EncryptionLevel,
+    ) -> crate::Result<Self> {
+        login_message.integrated_security(Some(sspi.step(None)?));
+        let id = self.context.next_packet_id();
+        self.send(PacketHeader::login(id), login_message).await?;
+        self = self.post_login_encryption(encryption);
+
+        while let Some(token) = TokenStream::new(&mut self).flush_sspi_or_done().await? {
+            let response = sspi.step(Some(token.as_ref()))?;
+            if !response.is_empty() {
+                let id = self.context.next_packet_id();
+                self.send(PacketHeader::sspi(id), super::sspi::SspiMessage(response))
+                    .await?;
             }
         }
 
@@ -862,5 +865,178 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), Some(16917));
         assert!(!error.leaves_connection_usable(), "{error:?}");
+    }
+
+    mod sspi {
+        use super::*;
+        use crate::client::sspi::SspiClient;
+        use crate::tds::codec::{Decode, PacketType, TokenSspi};
+        use std::collections::VecDeque;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+        use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+
+        /// Replies to each step from a script and records what it was given.
+        struct Scripted {
+            replies: VecDeque<&'static [u8]>,
+            received: Arc<std::sync::Mutex<Vec<Option<Vec<u8>>>>>,
+        }
+
+        impl SspiClient for Scripted {
+            fn step(&mut self, input: Option<&[u8]>) -> crate::Result<Vec<u8>> {
+                self.received
+                    .lock()
+                    .unwrap()
+                    .push(input.map(<[u8]>::to_vec));
+                Ok(self.replies.pop_front().unwrap_or_default().to_vec())
+            }
+        }
+
+        async fn read_packet(stream: &mut DuplexStream) -> (u8, Vec<u8>) {
+            let mut header = [0; 8];
+            stream.read_exact(&mut header).await.unwrap();
+            let length = u16::from_be_bytes([header[2], header[3]]) as usize - 8;
+            let mut payload = vec![0; length];
+            stream.read_exact(&mut payload).await.unwrap();
+            (header[0], payload)
+        }
+
+        async fn respond(stream: &mut DuplexStream, tokens: &[&[u8]]) {
+            let payload = tokens.concat();
+            let mut packet = vec![PacketType::TabularResult as u8, 1];
+            packet.extend(((payload.len() + 8) as u16).to_be_bytes());
+            packet.extend([0, 0, 1, 0]);
+            packet.extend(payload);
+            stream.write_all(&packet).await.unwrap();
+        }
+
+        fn encoded(item: impl Encode<BytesMut>) -> Vec<u8> {
+            let mut bytes = BytesMut::new();
+            item.encode(&mut bytes).unwrap();
+            bytes.to_vec()
+        }
+
+        fn server_token(bytes: &[u8]) -> Vec<u8> {
+            encoded(TokenSspi::from_bytes(bytes.to_vec()))
+        }
+
+        fn done() -> Vec<u8> {
+            encoded(TokenDone::default())
+        }
+
+        /// Logs in with `replies` while `server` plays the other side, and
+        /// returns the result, every step input, and the login's SSPI bytes.
+        async fn exchange<F>(
+            replies: &[&'static [u8]],
+            server: impl FnOnce(DuplexStream) -> F,
+        ) -> (crate::Result<()>, Vec<Option<Vec<u8>>>, Vec<u8>)
+        where
+            F: std::future::Future<Output = DuplexStream>,
+        {
+            let (client, mut peer) = tokio::io::duplex(1 << 16);
+            let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sspi = Scripted {
+                replies: replies.iter().copied().collect(),
+                received: received.clone(),
+            };
+            let connection: Connection<Compat<DuplexStream>> = Connection {
+                transport: Framed::new(MaybeTlsStream::Raw(client.compat()), PacketCodec),
+                flushed: false,
+                buffered_only: false,
+                context: Context::new(),
+                buf: BytesMut::new(),
+                cancellation: Arc::new(CancellationState::new()),
+            };
+            let login = async {
+                let (kind, payload) = read_packet(&mut peer).await;
+                assert_eq!(kind, PacketType::TDSv7Login as u8);
+                let login = LoginMessage::decode(&mut BytesMut::from(&payload[..])).unwrap();
+                let initial = login.integrated_security_bytes().unwrap().to_vec();
+                let mut peer = server(peer).await;
+                let mut rest = Vec::new();
+                peer.read_to_end(&mut rest).await.unwrap();
+                assert!(rest.is_empty(), "unexpected bytes after login: {rest:?}");
+                initial
+            };
+            let client = async {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    connection.sspi_login(sspi, LoginMessage::new(), EncryptionLevel::NotSupported),
+                )
+                .await
+                .expect("login exchange hung");
+                result.map(drop)
+            };
+            let (result, initial) = tokio::join!(client, login);
+            let received = received.lock().unwrap().clone();
+            (result, received, initial)
+        }
+
+        #[tokio::test]
+        async fn a_login_completed_without_a_server_token_needs_one_step() {
+            let (result, received, initial) = exchange(&[b"kerberos"], |mut peer| async move {
+                respond(&mut peer, &[&done()]).await;
+                peer
+            })
+            .await;
+            result.unwrap();
+            assert_eq!(initial, b"kerberos");
+            assert_eq!(received, [None]);
+        }
+
+        #[tokio::test]
+        async fn a_final_server_token_is_consumed_without_a_reply() {
+            let (result, received, _) = exchange(&[b"kerberos"], |mut peer| async move {
+                respond(&mut peer, &[&server_token(b"mutual"), &done()]).await;
+                peer
+            })
+            .await;
+            result.unwrap();
+            assert_eq!(received, [None, Some(b"mutual".to_vec())]);
+        }
+
+        #[tokio::test]
+        async fn a_challenge_is_answered_with_a_raw_sspi_message() {
+            let (result, received, initial) =
+                exchange(&[b"negotiate", b"authenticate"], |mut peer| async move {
+                    respond(&mut peer, &[&server_token(b"challenge")]).await;
+                    let (kind, payload) = read_packet(&mut peer).await;
+                    assert_eq!(kind, PacketType::Sspi as u8);
+                    assert_eq!(payload, b"authenticate");
+                    respond(&mut peer, &[&done()]).await;
+                    peer
+                })
+                .await;
+            result.unwrap();
+            assert_eq!(initial, b"negotiate");
+            assert_eq!(received, [None, Some(b"challenge".to_vec())]);
+        }
+
+        #[tokio::test]
+        async fn a_login_error_fails_the_exchange() {
+            let (result, _, _) = exchange(&[b"negotiate"], |mut peer| async move {
+                let error = encoded(TokenError::new(18456, 1, 14, "Login failed", "srv", "", 1));
+                respond(&mut peer, &[&error, &done()]).await;
+                peer
+            })
+            .await;
+            match result {
+                Err(crate::Error::Server(error)) => assert_eq!(error.code(), 18456),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_challenge_without_a_reply_fails_instead_of_waiting() {
+            let (result, _, _) = exchange(&[b"negotiate", b""], |mut peer| async move {
+                respond(&mut peer, &[&server_token(b"challenge")]).await;
+                peer
+            })
+            .await;
+            assert!(
+                matches!(result, Err(crate::Error::Protocol(_))),
+                "{result:?}"
+            );
+        }
     }
 }
