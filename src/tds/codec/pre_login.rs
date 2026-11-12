@@ -57,32 +57,22 @@ impl PreloginMessage {
         }
     }
 
-    #[cfg(any(
-        feature = "rustls",
-        feature = "native-tls",
-        feature = "vendored-openssl"
-    ))]
-    pub fn negotiated_encryption(&self, expected: EncryptionLevel) -> EncryptionLevel {
-        match (expected, self.encryption) {
-            (EncryptionLevel::NotSupported, EncryptionLevel::NotSupported) => {
-                EncryptionLevel::NotSupported
-            }
-            (EncryptionLevel::Off, EncryptionLevel::Off) => EncryptionLevel::Off,
-            (EncryptionLevel::On, EncryptionLevel::Off)
-            | (EncryptionLevel::On, EncryptionLevel::NotSupported) => {
-                panic!("Server does not allow the requested encryption level.")
-            }
-            (_, _) => EncryptionLevel::On,
-        }
-    }
+    /// Apply the TDS 7 encryption negotiation table. `Off` means login-only
+    /// TLS, `On` full-session TLS, and `NotSupported` an unencrypted session.
+    pub fn negotiated_encryption(&self, expected: EncryptionLevel) -> Result<EncryptionLevel> {
+        use EncryptionLevel::{NotSupported, Off, On, Required};
 
-    #[cfg(not(any(
-        feature = "rustls",
-        feature = "native-tls",
-        feature = "vendored-openssl"
-    )))]
-    pub fn negotiated_encryption(&self, _: EncryptionLevel) -> EncryptionLevel {
-        EncryptionLevel::NotSupported
+        match (expected, self.encryption) {
+            (NotSupported, NotSupported) | (Off, NotSupported) => Ok(NotSupported),
+            (Off, Off) => Ok(Off),
+            (Off | On | Required, On | Required) => Ok(On),
+            (On | Required, Off | NotSupported) => Err(Error::Tls(
+                "Server does not support the required full-session encryption.".into(),
+            )),
+            (NotSupported, Off | On | Required) => Err(Error::Tls(
+                "Server requested TLS, but the client disabled encryption.".into(),
+            )),
+        }
     }
 }
 
@@ -306,5 +296,30 @@ mod tests {
         let decoded = PreloginMessage::decode(&mut payload).expect("decode should succeed");
 
         assert_eq!(prelogin, decoded);
+    }
+
+    #[test]
+    fn encryption_negotiation_table() {
+        use EncryptionLevel::{NotSupported, Off, On, Required};
+        let levels = [Off, On, NotSupported, Required];
+        // Rows are the client setting, columns the server response.
+        let expected = [
+            [Some(Off), Some(On), Some(NotSupported), Some(On)],
+            [None, Some(On), None, Some(On)],
+            [None, None, Some(NotSupported), None],
+            [None, Some(On), None, Some(On)],
+        ];
+
+        for (row, client) in levels.iter().enumerate() {
+            for (column, server) in levels.iter().enumerate() {
+                let mut response = PreloginMessage::new();
+                response.encryption = *server;
+                let actual = response.negotiated_encryption(*client);
+                match expected[row][column] {
+                    Some(level) => assert_eq!(actual.unwrap(), level),
+                    None => assert!(actual.is_err(), "{:?} accepted {:?}", client, server),
+                }
+            }
+        }
     }
 }

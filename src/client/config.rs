@@ -30,6 +30,10 @@ pub struct Config {
     pub(crate) application_name: Option<String>,
     pub(crate) encryption: EncryptionLevel,
     pub(crate) trust: TrustConfig,
+    pub(crate) strict_encryption: bool,
+    pub(crate) certificate_hostname: Option<String>,
+    pub(crate) server_certificate: Option<PathBuf>,
+    trust_cert_requested: bool,
     pub(crate) auth: AuthMethod,
     pub(crate) readonly: bool,
 }
@@ -63,6 +67,10 @@ impl Default for Config {
             )))]
             encryption: EncryptionLevel::NotSupported,
             trust: TrustConfig::Default,
+            strict_encryption: false,
+            certificate_hostname: None,
+            server_certificate: None,
+            trust_cert_requested: false,
             auth: AuthMethod::None,
             readonly: false,
         }
@@ -123,21 +131,121 @@ impl Config {
         self.encryption = encryption;
     }
 
+    /// Enables TLS-first TDS 8.0 (Strict), requiring TLS 1.2 or newer.
+    ///
+    /// Strict never permits certificate-validation bypass or a plaintext fallback.
+    /// Requires the `native-tls` backend.
+    pub fn strict_encryption(&mut self, strict: bool) {
+        self.strict_encryption = strict;
+    }
+
+    /// Overrides the certificate verification name and TLS SNI, not the TCP host.
+    ///
+    /// Cannot be combined with certificate pinning or validation bypass.
+    /// Requires the `native-tls` backend.
+    pub fn certificate_hostname(&mut self, hostname: impl ToString) {
+        self.certificate_hostname = Some(hostname.to_string());
+    }
+
+    /// Pins the exact server leaf certificate from one PEM or DER certificate file.
+    ///
+    /// This replaces chain and hostname verification, but not the TLS handshake.
+    /// Cannot be combined with a custom CA, hostname override, validation bypass,
+    /// or an encryption mode that permits plaintext. File errors are fatal.
+    /// File contents determine the format; bundles and trailing data are rejected.
+    /// Requires the `native-tls` backend.
+    pub fn server_certificate(&mut self, path: impl ToString) {
+        self.server_certificate = Some(PathBuf::from(path.to_string()));
+    }
+
+    pub(crate) fn validate_security(&self) -> crate::Result<()> {
+        let invalid = |message: &str| crate::Error::Tls(message.to_owned());
+        let bypass = self.trust_cert_requested;
+        let ca = matches!(self.trust, TrustConfig::CaCertificateLocation(_));
+
+        if bypass
+            && (ca || self.certificate_hostname.is_some() || self.server_certificate.is_some())
+        {
+            return Err(invalid("Certificate validation bypass conflicts with CA, hostname, or certificate pin settings."));
+        }
+        if self.strict_encryption && bypass {
+            return Err(invalid(
+                "Strict encryption does not permit certificate validation bypass.",
+            ));
+        }
+        if self.strict_encryption
+            && matches!(
+                self.encryption,
+                EncryptionLevel::Off | EncryptionLevel::NotSupported
+            )
+        {
+            return Err(invalid(
+                "Strict encryption conflicts with modes that permit plaintext.",
+            ));
+        }
+        if self.server_certificate.is_some() {
+            if ca || self.certificate_hostname.is_some() {
+                return Err(invalid(
+                    "Certificate pinning conflicts with CA or hostname settings.",
+                ));
+            }
+            if matches!(
+                self.encryption,
+                EncryptionLevel::Off | EncryptionLevel::NotSupported
+            ) {
+                return Err(invalid(
+                    "Certificate pinning requires full-session encryption.",
+                ));
+            }
+        }
+        if self.certificate_hostname.as_ref().is_some_and(|name| {
+            name.is_empty() || name.bytes().any(|c| c.is_ascii_whitespace() || c == 0)
+        }) {
+            return Err(invalid(
+                "The certificate hostname must be nonempty and contain no whitespace or NUL.",
+            ));
+        }
+
+        #[cfg(not(feature = "native-tls"))]
+        if self.strict_encryption
+            || self.certificate_hostname.is_some()
+            || self.server_certificate.is_some()
+        {
+            return Err(invalid("Strict encryption, hostname override, and certificate pinning require the native-tls backend."));
+        }
+        #[cfg(not(any(
+            feature = "native-tls",
+            feature = "rustls",
+            feature = "vendored-openssl"
+        )))]
+        if (bypass && self.encryption != EncryptionLevel::NotSupported)
+            || matches!(
+                self.encryption,
+                EncryptionLevel::On | EncryptionLevel::Required
+            )
+        {
+            return Err(invalid(
+                "The requested encryption settings require a TLS backend.",
+            ));
+        }
+        Ok(())
+    }
+
     /// If set, the server certificate will not be validated and it is accepted
     /// as-is.
     ///
     /// On production setting, the certificate should be added to the local key
     /// storage (or use `trust_cert_ca` instead), using this setting is potentially dangerous.
     ///
-    /// # Panics
-    /// Will panic in case `trust_cert_ca` was called before.
-    ///
     /// - Defaults to `default`, meaning server certificate is validated against system-truststore.
+    ///
+    /// In builds without a TLS backend, this setting is accepted only with
+    /// [`EncryptionLevel::NotSupported`], where it has no effect.
     pub fn trust_cert(&mut self) {
-        if let TrustConfig::CaCertificateLocation(_) = &self.trust {
-            panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
+        self.trust_cert_requested = true;
+        if !matches!(self.trust, TrustConfig::CaCertificateLocation(_)) {
+            self.trust = TrustConfig::TrustAll;
         }
-        self.trust = TrustConfig::TrustAll;
     }
 
     /// If set, the server certificate will be validated against the given CA certificate in
@@ -145,16 +253,12 @@ impl Config {
     /// Useful when using self-signed certificates on the server without having to disable the
     /// trust-chain.
     ///
-    /// # Panics
-    /// Will panic in case `trust_cert` was called before.
-    ///
     /// - Defaults to validating the server certificate is validated against system's certificate storage.
+    /// With `native-tls`, the file must hold exactly one PEM or DER certificate;
+    /// file contents determine the format, and bundles and trailing data are rejected.
+    /// Conflicts with bypass and certificate pinning are reported at connection.
     pub fn trust_cert_ca(&mut self, path: impl ToString) {
-        if let TrustConfig::TrustAll = &self.trust {
-            panic!("'trust_cert' and 'trust_cert_ca' are mutual exclusive! Only use one.")
-        } else {
-            self.trust = TrustConfig::CaCertificateLocation(PathBuf::from(path.to_string()))
-        }
+        self.trust = TrustConfig::CaCertificateLocation(PathBuf::from(path.to_string()));
     }
 
     /// Sets the authentication method.
@@ -387,5 +491,125 @@ pub(crate) trait ConfigString {
             .get("applicationintent")
             .filter(|val| *val == "ReadOnly")
             .is_some()
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn trust_conflicts_are_preserved_in_both_setter_orders() {
+        for ca_first in [true, false] {
+            let mut config = Config::new();
+            if ca_first {
+                config.trust_cert_ca("not-opened");
+                config.trust_cert();
+            } else {
+                config.trust_cert();
+                config.trust_cert_ca("not-opened");
+            }
+            assert!(config.validate_security().is_err());
+        }
+    }
+
+    #[test]
+    fn strict_never_allows_bypass() {
+        let mut config = Config::new();
+        config.strict_encryption(true);
+        config.trust_cert();
+        assert!(config.validate_security().is_err());
+    }
+
+    #[test]
+    fn strict_rejects_plaintext_permitting_modes() {
+        for encryption in [EncryptionLevel::Off, EncryptionLevel::NotSupported] {
+            let mut config = Config::new();
+            config.strict_encryption(true);
+            config.encryption(encryption);
+            assert!(config.validate_security().is_err());
+        }
+    }
+
+    #[test]
+    fn pinning_rejects_competing_verification_and_plaintext_modes() {
+        for conflict in 0..5 {
+            let mut config = Config::new();
+            config.encryption(EncryptionLevel::Required);
+            config.server_certificate("not-opened");
+            match conflict {
+                0 => config.trust_cert_ca("not-opened"),
+                1 => config.certificate_hostname("sql.test"),
+                2 => config.trust_cert(),
+                3 => config.encryption(EncryptionLevel::Off),
+                _ => config.encryption(EncryptionLevel::NotSupported),
+            }
+            assert!(config.validate_security().is_err());
+        }
+    }
+
+    #[test]
+    fn bypass_rejects_hostname_override_in_both_setter_orders() {
+        for hostname_first in [true, false] {
+            let mut config = Config::new();
+            if hostname_first {
+                config.certificate_hostname("sql.test");
+                config.trust_cert();
+            } else {
+                config.trust_cert();
+                config.certificate_hostname("sql.test");
+            }
+            assert!(config.validate_security().is_err());
+        }
+    }
+
+    #[cfg(not(any(
+        feature = "native-tls",
+        feature = "rustls",
+        feature = "vendored-openssl"
+    )))]
+    #[test]
+    fn bypass_without_tls_requires_explicit_plaintext() {
+        for (encryption, accepted) in [
+            (EncryptionLevel::NotSupported, true),
+            (EncryptionLevel::Off, false),
+            (EncryptionLevel::On, false),
+            (EncryptionLevel::Required, false),
+        ] {
+            let mut config = Config::new();
+            config.encryption(encryption);
+            config.trust_cert();
+            assert_eq!(
+                config.validate_security().is_ok(),
+                accepted,
+                "{encryption:?}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "native-tls"))]
+    #[test]
+    fn unsupported_backends_reject_native_certificate_options() {
+        for option in 0..3 {
+            let mut config = Config::new();
+            config.encryption(EncryptionLevel::Required);
+            match option {
+                0 => config.strict_encryption(true),
+                1 => config.certificate_hostname("sql.test"),
+                _ => config.server_certificate("not-opened"),
+            }
+            assert!(config.validate_security().is_err());
+        }
+    }
+
+    #[cfg(all(
+        not(feature = "native-tls"),
+        any(feature = "rustls", feature = "vendored-openssl")
+    ))]
+    #[test]
+    fn other_backends_accept_custom_ca() {
+        let mut config = Config::new();
+        config.trust_cert_ca("not-opened");
+        assert!(config.validate_security().is_ok());
     }
 }
