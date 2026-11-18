@@ -218,7 +218,9 @@ impl Decode<BytesMut> for PreloginMessage {
                     } else if length == 4 {
                         cursor.read_u32::<BigEndian>()?
                     } else {
-                        panic!("should never happen")
+                        return Err(Error::Protocol(
+                            format!("invalid prelogin thread id length: {}", length).into(),
+                        ));
                     }
                 }
                 // mars
@@ -296,6 +298,16 @@ mod tests {
         let decoded = PreloginMessage::decode(&mut payload).expect("decode should succeed");
 
         assert_eq!(prelogin, decoded);
+    }
+
+    #[test]
+    fn prelogin_with_invalid_thread_id_length_is_an_error() {
+        let mut payload = BytesMut::from(&[PRELOGIN_THREADID, 0, 6, 0, 2, 0xff, 0, 0][..]);
+
+        assert!(matches!(
+            PreloginMessage::decode(&mut payload),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]

@@ -433,10 +433,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let id = self.context.next_packet_id();
         self.send(PacketHeader::pre_login(id), msg).await?;
 
-        let response: PreloginMessage = codec::collect_from(self).await?;
-        // threadid (should be empty when sent from server to client)
-        debug_assert_eq!(response.thread_id, 0);
-        Ok(response)
+        codec::collect_from(self).await
     }
 
     /// Defines the login record rules with SQL Server. Authentication with
