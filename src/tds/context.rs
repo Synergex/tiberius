@@ -18,7 +18,6 @@ pub(crate) struct Context {
     packet_size: u32,
     packet_id: u8,
     transaction_desc: [u8; 8],
-    transaction_uncertain: bool,
     transaction_end: Option<TransactionOutcome>,
     last_meta: Option<Arc<TokenColMetaData<'static>>>,
     alt_meta: HashMap<u16, Arc<TokenAltMetaData<'static>>>,
@@ -35,7 +34,6 @@ impl Context {
             packet_size: 4096,
             packet_id: 0,
             transaction_desc: [0; 8],
-            transaction_uncertain: false,
             transaction_end: None,
             last_meta: None,
             alt_meta: HashMap::new(),
@@ -100,16 +98,6 @@ impl Context {
 
     pub fn set_transaction_descriptor(&mut self, desc: [u8; 8]) {
         self.transaction_desc = desc;
-    }
-
-    /// Whether undecodable response tokens were discarded, so the transaction
-    /// descriptor may be stale.
-    pub fn transaction_uncertain(&self) -> bool {
-        self.transaction_uncertain
-    }
-
-    pub fn set_transaction_uncertain(&mut self, uncertain: bool) {
-        self.transaction_uncertain = uncertain;
     }
 
     /// How the server last reported a transaction ending, until it reports
@@ -193,10 +181,6 @@ impl Context {
 
     pub fn set_database(&mut self, database: String) {
         self.database = Some(database);
-    }
-
-    pub fn clear_database(&mut self) {
-        self.database = None;
     }
 
     pub fn set_spn(&mut self, host: impl AsRef<str>, port: u16) {

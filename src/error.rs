@@ -84,7 +84,7 @@ pub enum Error {
 }
 
 /// The lowest severity at which SQL Server ends the connection after an error.
-const FATAL_SEVERITY: u8 = 20;
+pub(crate) const FATAL_SEVERITY: u8 = 20;
 
 impl Error {
     /// True, if the error was caused by a deadlock.

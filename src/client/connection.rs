@@ -11,7 +11,7 @@ use crate::{
             self, Encode, LoginMessage, Packet, PacketCodec, PacketHeader, PacketStatus,
             PreloginMessage, TokenDone,
         },
-        stream::{ReceivedToken, TokenStream},
+        stream::TokenStream,
         Context, HEADER_BYTES,
     },
     EncryptionLevel, SqlReadBytes,
@@ -61,6 +61,17 @@ where
     /// that runs past the buffered bytes fails instead of waiting on the
     /// network for data the server will never send.
     buffered_only: bool,
+    /// Set while a token is decoded, so it stays set when one fails or is
+    /// dropped part-way and the rest of the stream has no token boundary to
+    /// resume from. Every later request fails.
+    mid_token: bool,
+    /// Set for good when a fatal server error ends the session or the
+    /// buffered tail of a response fails to drain. Every later request fails.
+    broken: bool,
+    /// Set once an attention is queued and until its acknowledgment is read,
+    /// so a drain dropped before then is finished by the next one rather than
+    /// leaving the acknowledgment for the next request to read as its own.
+    attention_pending: bool,
     context: Context,
     buf: BytesMut,
     cancellation: Arc<CancellationState>,
@@ -93,6 +104,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             context,
             flushed: false,
             buffered_only: false,
+            mid_token: false,
+            broken: false,
+            attention_pending: false,
             buf: BytesMut::new(),
             cancellation: Arc::new(CancellationState::new()),
         };
@@ -234,9 +248,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     pub(crate) async fn send_attention(&mut self) -> crate::Result<()> {
         let id = self.context.next_packet_id();
         let header = PacketHeader::attention(id);
-        self.write_to_wire(header, BytesMut::new()).await?;
-        self.flush_sink().await?;
-        Ok(())
+        self.flushed = false;
+        self.transport
+            .feed(Packet::new(header, BytesMut::new()))
+            .await?;
+        self.attention_pending = true;
+        self.flush_sink().await
+    }
+
+    /// Records that the acknowledgment of the pending attention was read.
+    pub(crate) fn attention_acknowledged(&mut self) {
+        self.attention_pending = false;
     }
 
     /// Returns a [`CancellationToken`] that can request cancellation of
@@ -253,6 +275,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Clears the cancellation request flag.
     pub(crate) fn clear_cancellation_request(&self) {
         self.cancellation.clear();
+    }
+
+    /// Marks a token as decoding until [`token_decoded`](Self::token_decoded),
+    /// so one that fails or is dropped part-way leaves the connection
+    /// unusable. Call once its type byte is read.
+    pub(crate) fn decoding_token(&mut self) {
+        self.mid_token = true;
+    }
+
+    pub(crate) fn token_decoded(&mut self) {
+        self.mid_token = false;
+    }
+
+    /// Breaks the connection for good when `error` is fatal, since the server
+    /// ends the session after one. Every reader of response tokens calls this
+    /// for each server error it decodes.
+    pub(crate) fn note_server_error(&mut self, error: &codec::TokenError) {
+        self.broken |= error.class() >= crate::error::FATAL_SEVERITY;
+    }
+
+    /// Fails once a token stopped part-way or the connection broke.
+    fn usable(&self) -> crate::Result<()> {
+        if self.mid_token || self.broken {
+            return Err(crate::Error::Protocol(
+                "a response stopped part-way through a token, could not be decoded or \
+                 ended the session, so the connection cannot be used"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Reads the next token-type byte, racing the read against cancellation.
@@ -308,8 +360,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// causing undefined behaviour after previous queries.
     pub async fn flush_stream(&mut self) -> crate::Result<()> {
         self.clear_cancellation_request();
+        self.usable()?;
 
-        if self.flushed && self.buf.is_empty() {
+        if self.flushed && self.buf.is_empty() && !self.attention_pending {
             return Ok(());
         }
 
@@ -319,28 +372,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             "Flushing unhandled stream via attention signal. Please consume your streams!",
         );
 
-        if self.flushed {
+        if self.flushed && !self.attention_pending {
             // Server already finished sending all data (EOM seen), so the rest
             // of the response is buffered. Decode it rather than discard it: a
             // transaction it began or ended changes the descriptor every later
             // request must carry, and SQL Server rejects a stale one.
             if !self.drain_buffered_tokens().await {
-                // Undecodable tokens are dropped, or a fatal error ended the
-                // session. The tracked database becomes unknown and the
-                // transaction descriptor untrusted, so the request fails, and
-                // a commit or rollback keeps failing if the caller goes on.
-                self.buf.truncate(0);
-                self.context.clear_database();
-                self.context.set_transaction_uncertain(true);
-                return Err(crate::Error::Protocol(
-                    "the rest of the previous response could not be decoded".into(),
-                ));
+                // A token could not be decoded, so the session state it
+                // carried is lost.
+                self.broken = true;
             }
-            return Ok(());
+            return self.usable();
         }
 
-        // Server still has data to send. Send attention to cancel quickly.
-        self.send_attention().await?;
+        // Server still has data to send, or owes the acknowledgment of an
+        // attention sent before a drain was dropped. Send attention to cancel
+        // quickly, unless one is already on its way.
+        if self.attention_pending {
+            self.flush_sink().await?;
+        } else {
+            self.send_attention().await?;
+        }
 
         // Drain at the token level until the server's attention
         // acknowledgment (Done+Attention) arrives. We use
@@ -350,33 +402,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let ts = TokenStream::new_with_attention(self);
         ts.flush_to_attention().await?;
 
-        Ok(())
+        self.usable()
     }
 
     /// Decodes the buffered tokens of a fully received response without
-    /// reading the network. Returns whether all of them decoded and none was
-    /// a fatal server error; consuming the bytes alone does not show that.
+    /// reading the network. Returns whether all of them decoded.
     async fn drain_buffered_tokens(&mut self) -> bool {
         self.buffered_only = true;
         let mut tokens = TokenStream::new(self).try_unfold();
-        let mut usable = true;
-        loop {
+        let decoded = loop {
             match tokens.try_next().await {
-                Ok(Some(ReceivedToken::Error(error))) => {
-                    usable &= crate::Error::Server(error).leaves_connection_usable();
-                }
                 Ok(Some(_)) => (),
                 // The token stream raises its first server error again at the end.
-                Ok(None) | Err(crate::Error::Server(_)) => break,
-                Err(_) => {
-                    usable = false;
-                    break;
-                }
+                Ok(None) | Err(crate::Error::Server(_)) => break true,
+                Err(_) => break false,
             }
-        }
+        };
         drop(tokens);
         self.buffered_only = false;
-        usable && self.buf.is_empty()
+        decoded && self.buf.is_empty()
     }
 
     /// True if the underlying stream has no more data and is consumed
@@ -599,6 +643,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 context,
                 flushed: false,
                 buffered_only: false,
+                mid_token: false,
+                broken: false,
+                attention_pending: false,
                 buf: BytesMut::new(),
                 cancellation,
             })
@@ -723,7 +770,52 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tds::codec::{TokenEnvChange, TokenError};
+    use crate::tds::codec::{DoneStatus, PacketType, TokenEnvChange, TokenError};
+    use crate::tds::stream::ReceivedToken;
+    use futures_util::{FutureExt, StreamExt};
+    use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+
+    type Duplex = Compat<tokio::io::DuplexStream>;
+
+    /// A connection to an in-memory server, and the server's end of it.
+    fn duplex(flushed: bool) -> (Connection<Duplex>, Framed<Duplex, PacketCodec>) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let connection = Connection {
+            transport: Framed::new(MaybeTlsStream::Raw(client_io.compat()), PacketCodec),
+            flushed,
+            buffered_only: false,
+            mid_token: false,
+            broken: false,
+            attention_pending: false,
+            context: Context::new(),
+            buf: BytesMut::new(),
+            cancellation: Arc::new(CancellationState::new()),
+        };
+        (connection, Framed::new(server_io.compat(), PacketCodec))
+    }
+
+    /// Sends `payload` from the server in one packet, the last of its
+    /// message when `last`.
+    async fn respond(server: &mut Framed<Duplex, PacketCodec>, payload: BytesMut, last: bool) {
+        let mut header = PacketHeader::new(0, 1);
+        header.set_type(PacketType::TabularResult);
+        header.set_status(if last {
+            PacketStatus::EndOfMessage
+        } else {
+            PacketStatus::NormalMessage
+        });
+        server.send(Packet::new(header, payload)).await.unwrap();
+    }
+
+    fn encoded(done: TokenDone) -> BytesMut {
+        let mut bytes = BytesMut::new();
+        done.encode(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn attention_ack() -> BytesMut {
+        encoded(TokenDone::with_status(DoneStatus::Attention.into(), 0))
+    }
 
     fn buffered(bytes: &[u8]) -> Connection<futures_util::io::Cursor<Vec<u8>>> {
         Connection {
@@ -733,6 +825,9 @@ mod tests {
             ),
             flushed: true,
             buffered_only: false,
+            mid_token: false,
+            broken: false,
+            attention_pending: false,
             context: Context::new(),
             buf: BytesMut::from(bytes),
             cancellation: Arc::new(CancellationState::new()),
@@ -761,21 +856,50 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn commit_fails_after_a_fatal_error_in_the_buffered_tail() {
+    /// A buffered response holding a fatal error, then `rest`.
+    fn fatal_error_then(rest: BytesMut) -> Connection<futures_util::io::Cursor<Vec<u8>>> {
         let mut bytes = BytesMut::new();
         TokenError::new(50001, 1, 20, "fatal", "srv", "", 1)
             .encode(&mut bytes)
             .unwrap();
-        TokenDone::default().encode(&mut bytes).unwrap();
+        bytes.extend_from_slice(&rest);
+        buffered(&bytes)
+    }
+
+    #[tokio::test]
+    async fn commit_fails_after_a_fatal_error_in_the_buffered_tail() {
         let mut client = crate::Client {
-            connection: buffered(&bytes),
+            connection: fatal_error_then(encoded(TokenDone::default())),
         };
         let result = client.commit_transaction().await;
         assert!(
             matches!(result, Err(crate::Error::Protocol(_))),
             "{result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn requests_fail_after_a_request_reads_a_fatal_error() {
+        let mut client = crate::Client {
+            connection: fatal_error_then(encoded(TokenDone::default())),
+        };
+        let mut tokens = TokenStream::new(&mut client.connection).try_unfold();
+        while tokens.try_next().await.is_ok_and(|token| token.is_some()) {}
+        drop(tokens);
+        assert!(client.connection.is_eof());
+        assert_broken(&mut client).await;
+    }
+
+    #[tokio::test]
+    async fn requests_fail_after_a_metadata_only_fetch_reads_a_fatal_error() {
+        let mut client = crate::Client {
+            connection: fatal_error_then(encoded(TokenDone::default())),
+        };
+        let error = crate::client::rpc_response::collect_metadata_only_rpc(&mut client.connection)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(50001));
+        assert_broken(&mut client).await;
     }
 
     #[tokio::test]
@@ -875,28 +999,14 @@ mod tests {
     /// Drops a commit call once it has sent its request, has the server end
     /// the transaction with `change`, and returns what the retry reports.
     async fn retry_after_a_dropped_commit(change: TokenEnvChange) -> crate::TransactionEnd {
-        use crate::tds::codec::{DoneStatus, PacketStatus, PacketType};
-        use futures_util::{FutureExt, StreamExt};
-        use tokio_util::compat::TokioAsyncReadCompatExt;
-
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let mut client = crate::Client {
-            connection: Connection {
-                transport: Framed::new(MaybeTlsStream::Raw(client_io.compat()), PacketCodec),
-                flushed: true,
-                buffered_only: false,
-                context: Context::new(),
-                buf: BytesMut::new(),
-                cancellation: Arc::new(CancellationState::new()),
-            },
-        };
+        let (connection, mut server) = duplex(true);
+        let mut client = crate::Client { connection };
         client
             .connection
             .context_mut()
             .set_transaction_descriptor(DESC);
         assert!(client.commit_transaction().now_or_never().is_none());
 
-        let mut server = Framed::new(server_io.compat(), PacketCodec);
         let request = server.next().await.unwrap().unwrap();
         assert!(matches!(
             request.header().r#type(),
@@ -906,16 +1016,8 @@ mod tests {
         let mut response = BytesMut::new();
         change.encode(&mut response).unwrap();
         TokenDone::default().encode(&mut response).unwrap();
-        let mut ack = BytesMut::new();
-        TokenDone::with_status(DoneStatus::Attention.into(), 0)
-            .encode(&mut ack)
-            .unwrap();
-        for payload in [response, ack] {
-            let mut header = PacketHeader::new(0, 1);
-            header.set_type(PacketType::TabularResult);
-            header.set_status(PacketStatus::EndOfMessage);
-            server.send(Packet::new(header, payload)).await.unwrap();
-        }
+        respond(&mut server, response, true).await;
+        respond(&mut server, attention_ack(), true).await;
 
         client.commit_transaction().await.unwrap()
     }
@@ -999,21 +1101,125 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_request_fails_after_an_undecodable_buffered_tail() {
-        let mut client = crate::Client {
-            connection: buffered(&[0xe3, 0, 0]),
-        };
-        let (_, error) = client
-            .execute_declared_until_error("SELECT 1", "", &[])
-            .await;
-        let error = error.expect("the request must fail");
-        assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
-        assert!(!error.leaves_connection_usable());
+    /// Asserts that requests, and a commit, keep failing with a protocol
+    /// error.
+    async fn assert_broken(client: &mut crate::Client<futures_util::io::Cursor<Vec<u8>>>) {
+        for _ in 0..2 {
+            let (_, error) = client
+                .execute_declared_until_error("SELECT 1", "", &[])
+                .await;
+            let error = error.expect("the request must fail");
+            assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
+            assert!(!error.leaves_connection_usable());
+        }
         assert!(matches!(
             client.commit_transaction().await,
             Err(crate::Error::Protocol(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn requests_fail_after_an_undecodable_buffered_tail() {
+        let mut client = crate::Client {
+            connection: buffered(&[0xe3, 0, 0]),
+        };
+        assert_broken(&mut client).await;
+    }
+
+    #[tokio::test]
+    async fn requests_fail_after_a_token_fails_part_way() {
+        let mut bytes = BytesMut::from(&[0xe3, 0, 0][..]);
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        let mut tokens = TokenStream::new(&mut client.connection).try_unfold();
+        assert!(tokens.try_next().await.is_err());
+        drop(tokens);
+        assert_broken(&mut client).await;
+    }
+
+    #[tokio::test]
+    async fn a_token_dropped_part_way_breaks_the_connection() {
+        let (mut connection, mut server) = duplex(false);
+        // Half of a DONE token, with more of the message to come.
+        respond(
+            &mut server,
+            encoded(TokenDone::default()).split_to(5),
+            false,
+        )
+        .await;
+
+        let mut tokens = TokenStream::new(&mut connection).try_unfold();
+        assert!(tokens.try_next().now_or_never().is_none());
+        drop(tokens);
+        assert!(matches!(
+            connection.flush_stream().now_or_never(),
+            Some(Err(crate::Error::Protocol(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_that_reads_a_fatal_error_reports_it() {
+        // Asked to cancel, the client sends an attention, and the server
+        // acknowledges it after the fatal error.
+        let mut connection = fatal_error_then(attention_ack());
+        connection.cancellation_token().cancel();
+        let error = TokenStream::new(&mut connection)
+            .try_unfold()
+            .try_next()
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(50001), "{error:?}");
+        assert!(!error.leaves_connection_usable());
+
+        let mut connection = fatal_error_then(attention_ack());
+        connection.cancellation_token().cancel();
+        let error = crate::client::rpc_response::collect_metadata_only_rpc(&mut connection)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(50001), "{error:?}");
+        assert!(!error.leaves_connection_usable());
+    }
+
+    #[tokio::test]
+    async fn a_retry_reads_the_ack_a_dropped_flush_left_pending() {
+        let (mut connection, mut server) = duplex(false);
+        // The end of the response the flush abandons; its ack comes later.
+        respond(&mut server, encoded(TokenDone::default()), true).await;
+        assert!(connection.flush_stream().now_or_never().is_none());
+        assert!(connection.is_eof());
+        respond(&mut server, attention_ack(), true).await;
+        connection.flush_stream().await.unwrap();
+
+        // The next request, and its response.
+        let id = connection.context_mut().next_packet_id();
+        connection
+            .write_to_wire(PacketHeader::batch(id), BytesMut::new())
+            .await
+            .unwrap();
+        respond(&mut server, encoded(TokenDone::with_rows(7)), true).await;
+        let mut tokens = TokenStream::new(&mut connection).try_unfold();
+        let token = tokens.try_next().await.unwrap();
+        assert!(
+            matches!(&token, Some(ReceivedToken::Done(done)) if done.rows() == 7),
+            "{token:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_waits_for_the_ack_instead_of_sending_another_attention() {
+        let (mut connection, mut server) = duplex(false);
+        assert!(connection.flush_stream().now_or_never().is_none());
+        respond(&mut server, attention_ack(), true).await;
+        connection.flush_stream().await.unwrap();
+
+        let attention = server.next().await.unwrap().unwrap();
+        assert!(matches!(
+            attention.header().r#type(),
+            PacketType::AttentionSignal
+        ));
+        assert!(server.next().now_or_never().is_none());
     }
 
     #[tokio::test]

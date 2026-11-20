@@ -195,6 +195,7 @@ where
 
     async fn get_error(&mut self) -> crate::Result<ReceivedToken> {
         let err = TokenError::decode(self.conn).await?;
+        self.conn.note_server_error(&err);
 
         self.last_error =
             Error::add_server_error(self.last_error.take(), Error::Server(err.clone()));
@@ -353,6 +354,7 @@ where
                     }
                 };
 
+                this.conn.decoding_token();
                 let ty = TokenType::try_from(ty_byte).map_err(|_| {
                     Error::Protocol(format!("invalid token type {:x}", ty_byte).into())
                 })?;
@@ -382,6 +384,7 @@ where
                     TokenType::FedAuthInfo => this.get_fed_auth_info().await,
                 }
                 .map_err(Error::into_decode_failure)?;
+                this.conn.token_decoded();
 
                 // When draining after attention, skip all tokens until we see
                 // Done+Attention, then terminate the stream.
@@ -392,10 +395,13 @@ where
                         | ReceivedToken::DoneInProc(done)
                             if done.status().contains(DoneStatus::Attention) =>
                         {
-                            return if this.canceled {
-                                Err(Error::Canceled)
-                            } else {
-                                Ok(None)
+                            this.conn.attention_acknowledged();
+                            return match this.last_error.take() {
+                                // A fatal error ended the session, which a
+                                // cancellation does not undo.
+                                Some(error) if !error.leaves_connection_usable() => Err(error),
+                                _ if this.canceled => Err(Error::Canceled),
+                                _ => Ok(None),
                             };
                         }
                         _ => continue,

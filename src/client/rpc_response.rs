@@ -393,6 +393,7 @@ where
                 return Err(crate::Error::Canceled);
             }
         };
+        conn.decoding_token();
         let ty = TokenType::try_from(ty_byte).map_err(|_| {
             crate::Error::Protocol(format!("invalid token type {:x}", ty_byte).into())
         })?;
@@ -405,6 +406,7 @@ where
                 if !metadata.columns.is_empty() {
                     let columns = metadata.columns().collect();
                     conn.context_mut().set_last_meta(Arc::new(metadata));
+                    conn.token_decoded();
                     conn.flush_stream().await?;
                     return Ok(columns);
                 }
@@ -427,6 +429,7 @@ where
                     .await
                     .map_err(crate::Error::into_decode_failure)?;
                 if !done.status().contains(DoneStatus::More) {
+                    conn.token_decoded();
                     break;
                 }
             }
@@ -434,6 +437,7 @@ where
                 let err = TokenError::decode(conn)
                     .await
                     .map_err(crate::Error::into_decode_failure)?;
+                conn.note_server_error(&err);
                 last_error =
                     crate::Error::add_server_error(last_error.take(), crate::Error::Server(err));
             }
@@ -488,6 +492,7 @@ where
                 ));
             }
         }
+        conn.token_decoded();
     }
 
     if let Some(err) = last_error {

@@ -128,8 +128,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     }
 
     /// The current database, as last reported by the server. `None` until
-    /// the server reports one, and again after unread results were
-    /// discarded, since they may have held a database change.
+    /// the server reports one.
     pub fn database(&self) -> Option<&str> {
         self.connection.context().database()
     }
@@ -360,9 +359,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// [`TransactionEnd::Ended`]. When the server has reported no open
     /// transaction on this connection, returns without contacting the server
     /// how the last one ended: see [`TransactionEnd`]. Fails with a protocol
-    /// error, which leaves the connection unusable, when an undecodable
-    /// response was discarded or ended with a fatal error, and the
-    /// transaction state is unknown.
+    /// error, which leaves the connection unusable, once a response stopped
+    /// part-way through a token, could not be decoded or ended the session,
+    /// since the transaction state is then unknown.
     pub async fn commit_transaction(&mut self) -> crate::Result<TransactionEnd> {
         self.end_transaction(TransactionOutcome::Commit).await
     }
@@ -379,11 +378,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     ) -> crate::Result<TransactionEnd> {
         self.connection.flush_stream().await?;
         let context = self.connection.context();
-        if context.transaction_uncertain() {
-            return Err(crate::Error::Protocol(
-                "transaction state was lost with an undecodable or fatal response".into(),
-            ));
-        }
         let descriptor = context.transaction_descriptor();
         if descriptor == [0; 8] {
             return Ok(match context.transaction_end() {
