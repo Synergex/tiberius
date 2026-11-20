@@ -62,6 +62,7 @@ pub struct RpcParam<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RpcProcId {
     CursorOpen = 2,
+    CursorExecute = 4,
     CursorPrepExec = 5,
     CursorUnprepare = 6,
     CursorFetch = 7,

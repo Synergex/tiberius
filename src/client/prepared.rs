@@ -93,7 +93,7 @@ impl PreparedStatement {
 
     /// The parameter definitions string supplied at prepare time — the
     /// verbatim T-SQL declaration (e.g. `"@P1 int, @P2 nvarchar(50)"`).
-    /// Parameter names passed at execute time must match these declarations.
+    /// Values passed at execute time bind to these declarations in order.
     pub fn param_defs(&self) -> &str {
         &self.param_defs
     }
@@ -145,6 +145,72 @@ impl PreparedStatement {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        self.release(client).await
+    }
+
+    /// Executes the statement a last time and then releases it, as
+    /// [`execute`](Self::execute) followed by [`unprepare`](Self::unprepare)
+    /// would. Returns the row counts reported before the execution's first
+    /// error, with that error.
+    ///
+    /// The release is attempted even when the execution fails or is
+    /// canceled, as long as the connection can still carry a request. When
+    /// both fail, the error is [`CleanupFailed`](crate::error::Error::CleanupFailed),
+    /// which keeps the execution's error and its code. An execution error
+    /// that leaves the connection unusable, such as an I/O or protocol error,
+    /// is returned without attempting the release. Whenever the error's
+    /// [`leaves_connection_usable`](crate::error::Error::leaves_connection_usable)
+    /// is `false`, the connection should be discarded, which frees the
+    /// handle.
+    pub async fn execute_and_unprepare<S>(
+        mut self,
+        client: &mut Client<S>,
+        params: &[&dyn ToSql],
+    ) -> (ExecuteResult, Option<crate::Error>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        // The release is not sent in the execution's request: an attention
+        // aborts the whole request it interrupts, so a release that had not
+        // yet run would be lost along with this consumed statement.
+        let (result, error) = self.execute_until_error(client, params).await;
+        if error
+            .as_ref()
+            .is_some_and(|error| !error.leaves_connection_usable())
+        {
+            return (result, error);
+        }
+        let released = self.release(client).await;
+        (result, crate::Error::with_cleanup(error, released))
+    }
+
+    /// Executes the statement like [`execute`](Self::execute), but returns
+    /// the row counts the server reported before the first error, with that
+    /// error, as
+    /// [`Client::execute_declared_until_error`](crate::Client::execute_declared_until_error)
+    /// does.
+    pub async fn execute_until_error<S>(
+        &self,
+        client: &mut Client<S>,
+        params: &[&dyn ToSql],
+    ) -> (ExecuteResult, Option<crate::Error>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        if let Err(error) = client.connection.flush_stream().await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        let rpc_params = build_execute_params(self.handle, params);
+        if let Err(error) = client.send_rpc(RpcProcId::Execute, rpc_params).await {
+            return (ExecuteResult::empty(), Some(error));
+        }
+        ExecuteResult::until_error(&mut client.connection).await
+    }
+
+    async fn release<S>(&mut self, client: &mut Client<S>) -> crate::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         client.connection.flush_stream().await?;
         let handle_param = RpcParam {
             name: Cow::Borrowed(""),
@@ -177,6 +243,18 @@ impl Drop for PreparedStatement {
     }
 }
 
+/// A value bound by position rather than by name. SQL Server matches each
+/// named value against the declarations, which costs more with every
+/// parameter; positional values bind to the declarations in order.
+pub(crate) fn positional_param(value: ColumnData<'_>) -> RpcParam<'_> {
+    RpcParam {
+        name: Cow::Borrowed(""),
+        flags: BitFlags::empty(),
+        type_info: None,
+        value,
+    }
+}
+
 /// Build the RPC parameter list for `sp_execute`: `[@handle, @P1, @P2, ...]`.
 fn build_execute_params<'a>(
     handle: PreparedHandle,
@@ -189,14 +267,7 @@ fn build_execute_params<'a>(
         type_info: None,
         value: ColumnData::I32(Some(handle.as_i32())),
     });
-    for (i, p) in params.iter().enumerate() {
-        rpc_params.push(RpcParam {
-            name: Cow::Owned(format!("@P{}", i + 1)),
-            flags: BitFlags::empty(),
-            type_info: None,
-            value: p.to_sql(),
-        });
-    }
+    rpc_params.extend(params.iter().map(|p| positional_param(p.to_sql())));
     rpc_params
 }
 
@@ -264,14 +335,7 @@ pub(crate) fn build_prepexec_params<'a>(
         type_info: None,
         value: ColumnData::String(Some(sql)),
     });
-    for (i, p) in params.iter().enumerate() {
-        rpc_params.push(RpcParam {
-            name: Cow::Owned(format!("@P{}", i + 1)),
-            flags: BitFlags::empty(),
-            type_info: None,
-            value: p.to_sql(),
-        });
-    }
+    rpc_params.extend(params.iter().map(|p| positional_param(p.to_sql())));
     rpc_params
 }
 
