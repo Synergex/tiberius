@@ -11,13 +11,13 @@ use crate::{
             self, Encode, LoginMessage, Packet, PacketCodec, PacketHeader, PacketStatus,
             PreloginMessage, TokenDone,
         },
-        stream::TokenStream,
+        stream::{ReceivedToken, TokenStream},
         Context, HEADER_BYTES,
     },
     EncryptionLevel, SqlReadBytes,
 };
 use asynchronous_codec::Framed;
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 #[cfg(any(windows, feature = "integrated-auth-gssapi"))]
 use codec::TokenSspi;
 use futures_util::future::{select, Either};
@@ -57,6 +57,10 @@ where
 {
     transport: Framed<MaybeTlsStream<S>, PacketCodec>,
     flushed: bool,
+    /// Set while decoding the tail of a fully received response, so a token
+    /// that runs past the buffered bytes fails instead of waiting on the
+    /// network for data the server will never send.
+    buffered_only: bool,
     context: Context,
     buf: BytesMut,
     cancellation: Arc<CancellationState>,
@@ -88,6 +92,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             transport,
             context,
             flushed: false,
+            buffered_only: false,
             buf: BytesMut::new(),
             cancellation: Arc::new(CancellationState::new()),
         };
@@ -315,12 +320,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         );
 
         if self.flushed {
-            // Server already finished sending all data (EOM seen), but some
-            // token data remains buffered. Just discard it. A database change
-            // in the discarded tokens is never seen, so the tracked database
-            // becomes unknown rather than stale.
-            self.buf.truncate(0);
-            self.context.clear_database();
+            // Server already finished sending all data (EOM seen), so the rest
+            // of the response is buffered. Decode it rather than discard it: a
+            // transaction it began or ended changes the descriptor every later
+            // request must carry, and SQL Server rejects a stale one.
+            if !self.drain_buffered_tokens().await {
+                // Undecodable tokens are dropped, or a fatal error ended the
+                // session. The tracked database becomes unknown and the
+                // transaction descriptor untrusted, so the request fails, and
+                // a commit or rollback keeps failing if the caller goes on.
+                self.buf.truncate(0);
+                self.context.clear_database();
+                self.context.set_transaction_uncertain(true);
+                return Err(crate::Error::Protocol(
+                    "the rest of the previous response could not be decoded".into(),
+                ));
+            }
             return Ok(());
         }
 
@@ -336,6 +351,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         ts.flush_to_attention().await?;
 
         Ok(())
+    }
+
+    /// Decodes the buffered tokens of a fully received response without
+    /// reading the network. Returns whether all of them decoded and none was
+    /// a fatal server error; consuming the bytes alone does not show that.
+    async fn drain_buffered_tokens(&mut self) -> bool {
+        self.buffered_only = true;
+        let mut tokens = TokenStream::new(self).try_unfold();
+        let mut usable = true;
+        loop {
+            match tokens.try_next().await {
+                Ok(Some(ReceivedToken::Error(error))) => {
+                    usable &= crate::Error::Server(error).leaves_connection_usable();
+                }
+                Ok(Some(_)) => (),
+                // The token stream raises its first server error again at the end.
+                Ok(None) | Err(crate::Error::Server(_)) => break,
+                Err(_) => {
+                    usable = false;
+                    break;
+                }
+            }
+        }
+        drop(tokens);
+        self.buffered_only = false;
+        usable && self.buf.is_empty()
     }
 
     /// True if the underlying stream has no more data and is consumed
@@ -557,6 +598,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 transport,
                 context,
                 flushed: false,
+                buffered_only: false,
                 buf: BytesMut::new(),
                 cancellation,
             })
@@ -621,11 +663,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> futures_util::io::AsyncRead for C
         let size = buf.len();
 
         if this.buf.len() < size {
+            if this.buffered_only {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "token runs past the buffered response",
+                )));
+            }
             while let Some(item) = ready!(Pin::new(&mut this).try_poll_next(cx)) {
                 match item {
                     Ok(packet) => {
                         let (_, payload) = packet.into_parts();
-                        this.buf.extend(payload);
+                        this.buf.extend_from_slice(&payload);
 
                         if this.buf.len() >= size {
                             break;
@@ -649,7 +697,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> futures_util::io::AsyncRead for C
             }
         }
 
-        buf.copy_from_slice(this.buf.split_to(size).as_ref());
+        buf.copy_from_slice(&this.buf[..size]);
+        this.buf.advance(size);
         Poll::Ready(Ok(size))
     }
 }
@@ -668,5 +717,320 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
     /// A mutable reference to the current execution context.
     fn context_mut(&mut self) -> &mut Context {
         &mut self.context
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::{TokenEnvChange, TokenError};
+
+    fn buffered(bytes: &[u8]) -> Connection<futures_util::io::Cursor<Vec<u8>>> {
+        Connection {
+            transport: Framed::new(
+                MaybeTlsStream::Raw(futures_util::io::Cursor::new(Vec::new())),
+                PacketCodec,
+            ),
+            flushed: true,
+            buffered_only: false,
+            context: Context::new(),
+            buf: BytesMut::from(bytes),
+            cancellation: Arc::new(CancellationState::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_that_fails_to_decode_is_a_protocol_error() {
+        // ENVCHANGE database change whose new name is an unpaired surrogate.
+        let mut connection = buffered(&[0xe3, 5, 0, 1, 1, 0x00, 0xd8, 0, 0xfd]);
+        let mut tokens = TokenStream::new(&mut connection).try_unfold();
+        let error = tokens.try_next().await.unwrap_err();
+        assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
+        assert!(!error.leaves_connection_usable());
+    }
+
+    #[tokio::test]
+    async fn commit_fails_after_an_undecodable_buffered_tail() {
+        let mut client = crate::Client {
+            connection: buffered(&[0xe3, 0, 0]),
+        };
+        let result = client.commit_transaction().await;
+        assert!(
+            matches!(result, Err(crate::Error::Protocol(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_fails_after_a_fatal_error_in_the_buffered_tail() {
+        let mut bytes = BytesMut::new();
+        TokenError::new(50001, 1, 20, "fatal", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        let result = client.commit_transaction().await;
+        assert!(
+            matches!(result, Err(crate::Error::Protocol(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nonfatal_error_in_the_buffered_tail_keeps_the_connection() {
+        let mut bytes = BytesMut::new();
+        TokenError::new(2627, 1, 14, "duplicate", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        assert!(matches!(
+            client.commit_transaction().await,
+            Ok(crate::TransactionEnd::NoTransaction)
+        ));
+    }
+
+    /// Ends a transaction the server reports in a buffered response tail
+    /// made of `changes`, then asks the client to commit and to roll back.
+    async fn end_after(changes: Vec<TokenEnvChange>) -> [crate::TransactionEnd; 2] {
+        let mut bytes = BytesMut::new();
+        for change in changes {
+            change.encode(&mut bytes).unwrap();
+        }
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        [
+            client.commit_transaction().await.unwrap(),
+            client.rollback_transaction().await.unwrap(),
+        ]
+    }
+
+    const DESC: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    #[tokio::test]
+    async fn a_server_rollback_is_reported_until_another_transaction_begins() {
+        use crate::TransactionEnd::AlreadyRolledBack;
+        let rollback = TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        let ends = end_after(vec![TokenEnvChange::BeginTransaction(DESC), rollback]).await;
+        assert_eq!(ends, [AlreadyRolledBack, AlreadyRolledBack]);
+    }
+
+    #[tokio::test]
+    async fn a_tsql_commit_is_reported() {
+        use crate::TransactionEnd::AlreadyCommitted;
+        let commit = TokenEnvChange::CommitTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        let ends = end_after(vec![TokenEnvChange::BeginTransaction(DESC), commit]).await;
+        assert_eq!(ends, [AlreadyCommitted, AlreadyCommitted]);
+    }
+
+    #[tokio::test]
+    async fn a_connection_reset_forgets_how_the_last_transaction_ended() {
+        use crate::TransactionEnd::NoTransaction;
+        let rollback = TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        let ends = end_after(vec![
+            TokenEnvChange::BeginTransaction(DESC),
+            rollback,
+            TokenEnvChange::ResetConnection,
+        ])
+        .await;
+        assert_eq!(ends, [NoTransaction, NoTransaction]);
+    }
+
+    #[tokio::test]
+    async fn a_begin_forgets_how_the_last_transaction_ended() {
+        let mut bytes = BytesMut::new();
+        TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        TokenEnvChange::BeginTransaction(DESC)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut connection = buffered(&bytes);
+        let mut tokens = TokenStream::new(&mut connection).try_unfold();
+        while tokens.try_next().await.unwrap().is_some() {}
+        drop(tokens);
+        assert_eq!(connection.context().transaction_descriptor(), DESC);
+        assert_eq!(connection.context().transaction_end(), None);
+    }
+
+    /// Drops a commit call once it has sent its request, has the server end
+    /// the transaction with `change`, and returns what the retry reports.
+    async fn retry_after_a_dropped_commit(change: TokenEnvChange) -> crate::TransactionEnd {
+        use crate::tds::codec::{DoneStatus, PacketStatus, PacketType};
+        use futures_util::{FutureExt, StreamExt};
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut client = crate::Client {
+            connection: Connection {
+                transport: Framed::new(MaybeTlsStream::Raw(client_io.compat()), PacketCodec),
+                flushed: true,
+                buffered_only: false,
+                context: Context::new(),
+                buf: BytesMut::new(),
+                cancellation: Arc::new(CancellationState::new()),
+            },
+        };
+        client
+            .connection
+            .context_mut()
+            .set_transaction_descriptor(DESC);
+        assert!(client.commit_transaction().now_or_never().is_none());
+
+        let mut server = Framed::new(server_io.compat(), PacketCodec);
+        let request = server.next().await.unwrap().unwrap();
+        assert!(matches!(
+            request.header().r#type(),
+            PacketType::TransactionManagerReq
+        ));
+        // The commit's response, then the ack of the retry's attention.
+        let mut response = BytesMut::new();
+        change.encode(&mut response).unwrap();
+        TokenDone::default().encode(&mut response).unwrap();
+        let mut ack = BytesMut::new();
+        TokenDone::with_status(DoneStatus::Attention.into(), 0)
+            .encode(&mut ack)
+            .unwrap();
+        for payload in [response, ack] {
+            let mut header = PacketHeader::new(0, 1);
+            header.set_type(PacketType::TabularResult);
+            header.set_status(PacketStatus::EndOfMessage);
+            server.send(Packet::new(header, payload)).await.unwrap();
+        }
+
+        client.commit_transaction().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_retry_reports_how_a_dropped_commit_ended() {
+        let commit = TokenEnvChange::CommitTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        assert_eq!(
+            retry_after_a_dropped_commit(commit).await,
+            crate::TransactionEnd::AlreadyCommitted
+        );
+        let rollback = TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        assert_eq!(
+            retry_after_a_dropped_commit(rollback).await,
+            crate::TransactionEnd::AlreadyRolledBack
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_only_fetch_records_a_transaction_it_begins() {
+        use crate::tds::codec::{BaseMetaDataColumn, MetaDataColumn, TokenColMetaData};
+        let mut bytes = BytesMut::new();
+        TokenEnvChange::BeginTransaction(DESC)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenColMetaData {
+            columns: vec![MetaDataColumn {
+                base: BaseMetaDataColumn {
+                    user_type: 0,
+                    flags: enumflags2::BitFlags::empty(),
+                    ty: crate::TypeInfo::FixedLen(crate::FixedLenType::Int4),
+                    table_name: None,
+                },
+                col_name: "v".into(),
+            }],
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut connection = buffered(&bytes);
+        let columns = crate::client::rpc_response::collect_metadata_only_rpc(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(columns.len(), 1);
+        assert_eq!(connection.context().transaction_descriptor(), DESC);
+    }
+
+    #[tokio::test]
+    async fn a_metadata_only_fetch_records_a_server_rollback() {
+        let mut bytes = BytesMut::new();
+        TokenError::new(8134, 1, 16, "divide by zero", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        client
+            .connection
+            .context_mut()
+            .set_transaction_descriptor(DESC);
+        let error = crate::client::rpc_response::collect_metadata_only_rpc(&mut client.connection)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(8134));
+        assert_eq!(
+            client.commit_transaction().await.unwrap(),
+            crate::TransactionEnd::AlreadyRolledBack
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_fails_after_an_undecodable_buffered_tail() {
+        let mut client = crate::Client {
+            connection: buffered(&[0xe3, 0, 0]),
+        };
+        let (_, error) = client
+            .execute_declared_until_error("SELECT 1", "", &[])
+            .await;
+        let error = error.expect("the request must fail");
+        assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
+        assert!(!error.leaves_connection_usable());
+        assert!(matches!(
+            client.commit_transaction().await,
+            Err(crate::Error::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_later_fatal_error_keeps_the_first_code_and_ends_the_connection() {
+        let mut bytes = BytesMut::new();
+        TokenError::new(16917, 1, 16, "cursor is not open", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenError::new(50002, 1, 20, "fatal", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut connection = buffered(&bytes);
+        let error = crate::client::rpc_response::collect_rpc_outputs(&mut connection)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(16917));
+        assert!(!error.leaves_connection_usable(), "{error:?}");
     }
 }

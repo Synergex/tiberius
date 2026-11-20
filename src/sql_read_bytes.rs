@@ -60,9 +60,7 @@ macro_rules! varchar_reader {
 
                 // Everything's read, we can return the string.
                 if *me.read == len {
-                    let s = String::from_utf16(&buf).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-16 data.")
-                    })?;
+                    let s = String::from_utf16_lossy(&buf);
 
                     return Poll::Ready(Ok(s));
                 }
@@ -82,9 +80,7 @@ macro_rules! varchar_reader {
                 }
 
                 // Everything's read, we can return the string.
-                let s = String::from_utf16(&buf).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-16 data.")
-                })?;
+                let s = String::from_utf16_lossy(&buf);
 
                 return Poll::Ready(Ok(s));
             }
