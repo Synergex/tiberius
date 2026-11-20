@@ -256,54 +256,10 @@ where
 
     async fn get_env_change(&mut self) -> crate::Result<ReceivedToken> {
         let change = TokenEnvChange::decode(self.conn).await?;
-
-        match &change {
-            TokenEnvChange::PacketSize(new_size, _) => {
-                self.conn.context_mut().set_packet_size(*new_size);
-            }
-            TokenEnvChange::BeginTransaction(desc) => {
-                self.conn.context_mut().set_transaction_descriptor(*desc);
-            }
-            TokenEnvChange::EnlistDtcTransaction(desc) => {
-                self.conn.context_mut().set_transaction_descriptor(*desc);
-            }
-            TokenEnvChange::CommitTransaction { new, .. } => {
-                self.update_transaction_descriptor(new);
-            }
-            TokenEnvChange::RollbackTransaction { new, .. } => {
-                self.update_transaction_descriptor(new);
-            }
-            TokenEnvChange::DefectTransaction { new, .. } => {
-                self.update_transaction_descriptor(new);
-            }
-            TokenEnvChange::PromoteTransaction { dtc, .. } => {
-                self.update_transaction_descriptor(dtc);
-            }
-            TokenEnvChange::TransactionEnded { new, .. } => {
-                self.update_transaction_descriptor(new);
-            }
-            TokenEnvChange::ResetConnection => {
-                self.conn.context_mut().set_transaction_descriptor([0; 8]);
-            }
-            TokenEnvChange::Database(new, _) => {
-                self.conn.context_mut().set_database(new.clone());
-            }
-            _ => (),
-        }
-
+        self.conn.context_mut().apply_env_change(&change);
         event!(Level::INFO, "{}", change);
 
         Ok(ReceivedToken::EnvChange(change))
-    }
-
-    fn update_transaction_descriptor(&mut self, bytes: &[u8]) {
-        if bytes.len() == 8 {
-            let mut desc = [0u8; 8];
-            desc.copy_from_slice(bytes);
-            self.conn.context_mut().set_transaction_descriptor(desc);
-        } else {
-            self.conn.context_mut().set_transaction_descriptor([0; 8]);
-        }
     }
 
     async fn get_info(&mut self) -> crate::Result<ReceivedToken> {

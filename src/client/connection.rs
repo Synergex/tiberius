@@ -723,7 +723,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tds::codec::TokenError;
+    use crate::tds::codec::{TokenEnvChange, TokenError};
 
     fn buffered(bytes: &[u8]) -> Connection<futures_util::io::Cursor<Vec<u8>>> {
         Connection {
@@ -788,7 +788,215 @@ mod tests {
         let mut client = crate::Client {
             connection: buffered(&bytes),
         };
-        assert!(matches!(client.commit_transaction().await, Ok(false)));
+        assert!(matches!(
+            client.commit_transaction().await,
+            Ok(crate::TransactionEnd::NoTransaction)
+        ));
+    }
+
+    /// Ends a transaction the server reports in a buffered response tail
+    /// made of `changes`, then asks the client to commit and to roll back.
+    async fn end_after(changes: Vec<TokenEnvChange>) -> [crate::TransactionEnd; 2] {
+        let mut bytes = BytesMut::new();
+        for change in changes {
+            change.encode(&mut bytes).unwrap();
+        }
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        [
+            client.commit_transaction().await.unwrap(),
+            client.rollback_transaction().await.unwrap(),
+        ]
+    }
+
+    const DESC: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    #[tokio::test]
+    async fn a_server_rollback_is_reported_until_another_transaction_begins() {
+        use crate::TransactionEnd::AlreadyRolledBack;
+        let rollback = TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        let ends = end_after(vec![TokenEnvChange::BeginTransaction(DESC), rollback]).await;
+        assert_eq!(ends, [AlreadyRolledBack, AlreadyRolledBack]);
+    }
+
+    #[tokio::test]
+    async fn a_tsql_commit_is_reported() {
+        use crate::TransactionEnd::AlreadyCommitted;
+        let commit = TokenEnvChange::CommitTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        let ends = end_after(vec![TokenEnvChange::BeginTransaction(DESC), commit]).await;
+        assert_eq!(ends, [AlreadyCommitted, AlreadyCommitted]);
+    }
+
+    #[tokio::test]
+    async fn a_connection_reset_forgets_how_the_last_transaction_ended() {
+        use crate::TransactionEnd::NoTransaction;
+        let rollback = TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        let ends = end_after(vec![
+            TokenEnvChange::BeginTransaction(DESC),
+            rollback,
+            TokenEnvChange::ResetConnection,
+        ])
+        .await;
+        assert_eq!(ends, [NoTransaction, NoTransaction]);
+    }
+
+    #[tokio::test]
+    async fn a_begin_forgets_how_the_last_transaction_ended() {
+        let mut bytes = BytesMut::new();
+        TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        TokenEnvChange::BeginTransaction(DESC)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut connection = buffered(&bytes);
+        let mut tokens = TokenStream::new(&mut connection).try_unfold();
+        while tokens.try_next().await.unwrap().is_some() {}
+        drop(tokens);
+        assert_eq!(connection.context().transaction_descriptor(), DESC);
+        assert_eq!(connection.context().transaction_end(), None);
+    }
+
+    /// Drops a commit call once it has sent its request, has the server end
+    /// the transaction with `change`, and returns what the retry reports.
+    async fn retry_after_a_dropped_commit(change: TokenEnvChange) -> crate::TransactionEnd {
+        use crate::tds::codec::{DoneStatus, PacketStatus, PacketType};
+        use futures_util::{FutureExt, StreamExt};
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut client = crate::Client {
+            connection: Connection {
+                transport: Framed::new(MaybeTlsStream::Raw(client_io.compat()), PacketCodec),
+                flushed: true,
+                buffered_only: false,
+                context: Context::new(),
+                buf: BytesMut::new(),
+                cancellation: Arc::new(CancellationState::new()),
+            },
+        };
+        client
+            .connection
+            .context_mut()
+            .set_transaction_descriptor(DESC);
+        assert!(client.commit_transaction().now_or_never().is_none());
+
+        let mut server = Framed::new(server_io.compat(), PacketCodec);
+        let request = server.next().await.unwrap().unwrap();
+        assert!(matches!(
+            request.header().r#type(),
+            PacketType::TransactionManagerReq
+        ));
+        // The commit's response, then the ack of the retry's attention.
+        let mut response = BytesMut::new();
+        change.encode(&mut response).unwrap();
+        TokenDone::default().encode(&mut response).unwrap();
+        let mut ack = BytesMut::new();
+        TokenDone::with_status(DoneStatus::Attention.into(), 0)
+            .encode(&mut ack)
+            .unwrap();
+        for payload in [response, ack] {
+            let mut header = PacketHeader::new(0, 1);
+            header.set_type(PacketType::TabularResult);
+            header.set_status(PacketStatus::EndOfMessage);
+            server.send(Packet::new(header, payload)).await.unwrap();
+        }
+
+        client.commit_transaction().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_retry_reports_how_a_dropped_commit_ended() {
+        let commit = TokenEnvChange::CommitTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        assert_eq!(
+            retry_after_a_dropped_commit(commit).await,
+            crate::TransactionEnd::AlreadyCommitted
+        );
+        let rollback = TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        };
+        assert_eq!(
+            retry_after_a_dropped_commit(rollback).await,
+            crate::TransactionEnd::AlreadyRolledBack
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_only_fetch_records_a_transaction_it_begins() {
+        use crate::tds::codec::{BaseMetaDataColumn, MetaDataColumn, TokenColMetaData};
+        let mut bytes = BytesMut::new();
+        TokenEnvChange::BeginTransaction(DESC)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenColMetaData {
+            columns: vec![MetaDataColumn {
+                base: BaseMetaDataColumn {
+                    user_type: 0,
+                    flags: enumflags2::BitFlags::empty(),
+                    ty: crate::TypeInfo::FixedLen(crate::FixedLenType::Int4),
+                    table_name: None,
+                },
+                col_name: "v".into(),
+            }],
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut connection = buffered(&bytes);
+        let columns = crate::client::rpc_response::collect_metadata_only_rpc(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(columns.len(), 1);
+        assert_eq!(connection.context().transaction_descriptor(), DESC);
+    }
+
+    #[tokio::test]
+    async fn a_metadata_only_fetch_records_a_server_rollback() {
+        let mut bytes = BytesMut::new();
+        TokenError::new(8134, 1, 16, "divide by zero", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenEnvChange::RollbackTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        client
+            .connection
+            .context_mut()
+            .set_transaction_descriptor(DESC);
+        let error = crate::client::rpc_response::collect_metadata_only_rpc(&mut client.connection)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(8134));
+        assert_eq!(
+            client.commit_transaction().await.unwrap(),
+            crate::TransactionEnd::AlreadyRolledBack
+        );
     }
 
     #[tokio::test]

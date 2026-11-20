@@ -463,9 +463,10 @@ where
                     .map_err(crate::Error::into_decode_failure)?;
             }
             TokenType::EnvChange => {
-                let _ = TokenEnvChange::decode(conn)
+                let change = TokenEnvChange::decode(conn)
                     .await
                     .map_err(crate::Error::into_decode_failure)?;
+                conn.context_mut().apply_env_change(&change);
             }
             TokenType::SessionState => {
                 let _ = TokenSessionState::decode(conn)

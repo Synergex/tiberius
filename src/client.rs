@@ -47,6 +47,28 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::TryStreamExt;
 use std::{borrow::Cow, fmt::Debug};
 
+/// What [`Client::commit_transaction`] or [`Client::rollback_transaction`]
+/// did. The `Already` variants report a transaction the server ended before
+/// the call: with a T-SQL `COMMIT` or `ROLLBACK`, by rolling it back itself
+/// after a deadlock or an error under `XACT_ABORT`, or in answer to a commit
+/// or rollback call that was dropped before it read the response. They stay
+/// the answer until the server begins another transaction or a commit or
+/// rollback call reads its own response, so a caller can treat them as
+/// success, as ODBC does, or as an error, as SqlClient does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionEnd {
+    /// The request committed or rolled back the open transaction. A commit
+    /// of a nested transaction ends one level, as a T-SQL `COMMIT` does.
+    Ended,
+    /// No transaction was open, and the server has reported none ending since
+    /// a commit or rollback call last read its own response.
+    NoTransaction,
+    /// No transaction was open: the server last reported one committed.
+    AlreadyCommitted,
+    /// No transaction was open: the server last reported one rolled back.
+    AlreadyRolledBack,
+}
+
 /// `Client` is the main entry point to the SQL Server, providing query
 /// execution capabilities.
 ///
@@ -334,32 +356,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     }
 
     /// Commits the session's transaction with a transaction manager request,
-    /// which the server runs without compiling a batch. Returns `false`
-    /// without contacting the server when the server has reported no open
-    /// transaction on this connection. Fails with a protocol error, which
-    /// leaves the connection unusable, when an undecodable response was
-    /// discarded or ended with a fatal error, and the transaction state is
-    /// unknown.
-    pub async fn commit_transaction(&mut self) -> crate::Result<bool> {
+    /// which the server runs without compiling a batch, and returns
+    /// [`TransactionEnd::Ended`]. When the server has reported no open
+    /// transaction on this connection, returns without contacting the server
+    /// how the last one ended: see [`TransactionEnd`]. Fails with a protocol
+    /// error, which leaves the connection unusable, when an undecodable
+    /// response was discarded or ended with a fatal error, and the
+    /// transaction state is unknown.
+    pub async fn commit_transaction(&mut self) -> crate::Result<TransactionEnd> {
         self.end_transaction(TransactionOutcome::Commit).await
     }
 
     /// Rolls back the session's transaction as
     /// [`commit_transaction`](Self::commit_transaction) commits it.
-    pub async fn rollback_transaction(&mut self) -> crate::Result<bool> {
+    pub async fn rollback_transaction(&mut self) -> crate::Result<TransactionEnd> {
         self.end_transaction(TransactionOutcome::Rollback).await
     }
 
-    async fn end_transaction(&mut self, outcome: TransactionOutcome) -> crate::Result<bool> {
+    async fn end_transaction(
+        &mut self,
+        outcome: TransactionOutcome,
+    ) -> crate::Result<TransactionEnd> {
         self.connection.flush_stream().await?;
-        if self.connection.context().transaction_uncertain() {
+        let context = self.connection.context();
+        if context.transaction_uncertain() {
             return Err(crate::Error::Protocol(
                 "transaction state was lost with an undecodable or fatal response".into(),
             ));
         }
-        let descriptor = self.connection.context().transaction_descriptor();
+        let descriptor = context.transaction_descriptor();
         if descriptor == [0; 8] {
-            return Ok(false);
+            return Ok(match context.transaction_end() {
+                None => TransactionEnd::NoTransaction,
+                Some(TransactionOutcome::Commit) => TransactionEnd::AlreadyCommitted,
+                Some(TransactionOutcome::Rollback) => TransactionEnd::AlreadyRolledBack,
+            });
         }
 
         let id = self.connection.context_mut().next_packet_id();
@@ -371,9 +402,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .await?;
         // The server's ENVCHANGE for the commit or rollback clears the
         // descriptor while the response is read.
-        let mut tokens = TokenStream::new(&mut self.connection).try_unfold();
-        while tokens.try_next().await?.is_some() {}
-        Ok(true)
+        let drained = TokenStream::new(&mut self.connection)
+            .try_unfold()
+            .try_for_each(|_| futures_util::future::ready(Ok(())))
+            .await;
+        // The end this request reported is its own, not an earlier one.
+        self.connection.context_mut().set_transaction_end(None);
+        drained.map(|()| TransactionEnd::Ended)
     }
 
     /// Execute a `BULK INSERT` statement, efficiantly storing a large number of

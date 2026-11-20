@@ -19,6 +19,7 @@ pub(crate) struct Context {
     packet_id: u8,
     transaction_desc: [u8; 8],
     transaction_uncertain: bool,
+    transaction_end: Option<TransactionOutcome>,
     last_meta: Option<Arc<TokenColMetaData<'static>>>,
     alt_meta: HashMap<u16, Arc<TokenAltMetaData<'static>>>,
     spn: Option<String>,
@@ -35,6 +36,7 @@ impl Context {
             packet_id: 0,
             transaction_desc: [0; 8],
             transaction_uncertain: false,
+            transaction_end: None,
             last_meta: None,
             alt_meta: HashMap::new(),
             spn: None,
@@ -108,6 +110,57 @@ impl Context {
 
     pub fn set_transaction_uncertain(&mut self, uncertain: bool) {
         self.transaction_uncertain = uncertain;
+    }
+
+    /// How the server last reported a transaction ending, until it reports
+    /// one beginning or a commit or rollback call reads its own response. A
+    /// call dropped before then leaves the end for the next one to report.
+    pub fn transaction_end(&self) -> Option<TransactionOutcome> {
+        self.transaction_end
+    }
+
+    pub fn set_transaction_end(&mut self, end: Option<TransactionOutcome>) {
+        self.transaction_end = end;
+    }
+
+    /// Records what an ENVCHANGE token changed in the session. Every reader
+    /// of response tokens applies them here, so the transaction descriptor
+    /// later requests carry is the server's current one.
+    pub fn apply_env_change(&mut self, change: &TokenEnvChange) {
+        match change {
+            TokenEnvChange::PacketSize(new_size, _) => {
+                self.set_packet_size(*new_size);
+            }
+            TokenEnvChange::BeginTransaction(desc) | TokenEnvChange::EnlistDtcTransaction(desc) => {
+                self.transaction_desc = *desc;
+                self.transaction_end = None;
+            }
+            TokenEnvChange::CommitTransaction { new, .. } => {
+                self.update_transaction_descriptor(new);
+                self.transaction_end = Some(TransactionOutcome::Commit);
+            }
+            TokenEnvChange::RollbackTransaction { new, .. } => {
+                self.update_transaction_descriptor(new);
+                self.transaction_end = Some(TransactionOutcome::Rollback);
+            }
+            TokenEnvChange::DefectTransaction { new, .. }
+            | TokenEnvChange::PromoteTransaction { dtc: new, .. }
+            | TokenEnvChange::TransactionEnded { new, .. } => {
+                self.update_transaction_descriptor(new);
+            }
+            TokenEnvChange::ResetConnection => {
+                self.transaction_desc = [0; 8];
+                self.transaction_end = None;
+            }
+            TokenEnvChange::Database(new, _) => {
+                self.set_database(new.clone());
+            }
+            _ => (),
+        }
+    }
+
+    fn update_transaction_descriptor(&mut self, bytes: &[u8]) {
+        self.transaction_desc = <[u8; 8]>::try_from(bytes).unwrap_or([0; 8]);
     }
 
     pub fn version(&self) -> FeatureLevel {

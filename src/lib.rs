@@ -275,6 +275,7 @@ pub use client::{
         CursorPrepExecOutcome,
     CursorScrollOptions, DirectResultSet, DirectResults, Fetch, OutputValue, ParameterDirection,
     PreparedCursor, PreparedHandle, PreparedStatement, ProcedureParameter, ProcedureResult,
+    TransactionEnd,
 };
 pub(crate) use error::Error;
 pub use from_sql::{FromSql, FromSqlOwned};
