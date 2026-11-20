@@ -2815,6 +2815,49 @@ where
     Ok(())
 }
 
+#[test_on_runtimes]
+async fn bytes_invalid_in_the_code_page_decode_as_replacement_characters<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // SQL Server stores the bytes as given: 0x81 is a Shift_JIS lead byte, and
+    // 0x00 cannot follow it.
+    let row = conn
+        .simple_query(
+            "CREATE TABLE #bad (v varchar(10) COLLATE Japanese_CI_AS, \
+                 vm varchar(max) COLLATE Japanese_CI_AS, c char(2) COLLATE Japanese_CI_AS, \
+                 t text COLLATE Japanese_CI_AS); \
+             INSERT INTO #bad (v) VALUES (0x8100); \
+             UPDATE #bad SET vm = v, c = v, t = v; \
+             SELECT v, vm, c, t, CAST(v AS sql_variant) FROM #bad;",
+        )
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    for column in 0..4 {
+        assert_eq!(row.get::<&str, _>(column), Some("\u{fffd}\0"));
+    }
+    let variant: &VariantData = row.get(4).unwrap();
+    assert_eq!(
+        variant.decode_typed().await?.1,
+        ColumnData::String(Some("\u{fffd}\0".into()))
+    );
+
+    // The connection is still usable.
+    let row = conn
+        .query("SELECT @P1", &[&1i32])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i32, _>(0), Some(1));
+
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "sql-browser-async-std")]
 fn cyrillic_collations_should_work() -> Result<()> {
