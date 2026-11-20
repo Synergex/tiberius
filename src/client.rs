@@ -667,7 +667,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     ///
     /// `param_defs` follows the same format as [`prepare`](Self::prepare)
     /// (`"@P1 int, @P2 nvarchar(50)"` etc.); pass an empty string if the
-    /// statement has no parameters.
+    /// statement has no parameters. Unlike `prepare`, values are passed by
+    /// name as `@P1` onward, so the declarations must use those names.
     ///
     /// Use [`Cursor::fetch`] to page through rows and [`Cursor::close`] when
     /// done.
@@ -693,7 +694,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// round trip using `sp_cursorprepexec`.
     ///
     /// `param_defs` follows the same format as [`prepare`](Self::prepare);
-    /// pass an empty string when the statement has no parameters.
+    /// pass an empty string when the statement has no parameters. Unlike
+    /// `prepare`, values are passed by name as `@P1` onward, so the
+    /// declarations must use those names.
     ///
     /// The return value is a [`CursorPrepExecOutcome`]: usually the server
     /// opens a cursor ([`Cursor`](CursorPrepExecOutcome::Cursor)), but when the

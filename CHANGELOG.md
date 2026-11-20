@@ -1,5 +1,17 @@
 # Changes
 
+## Unreleased
+
+- BREAKING: values passed to `sp_executesql`, `sp_prepexec` and `sp_execute`
+  (`Client::execute_declared_until_error`, `Client::prep_exec`,
+  `Client::prep_exec_until_error` and every `PreparedStatement` execution)
+  bind to the declarations by position instead of as `@P1`, `@P2`, ... by
+  name. Pass values in declaration order: with `"@P2 int, @P1 int"` the first
+  value now goes to `@P2`. Declarations may use any names. Cursor calls
+  (`Client::open_cursor`, `Client::cursor_prep_exec`,
+  `PreparedCursor::execute`) still bind by name, so their declarations must be
+  `@P1` onward.
+
 ## Version 0.12.3
 - feat: improve column type accuracy (#347)
 - fix: encoding of zero-length values for large varlen columns (#315)
