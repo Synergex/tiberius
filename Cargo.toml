@@ -63,6 +63,11 @@ uuid = "1.0"
 
 [target.'cfg(windows)'.dependencies]
 winauth = { version = "0.0.4", optional = true }
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libgssapi = { version = "0.8.1", optional = true, default-features = false }
@@ -217,6 +222,7 @@ all = [
     "native-tls",
 ]
 default = ["winauth", "native-tls"]
+winauth = ["dep:winauth", "dep:windows-sys"]
 docs = []
 sql-browser-async-std = ["async-std"]
 sql-browser-tokio = ["tokio", "tokio-util"]
