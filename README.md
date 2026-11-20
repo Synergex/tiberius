@@ -71,15 +71,23 @@ Alternatively one can use the `rustls` feature flag to use the Rust native TLS i
 
 The crate can also be compiled without TLS support, but not with both features enabled at the same time.
 
-Tiberius has three runtime encryption settings:
+| Encryption level | Description |
+| --- | --- |
+| `Required` | Require full-session TLS; reject a server that declines. Default for `Config::new()` with TLS enabled. |
+| `On` | Require full-session TLS, like `Required`. |
+| `Off` | Optional: plaintext if TLS is unavailable, login-only TLS if the server returns OFF, or full-session TLS if the server requires it. |
+| `NotSupported` | No TLS; reject a server that requests TLS. |
 
-| Encryption level | Description                                      |
-|------------------|--------------------------------------------------|
-| `Required`       | All traffic is encrypted. (default)              |
-| `Off`            | Only the login procedure is encrypted.           |
-| `NotSupported`   | None of the traffic is encrypted.                |
+Native TLS additionally supports `Config::strict_encryption(true)`: TLS-first TDS 8.0 (SQL Server 2022+), TLS 1.2 or later, with no TDS 7 fallback. Set `EncryptionLevel::Required` with Strict. Non-Strict native TLS uses TLS up to 1.2 for TDS 7 compatibility.
 
-The encryption levels can be set when connecting to the database.
+Certificate identity is validated against OS trust and the connection hostname by default:
+
+- `trust_cert_ca(path)` adds one PEM or DER CA certificate to OS trust. rustls and vendored OpenSSL keep their existing CA file handling.
+- `certificate_hostname(name)` overrides the verification hostname/SNI without changing the TCP destination.
+- `server_certificate(path)` pins the exact DER leaf certificate from one PEM or DER file instead of chain/hostname validation. Pinning does not check expiry or hostname; update the pin when the certificate changes.
+- `trust_cert()` explicitly bypasses certificate/hostname checks. It is forbidden in Strict and conflicts with other identity controls.
+
+Pinning requires full-session encryption and conflicts with CA/hostname overrides. With native TLS, unreadable, malformed, bundled, or trailing-data certificate files fail without fallback. Unsupported backend/option combinations and conflicting settings return errors before protocol I/O; hostname/pin/Strict controls require the native TLS backend. `Client::is_encrypted()` reports actual post-login TLS, including Optional's negotiated outcome. These APIs apply to programmatic configuration; RSSQL parses its own connection-string controls.
 
 ### Integrated Authentication (TrustedConnection) on \*nix
 
