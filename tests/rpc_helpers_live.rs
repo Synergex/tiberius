@@ -1307,11 +1307,19 @@ async fn live_prepared_cursor_executes_again_with_new_parameters() -> tiberius::
                 .await?;
             assert_eq!(rows.len(), 1, "{scroll:?}");
             assert_eq!(rows[0].get::<i32, _>(0), Some(key), "{scroll:?}");
-            previous.expect("the replaced cursor").close(&mut client).await?;
+            previous
+                .expect("the replaced cursor")
+                .close(&mut client)
+                .await?;
         }
         cursor.close_and_unprepare(&mut client).await?;
     }
-    let row = client.simple_query("SELECT 42").await?.into_row().await?.unwrap();
+    let row = client
+        .simple_query("SELECT 42")
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
     assert_eq!(row.get::<i32, _>(0), Some(42));
     Ok(())
 }
@@ -1371,7 +1379,12 @@ async fn live_prepared_cursor_execute_sees_changed_columns() -> tiberius::Result
         CursorConcurrencyOptions::ReadOnly | CursorConcurrencyOptions::AllowDirect,
     );
     let mut cursor = client
-        .cursor_prep_exec("SELECT * FROM #reshaped WHERE id >= @P1", options, "@P1 int", &[&0i32])
+        .cursor_prep_exec(
+            "SELECT * FROM #reshaped WHERE id >= @P1",
+            options,
+            "@P1 int",
+            &[&0i32],
+        )
         .await?
         .into_cursor()
         .expect("expected a server cursor");
@@ -1395,7 +1408,10 @@ async fn live_prepared_cursor_execute_sees_changed_columns() -> tiberius::Result
         panic!("executed directly");
     };
     assert!(previous.is_none());
-    assert_eq!(names(cursor.fetch_metadata(&mut client).await?), ["id", "extra"]);
+    assert_eq!(
+        names(cursor.fetch_metadata(&mut client).await?),
+        ["id", "extra"]
+    );
     let rows = cursor
         .fetch(&mut client, Fetch::Next { count: 10 })
         .await?
