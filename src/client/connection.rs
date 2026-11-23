@@ -384,12 +384,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             // of the response is buffered. Decode it rather than discard it: a
             // transaction it began or ended changes the descriptor every later
             // request must carry, and SQL Server rejects a stale one.
-            if !self.drain_buffered_tokens().await {
-                // A token could not be decoded, so the session state it
-                // carried is lost.
-                self.broken = true;
-            }
-            return self.usable();
+            return self.drain_buffered_tokens().await;
         }
 
         // Server still has data to send, or owes the acknowledgment of an
@@ -413,21 +408,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     }
 
     /// Decodes the buffered tokens of a fully received response without
-    /// reading the network. Returns whether all of them decoded.
-    async fn drain_buffered_tokens(&mut self) -> bool {
+    /// reading the network. Fails with the response's fatal server error, if
+    /// it has one. A token that could not be decoded breaks the connection.
+    async fn drain_buffered_tokens(&mut self) -> crate::Result<()> {
         self.buffered_only = true;
-        let mut tokens = TokenStream::new(self).try_unfold();
-        let decoded = loop {
+        let mut tokens = TokenStream::new_unread(self).try_unfold();
+        let ended = loop {
             match tokens.try_next().await {
                 Ok(Some(_)) => (),
-                // The token stream raises its first server error again at the end.
-                Ok(None) | Err(crate::Error::Server(_)) => break true,
-                Err(_) => break false,
+                ended => break ended,
             }
         };
         drop(tokens);
         self.buffered_only = false;
-        decoded && self.buf.is_empty()
+        match ended {
+            Ok(_) => self.usable(),
+            // The fatal server error that ended the session.
+            Err(error @ crate::Error::Server(_)) => Err(error),
+            // A token that could not be decoded lost the session state it
+            // carried.
+            Err(_) => {
+                self.broken = true;
+                self.usable()
+            }
+        }
     }
 
     /// True if the underlying stream has no more data and is consumed
@@ -874,13 +878,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_fails_after_a_fatal_error_in_the_buffered_tail() {
+    async fn commit_fails_with_a_fatal_error_in_the_buffered_tail() {
         let mut client = crate::Client {
             connection: fatal_error_then(encoded(TokenDone::default())),
         };
         let result = client.commit_transaction().await;
         assert!(
-            matches!(result, Err(crate::Error::Protocol(_))),
+            matches!(&result, Err(crate::Error::Server(e)) if e.code() == 50001),
+            "{result:?}"
+        );
+        assert_broken(&mut client).await;
+
+        // An earlier error in the tail belongs to the response no one read.
+        let mut bytes = BytesMut::new();
+        TokenError::new(2627, 1, 14, "duplicate", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenError::new(50001, 1, 20, "fatal", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        TokenDone::default().encode(&mut bytes).unwrap();
+        let mut client = crate::Client {
+            connection: buffered(&bytes),
+        };
+        let result = client.commit_transaction().await;
+        assert!(
+            matches!(&result, Err(crate::Error::Server(e)) if e.code() == 50001),
             "{result:?}"
         );
     }
@@ -1194,7 +1217,7 @@ mod tests {
         let mut connection = buffered(&encoded(TokenDone::default()));
         // Requested after `flush_stream` cleared the flag, as the drain runs.
         connection.cancellation_token().cancel();
-        assert!(connection.drain_buffered_tokens().await);
+        connection.drain_buffered_tokens().await.unwrap();
         assert!(!connection.attention_pending);
         assert!(connection.is_cancellation_requested());
         connection.usable().unwrap();
@@ -1256,5 +1279,100 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), Some(16917));
         assert!(!error.leaves_connection_usable(), "{error:?}");
+    }
+
+    fn duplicate_key_error() -> BytesMut {
+        let mut bytes = BytesMut::new();
+        TokenError::new(2627, 1, 14, "duplicate", "srv", "", 1)
+            .encode(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_after_a_server_error_keeps_its_code() {
+        let mut bytes = duplicate_key_error();
+        bytes.extend_from_slice(&encoded(TokenDone::default()));
+        bytes.extend_from_slice(&attention_ack());
+        let mut connection = buffered(&bytes);
+        let cancellation = connection.cancellation_token();
+        let mut tokens = TokenStream::new(&mut connection).try_unfold();
+        let token = tokens.try_next().await;
+        assert!(
+            matches!(token, Ok(Some(ReceivedToken::Error(_)))),
+            "{token:?}"
+        );
+
+        cancellation.cancel();
+        let error = tokens.try_next().await.unwrap_err();
+        assert!(
+            matches!(&error, crate::Error::CleanupFailed { cleanup, .. }
+                if **cleanup == crate::Error::Canceled),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), Some(2627));
+        assert!(error.leaves_connection_usable());
+    }
+
+    #[tokio::test]
+    async fn a_server_error_read_after_a_cancellation_is_not_reported() {
+        let mut bytes = duplicate_key_error();
+        bytes.extend_from_slice(&encoded(TokenDone::default()));
+        bytes.extend_from_slice(&attention_ack());
+        let mut connection = buffered(&bytes);
+        connection.cancellation_token().cancel();
+        let error = TokenStream::new(&mut connection)
+            .try_unfold()
+            .try_next()
+            .await
+            .unwrap_err();
+        assert_eq!(error, crate::Error::Canceled);
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_after_a_server_error_keeps_its_code() {
+        let (mut connection, mut server) = duplex(false);
+        respond(&mut server, duplicate_key_error(), false).await;
+        drop(server);
+        let error = crate::ExecuteResult::new(&mut connection)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, crate::Error::CleanupFailed { cleanup, .. }
+                if matches!(**cleanup, crate::Error::Io { .. })),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), Some(2627));
+        assert!(!error.leaves_connection_usable());
+    }
+
+    #[tokio::test]
+    async fn a_flush_does_not_report_the_abandoned_response_errors() {
+        let (mut connection, mut server) = duplex(false);
+        respond(&mut server, duplicate_key_error(), false).await;
+        // The server reads the attention, then the connection drops.
+        let server = async move {
+            server.next().await.unwrap().unwrap();
+        };
+        let (result, ()) = tokio::join!(connection.flush_stream(), server);
+        let error = result.unwrap_err();
+        assert!(matches!(error, crate::Error::Io { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn prep_exec_until_error_fails_without_a_handle() {
+        let (connection, mut server) = duplex(true);
+        let mut client = crate::Client { connection };
+        let server = async move {
+            server.next().await.unwrap().unwrap();
+            respond(&mut server, encoded(TokenDone::default()), true).await;
+        };
+        let ((statement, _, error), ()) =
+            tokio::join!(client.prep_exec_until_error("SELECT 1", "", &[]), server);
+        assert!(statement.is_none());
+        assert!(
+            matches!(error, Some(crate::Error::Protocol(_))),
+            "{error:?}"
+        );
     }
 }

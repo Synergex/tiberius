@@ -47,6 +47,9 @@ pub(crate) struct TokenStream<'a, S: AsyncRead + AsyncWrite + Unpin + Send> {
     last_error: Option<Error>,
     attention_sent: bool,
     canceled: bool,
+    /// No request reads the rest of the response, so of the errors in it,
+    /// only one that ended the session is kept.
+    unread: bool,
 }
 
 impl<'a, S> TokenStream<'a, S>
@@ -59,6 +62,17 @@ where
             last_error: None,
             attention_sent: false,
             canceled: false,
+            unread: false,
+        }
+    }
+
+    /// Create a token stream that drains the rest of a response no request
+    /// reads. Its only error is a fatal server error, which ended the
+    /// session, or a failure to read or decode the response.
+    pub(crate) fn new_unread(conn: &'a mut Connection<S>) -> Self {
+        Self {
+            unread: true,
+            ..Self::new(conn)
         }
     }
 
@@ -67,10 +81,8 @@ where
     /// natural EOF before the server's attention acknowledgment arrives.
     pub(crate) fn new_with_attention(conn: &'a mut Connection<S>) -> Self {
         Self {
-            conn,
-            last_error: None,
             attention_sent: true,
-            canceled: false,
+            ..Self::new_unread(conn)
         }
     }
 
@@ -197,8 +209,10 @@ where
         let err = TokenError::decode(self.conn).await?;
         self.conn.note_server_error(&err);
 
-        self.last_error =
-            Error::add_server_error(self.last_error.take(), Error::Server(err.clone()));
+        if !self.unread || err.class() >= crate::error::FATAL_SEVERITY {
+            self.last_error =
+                Error::add_server_error(self.last_error.take(), Error::Server(err.clone()));
+        }
 
         event!(
             name: "tiberius.error",
@@ -317,98 +331,112 @@ where
         Ok(ReceivedToken::Sspi(sspi))
     }
 
+    /// Reads the next token, or `None` once the response ends: at its end,
+    /// or at the acknowledgment of an attention.
+    async fn next_token(&mut self) -> crate::Result<Option<ReceivedToken>> {
+        loop {
+            // Only check for EOF when we're NOT waiting for an attention
+            // acknowledgment. After sending attention, the server will
+            // always send a Done+Attention response, even if the original
+            // query response has already ended (EOM seen). Skipping the
+            // EOF check ensures we keep reading until that ack arrives.
+            if !self.attention_sent && self.conn.is_eof() {
+                return Ok(None);
+            }
+
+            // Read the next token-type byte. While we have not yet sent an
+            // attention signal, use the cancellable read: a packet-less
+            // statement (e.g. `WAITFOR DELAY`) produces no bytes until it
+            // completes, so a bare `read_u8().await` would park here and
+            // never observe a `cancel()`. `read_u8_or_cancel` checks the
+            // cancellation flag up front and otherwise races the read
+            // against a waker-backed signal; on cancellation it sends the
+            // attention and we switch to the drain path. Once draining, a
+            // plain read suffices — the Done+Attention ack is incoming.
+            let ty_byte = if self.attention_sent {
+                self.conn.read_u8().await?
+            } else {
+                match self.conn.read_u8_or_cancel().await? {
+                    Some(byte) => byte,
+                    None => {
+                        self.attention_sent = true;
+                        self.canceled = true;
+                        self.unread = true;
+                        continue;
+                    }
+                }
+            };
+
+            self.conn.decoding_token();
+            let ty = TokenType::try_from(ty_byte)
+                .map_err(|_| Error::Protocol(format!("invalid token type {:x}", ty_byte).into()))?;
+
+            let token = match ty {
+                TokenType::ReturnStatus => self.get_return_status().await,
+                TokenType::AltMetaData => self.get_alt_metadata().await,
+                TokenType::ColMetaData => self.get_col_metadata().await,
+                TokenType::ColName => self.get_col_name().await,
+                TokenType::Row => self.get_row().await,
+                TokenType::NbcRow => self.get_nbc_row().await,
+                TokenType::AltRow => self.get_alt_row().await,
+                TokenType::Done => self.get_done_value().await,
+                TokenType::DoneProc => self.get_done_proc_value().await,
+                TokenType::DoneInProc => self.get_done_in_proc_value().await,
+                TokenType::ReturnValue => self.get_return_value().await,
+                TokenType::Error => self.get_error().await,
+                TokenType::Order => self.get_order().await,
+                TokenType::TabName => self.get_tab_name().await,
+                TokenType::ColInfo => self.get_col_info().await,
+                TokenType::EnvChange => self.get_env_change().await,
+                TokenType::SessionState => self.get_session_state().await,
+                TokenType::Info => self.get_info().await,
+                TokenType::LoginAck => self.get_login_ack().await,
+                TokenType::Sspi => self.get_sspi().await,
+                TokenType::FeatureExtAck => self.get_feature_ext_ack().await,
+                TokenType::FedAuthInfo => self.get_fed_auth_info().await,
+            }
+            .map_err(Error::into_decode_failure)?;
+            self.conn.token_decoded();
+
+            // When draining after attention, skip all tokens until we see
+            // Done+Attention, then terminate the stream.
+            if self.attention_sent {
+                match &token {
+                    ReceivedToken::Done(done)
+                    | ReceivedToken::DoneProc(done)
+                    | ReceivedToken::DoneInProc(done)
+                        if done.status().contains(DoneStatus::Attention) =>
+                    {
+                        self.conn.attention_acknowledged();
+                        return Ok(None);
+                    }
+                    _ => continue,
+                }
+            }
+
+            return Ok(Some(token));
+        }
+    }
+
+    /// The error the stream ends with once the response ended, or once `cut`
+    /// cut it short: the response's first server error, kept together with
+    /// `cut` or with the cancellation that ended the response.
+    fn final_error(&mut self, cut: Option<Error>) -> Option<Error> {
+        let cut = cut.or_else(|| self.canceled.then_some(Error::Canceled));
+        match cut {
+            Some(cut) => Some(Error::cut_short(self.last_error.take(), cut)),
+            None => self.last_error.take(),
+        }
+    }
+
     pub fn try_unfold(self) -> BoxStream<'a, crate::Result<ReceivedToken>> {
         let stream = futures_util::stream::try_unfold(self, |mut this| async move {
-            loop {
-                // Only check for EOF when we're NOT waiting for an attention
-                // acknowledgment. After sending attention, the server will
-                // always send a Done+Attention response, even if the original
-                // query response has already ended (EOM seen). Skipping the
-                // EOF check ensures we keep reading until that ack arrives.
-                if !this.attention_sent && this.conn.is_eof() {
-                    return match this.last_error {
-                        None => Ok(None),
-                        Some(error) => Err(error),
-                    };
-                }
-
-                // Read the next token-type byte. While we have not yet sent an
-                // attention signal, use the cancellable read: a packet-less
-                // statement (e.g. `WAITFOR DELAY`) produces no bytes until it
-                // completes, so a bare `read_u8().await` would park here and
-                // never observe a `cancel()`. `read_u8_or_cancel` checks the
-                // cancellation flag up front and otherwise races the read
-                // against a waker-backed signal; on cancellation it sends the
-                // attention and we switch to the drain path. Once draining, a
-                // plain read suffices — the Done+Attention ack is incoming.
-                let ty_byte = if this.attention_sent {
-                    this.conn.read_u8().await?
-                } else {
-                    match this.conn.read_u8_or_cancel().await? {
-                        Some(byte) => byte,
-                        None => {
-                            this.attention_sent = true;
-                            this.canceled = true;
-                            continue;
-                        }
-                    }
-                };
-
-                this.conn.decoding_token();
-                let ty = TokenType::try_from(ty_byte).map_err(|_| {
-                    Error::Protocol(format!("invalid token type {:x}", ty_byte).into())
-                })?;
-
-                let token = match ty {
-                    TokenType::ReturnStatus => this.get_return_status().await,
-                    TokenType::AltMetaData => this.get_alt_metadata().await,
-                    TokenType::ColMetaData => this.get_col_metadata().await,
-                    TokenType::ColName => this.get_col_name().await,
-                    TokenType::Row => this.get_row().await,
-                    TokenType::NbcRow => this.get_nbc_row().await,
-                    TokenType::AltRow => this.get_alt_row().await,
-                    TokenType::Done => this.get_done_value().await,
-                    TokenType::DoneProc => this.get_done_proc_value().await,
-                    TokenType::DoneInProc => this.get_done_in_proc_value().await,
-                    TokenType::ReturnValue => this.get_return_value().await,
-                    TokenType::Error => this.get_error().await,
-                    TokenType::Order => this.get_order().await,
-                    TokenType::TabName => this.get_tab_name().await,
-                    TokenType::ColInfo => this.get_col_info().await,
-                    TokenType::EnvChange => this.get_env_change().await,
-                    TokenType::SessionState => this.get_session_state().await,
-                    TokenType::Info => this.get_info().await,
-                    TokenType::LoginAck => this.get_login_ack().await,
-                    TokenType::Sspi => this.get_sspi().await,
-                    TokenType::FeatureExtAck => this.get_feature_ext_ack().await,
-                    TokenType::FedAuthInfo => this.get_fed_auth_info().await,
-                }
-                .map_err(Error::into_decode_failure)?;
-                this.conn.token_decoded();
-
-                // When draining after attention, skip all tokens until we see
-                // Done+Attention, then terminate the stream.
-                if this.attention_sent {
-                    match &token {
-                        ReceivedToken::Done(done)
-                        | ReceivedToken::DoneProc(done)
-                        | ReceivedToken::DoneInProc(done)
-                            if done.status().contains(DoneStatus::Attention) =>
-                        {
-                            this.conn.attention_acknowledged();
-                            return match this.last_error.take() {
-                                // A fatal error ended the session, which a
-                                // cancellation does not undo.
-                                Some(error) if !error.leaves_connection_usable() => Err(error),
-                                _ if this.canceled => Err(Error::Canceled),
-                                _ => Ok(None),
-                            };
-                        }
-                        _ => continue,
-                    }
-                }
-
-                return Ok(Some((token, this)));
+            match this.next_token().await {
+                Ok(Some(token)) => Ok(Some((token, this))),
+                ended => match this.final_error(ended.err()) {
+                    Some(error) => Err(error),
+                    None => Ok(None),
+                },
             }
         });
 

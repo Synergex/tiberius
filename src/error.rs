@@ -155,6 +155,23 @@ impl Error {
         }
     }
 
+    /// Returns `error`, which cut a response short, such as a cancellation
+    /// or a transport failure, together with the server error the response
+    /// reported before it, if any. That server error stays the response's
+    /// error, with `error` kept as [`CleanupFailed`](Self::CleanupFailed).
+    /// After a fatal server error, which ended the session, `error` is
+    /// dropped.
+    pub(crate) fn cut_short(first: Option<Error>, error: Error) -> Error {
+        match first {
+            None => error,
+            Some(first) if !first.leaves_connection_usable() => first,
+            Some(first) => Error::CleanupFailed {
+                error: Box::new(first),
+                cleanup: Box::new(error),
+            },
+        }
+    }
+
     /// Returns a request's error together with that of the cleanup that
     /// followed it: the request's error alone when the cleanup succeeded, the
     /// cleanup's when only it failed, and [`CleanupFailed`](Self::CleanupFailed)

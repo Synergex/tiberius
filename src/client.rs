@@ -358,10 +358,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// which the server runs without compiling a batch, and returns
     /// [`TransactionEnd::Ended`]. When the server has reported no open
     /// transaction on this connection, returns without contacting the server
-    /// how the last one ended: see [`TransactionEnd`]. Fails with a protocol
-    /// error, which leaves the connection unusable, once a response stopped
-    /// part-way through a token, could not be decoded or ended the session,
-    /// since the transaction state is then unknown.
+    /// how the last one ended: see [`TransactionEnd`]. Fails, leaving the
+    /// connection unusable, once a response stopped part-way through a token,
+    /// could not be decoded or ended the session, since the transaction state
+    /// is then unknown. The error is a protocol error, or the server's fatal
+    /// error when this call is the one that reads it from the unread rest of
+    /// an earlier response.
     pub async fn commit_transaction(&mut self) -> crate::Result<TransactionEnd> {
         self.end_transaction(TransactionOutcome::Commit).await
     }
@@ -762,7 +764,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// does.
     ///
     /// The statement is returned whenever the server assigned a handle, even
-    /// when the execution failed, so the caller can still release it.
+    /// when the execution failed, so the caller can still release it. A
+    /// response that reports no error but carries no handle fails with a
+    /// protocol error, as in `prep_exec`.
     pub async fn prep_exec_until_error<'a>(
         &mut self,
         sql: impl Into<Cow<'a, str>>,
@@ -793,10 +797,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             }
         })
         .await;
-        let statement = prepared::extract_handle(&outputs)
-            .ok()
-            .map(|handle| PreparedStatement::new(handle, sql_owned, defs_owned));
-        (statement, result, error)
+        match (prepared::extract_handle(&outputs), error) {
+            (Ok(handle), error) => (
+                Some(PreparedStatement::new(handle, sql_owned, defs_owned)),
+                result,
+                error,
+            ),
+            // A request that failed may never have prepared the statement.
+            (Err(_), Some(error)) => (None, result, Some(error)),
+            (Err(missing), None) => (None, result, Some(missing)),
+        }
     }
 }
 
