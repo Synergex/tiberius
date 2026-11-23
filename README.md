@@ -139,6 +139,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Running the tests
+
+The integration tests need a SQL Server. `scripts/docker-test.sh` builds one from `docker/`, the images CI uses, and runs `cargo test` against it, including the live tests in `tests/rpc_helpers_live.rs` that are otherwise ignored:
+
+```sh
+scripts/docker-test.sh run                                       # SQL Server 2022, default features
+TIBERIUS_TEST_SERVER=2025 scripts/docker-test.sh run --features=rustls
+scripts/docker-test.sh up                                        # keep a server between runs
+scripts/docker-test.sh test --test query
+scripts/docker-test.sh down
+```
+
+The container listens on `127.0.0.1:1434` (set `TIBERIUS_TEST_PORT` to change it), so it can run next to another SQL Server on 1433. To use a server of your own instead, set `TIBERIUS_TEST_CONNECTION_STRING` and run `cargo test -- --include-ignored`. `tests/custom-cert.rs` passes only against the `docker/` images, whose certificate is signed by `docker/certs/customCA.crt`. That certificate lasts 200 days; once it expires, the script stops and prints the command that reissues it.
+
 ## Security
 
 If you have a security issue to report, please contact us at [security@prisma.io](mailto:security@prisma.io?subject=[GitHub]%20Prisma%202%20Security%20Report%20Tiberius)

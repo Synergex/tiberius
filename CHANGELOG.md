@@ -60,6 +60,10 @@
   and `message` fields, replacing `code` and `message`; info events carry
   `number`, `class`, `state` and `message`.
 - perf: fewer copies when reading responses.
+- With the `rustls` feature, connecting no longer fails with "tls handshake
+  eof". The client sent each TLS record of a handshake step as a PRELOGIN
+  message of its own, which SQL Server rejects; each step now goes out as one
+  message again.
 
 ## Version 0.12.3
 - feat: improve column type accuracy (#347)
