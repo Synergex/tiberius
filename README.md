@@ -145,13 +145,13 @@ The integration tests need a SQL Server. `scripts/docker-test.sh` builds one fro
 
 ```sh
 scripts/docker-test.sh run                                       # SQL Server 2022, default features
-TIBERIUS_TEST_SERVER=2025 scripts/docker-test.sh run --features=rustls
+TIBERIUS_TEST_SERVER=2025 scripts/docker-test.sh run --no-default-features --features=rustls
 scripts/docker-test.sh up                                        # keep a server between runs
 scripts/docker-test.sh test --test query
 scripts/docker-test.sh down
 ```
 
-The container listens on `127.0.0.1:1434` (set `TIBERIUS_TEST_PORT` to change it), so it can run next to another SQL Server on 1433. To use a server of your own instead, set `TIBERIUS_TEST_CONNECTION_STRING` and run `cargo test -- --include-ignored`. `tests/custom-cert.rs` passes only against the `docker/` images, whose certificate is signed by `docker/certs/customCA.crt`. That certificate lasts 200 days; once it expires, the script stops and prints the command that reissues it.
+The container listens on `127.0.0.1:1434` (set `TIBERIUS_TEST_PORT` to change it), so it can run next to another SQL Server on 1433. The TLS backends exclude each other, so `rustls` and `vendored-openssl` need `--no-default-features`. To use a server of your own instead, set `TIBERIUS_TEST_CONNECTION_STRING` and run `cargo test --tests -- --include-ignored`, then `cargo test --doc`; `--include-ignored` would also try to compile the doc examples marked `ignore`, which are not meant to build. `tests/custom-cert.rs` passes only against the `docker/` images, whose certificate is signed by `docker/certs/customCA.crt`. That certificate lasts 200 days; once it expires, the script stops and prints the command that reissues it.
 
 ## Security
 

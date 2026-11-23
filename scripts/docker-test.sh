@@ -9,8 +9,11 @@
 #   scripts/docker-test.sh down                    remove the container
 #
 # With no cargo arguments, `cargo test --no-fail-fast` runs. Unless the
-# arguments already contain `--`, `-- --include-ignored` is appended, so the
-# live tests in tests/rpc_helpers_live.rs run as well.
+# arguments contain `--` or `--doc`, `-- --include-ignored` is appended, so the
+# live tests in tests/rpc_helpers_live.rs run as well. The doc-tests never get
+# it, since their `ignore` examples do not compile: unless the arguments pick
+# targets (`--lib`, `--test NAME`, ...), the tests run with `--tests`, then
+# the doc-tests with `--doc`.
 #
 # Environment:
 #   TIBERIUS_TEST_SERVER  2025 | 2022 | 2019 | 2017 | azure-sql-edge   (default 2022)
@@ -109,23 +112,46 @@ up() {
   wait_ready
 }
 
+cargo_test() {
+  echo "+ cargo test $*"
+  cargo test "$@"
+}
+
 run_tests() {
-  local port has_separator=0 arg
+  local port arg as_given=0 picks_targets=0 status=0
   if ! port=$(running_port); then
     echo "$NAME is not running; start it with: $0 up" >&2
     exit 1
   fi
   (($# > 0)) || set -- --no-fail-fast
   for arg in "$@"; do
-    [[ "$arg" == -- ]] && has_separator=1
+    case "$arg" in
+      -- | --doc)
+        as_given=1
+        break
+        ;;
+      --lib | --bins | --bin | --bin=* | --examples | --example | --example=* | \
+        --tests | --test | --test=* | --benches | --bench | --bench=* | --all-targets)
+        picks_targets=1
+        ;;
+    esac
   done
-  ((has_separator)) || set -- "$@" -- --include-ignored
 
   export TIBERIUS_TEST_CONNECTION_STRING
   TIBERIUS_TEST_CONNECTION_STRING=$(connection_string "$port")
   cd "$ROOT"
-  echo "+ cargo test $*"
-  cargo test "$@"
+  if ((as_given)); then
+    cargo_test "$@"
+  elif ((picks_targets)); then
+    cargo_test "$@" -- --include-ignored
+  else
+    # With --include-ignored, rustdoc would also compile the doc examples
+    # marked `ignore`, which are not meant to build, so the doc-tests run on
+    # their own without it.
+    cargo_test "$@" --tests -- --include-ignored || status=$?
+    cargo_test "$@" --doc || status=$?
+    return "$status"
+  fi
 }
 
 down() {
@@ -149,7 +175,7 @@ case "$command" in
     run_tests "$@"
     ;;
   *)
-    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    awk 'NR == 1 { next } !/^#/ { exit } { print }' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     [[ -z "$command" || "$command" == help || "$command" == -h || "$command" == --help ]] || exit 2
     ;;
 esac
