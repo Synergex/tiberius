@@ -1,8 +1,19 @@
-use futures_util::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures_util::io::AsyncReadExt;
+#[cfg(any(
+    feature = "native-tls",
+    feature = "rustls",
+    feature = "vendored-openssl"
+))]
+use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use std::time::Duration;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+#[cfg(any(
+    feature = "native-tls",
+    feature = "rustls",
+    feature = "vendored-openssl"
+))]
 async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> (u8, Vec<u8>) {
     let mut header = [0; 8];
     stream.read_exact(&mut header).await.unwrap();
@@ -13,6 +24,11 @@ async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> (u8, Vec<u8>) {
     (header[0], payload)
 }
 
+#[cfg(any(
+    feature = "native-tls",
+    feature = "rustls",
+    feature = "vendored-openssl"
+))]
 async fn prelogin_response<S: AsyncWrite + Unpin>(stream: &mut S, encryption: u8) {
     // VERSION and ENCRYPTION options, followed by their values.
     stream
