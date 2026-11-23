@@ -991,10 +991,7 @@ async fn decode_variant_payload(
             }
             let collation = Collation::new(info, sort_id);
             let encoder = collation.encoding()?;
-            let s = encoder
-                .decode_without_bom_handling_and_without_replacement(value_bytes)
-                .ok_or_else(|| crate::Error::Encoding("invalid sequence".into()))?
-                .to_string();
+            let s = string::decode_code_page(encoder, value_bytes).into_owned();
             let ty = TypeInfo::VarLenSized(VarLenContext::new(var_ty, max_len, Some(collation)));
             Ok((ty, ColumnData::String(Some(s.into()))))
         }
@@ -3498,6 +3495,38 @@ mod tests {
         let bytes = ColumnData::Udt(Some(vec![1, 2, 3].into()));
         assert!(<&[u8]>::from_sql(&bytes).is_err());
         assert!(Vec::<u8>::from_sql_owned(bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn text_and_variant_bytes_invalid_in_the_code_page_decode_as_replacement_characters() {
+        // Shift_JIS: 0x81 is a lead byte, and 0x00 cannot follow it.
+        let shift_jis = Collation::new(0x0411, 0);
+        let bytes = [0x81, 0x00];
+
+        let mut wire = BytesMut::new();
+        wire.put_u8(16);
+        wire.put_slice(&[0; 16]);
+        wire.put_u64_le(0);
+        wire.put_u32_le(bytes.len() as u32);
+        wire.put_slice(&bytes);
+        wire.put_u8(0xad);
+        let reader = &mut wire.into_sql_read_bytes();
+        let ty = TypeInfo::VarLenSized(VarLenContext::new(
+            VarLenType::Text,
+            i32::MAX as usize,
+            Some(shift_jis),
+        ));
+        let value = ColumnData::decode(reader, &ty).await.unwrap();
+        assert_eq!(value, ColumnData::String(Some("\u{fffd}\0".into())));
+        assert_eq!(reader.read_u8().await.unwrap(), 0xad);
+
+        let mut payload = vec![VarLenType::BigVarChar as u8, 7];
+        payload.extend_from_slice(&shift_jis.info().to_le_bytes());
+        payload.push(shift_jis.sort_id());
+        payload.extend_from_slice(&8000u16.to_le_bytes());
+        payload.extend_from_slice(&bytes);
+        let (_, value) = decode_variant_payload(&payload).await.unwrap();
+        assert_eq!(value, ColumnData::String(Some("\u{fffd}\0".into())));
     }
 
     /// Test FromSql / FromSqlOwned for VariantData.

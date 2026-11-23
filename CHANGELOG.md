@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+- BREAKING: values passed to `sp_executesql`, `sp_prepexec` and `sp_execute`
+  (`Client::execute_declared_until_error`, `Client::prep_exec`,
+  `Client::prep_exec_until_error` and every `PreparedStatement` execution)
+  bind to the declarations by position instead of as `@P1`, `@P2`, ... by
+  name. Pass values in declaration order: with `"@P2 int, @P1 int"` the first
+  value now goes to `@P2`. Declarations may use any names. Cursor calls
+  (`Client::open_cursor`, `Client::cursor_prep_exec`,
+  `PreparedCursor::execute`) still bind by name, so their declarations must be
+  `@P1` onward.
+- BREAKING: `Error` has a new variant, `Error::CleanupFailed { error, cleanup }`,
+  and `RpcProcId` a new variant, `CursorExecute`, so exhaustive matches on
+  either no longer compile. `CleanupFailed` holds a request's error with the
+  error that followed it, and `Error::code` reports the first one's code.
+  Existing calls can return it where they returned `Error::Server` before:
+  when a cancellation, transport or protocol failure cuts a response short
+  after a server error, or a fatal server error follows a non-fatal one.
+- Text that does not decode no longer fails the request. Unpaired UTF-16
+  surrogates in nvarchar, nchar, ntext and sql_variant values, and in the
+  strings of tokens such as ERROR and INFO, become U+FFFD. Bytes that a char,
+  varchar, text or sql_variant value's code page cannot map become U+FFFD,
+  with a warning logged, instead of returning `Error::Encoding`.
+- A token that fails to decode is reported as `Error::Protocol` (transport
+  errors are unchanged). After such a failure, a response stopped part-way
+  through a token, or a fatal server error, the connection is unusable and
+  every later request on it fails with a protocol error. The unread rest of an
+  earlier response counts too: when it does not decode or holds a fatal server
+  error, the next request, `commit_transaction` and `rollback_transaction`
+  included, fails instead of running.
+- A cancellation whose drain reads a fatal server error returns that error
+  instead of `Error::Canceled`.
+- `PreparedCursor::unprepare` and `close_and_unprepare` release the prepared
+  handle even when closing the cursor fails, as long as the connection is
+  still usable.
+- New: `Error::leaves_connection_usable` tells whether a connection can carry
+  another request after an error.
+- New: `Client::execute_declared_until_error`, `Client::prep_exec_until_error`
+  and `PreparedStatement::execute_until_error` return the row counts reported
+  before the first error, with that error.
+- New: `PreparedStatement::execute_and_unprepare` executes the statement a
+  last time, then releases it. The release goes in its own request after the
+  execution's response is read, since an attention aborts the whole request it
+  interrupts, so it costs one more round trip than the execution alone.
+- New: `Client::commit_transaction` and `Client::rollback_transaction` end the
+  transaction with a TDS transaction manager request and report what happened
+  as a `TransactionEnd`. They send nothing when the server has reported no
+  open transaction. `Client::transaction_open` tells whether one is open.
+- New: `PreparedCursor::execute` opens another cursor from a prepared cursor
+  statement with `sp_cursorexecute` and returns a `CursorExecuteOutcome`;
+  `PreparedCursor::replace_cursor` restores a previous cursor.
+- New: `Client::spid`, `Client::server_version` and `Client::database` report
+  the server session ID, the server version (`major.minor.build`) and the
+  current database as last reported by the server.
+- Tracing events have names for filtering: `tiberius.error`, `tiberius.info`,
+  `tiberius.tls_off`, `tiberius.attention_flush` and `tiberius.handle_leaked`.
+  Server error events carry `number`, `class`, `state`, `line`, `procedure`
+  and `message` fields, replacing `code` and `message`; info events carry
+  `number`, `class`, `state` and `message`.
+- perf: fewer copies when reading responses.
+- With the `rustls` feature, connecting no longer fails with "tls handshake
+  eof". The client sent each TLS record of a handshake step as a PRELOGIN
+  message of its own, which SQL Server rejects; each step now goes out as one
+  message again.
 - Add native TLS-first TDS 8.0 via `Config::strict_encryption`, with no fallback and no certificate-validation bypass.
 - Add certificate hostname overrides and exact leaf-certificate file pinning; validate conflicting/unsupported security settings once at connection entry, before protocol I/O.
 - **Breaking (native TLS):** CA and pin files must contain exactly one PEM or DER certificate; bundles and text around the certificate are rejected. Unreadable CA files now return `Error::Tls` instead of `Error::Io`. Adding a custom CA preserves OS roots.
