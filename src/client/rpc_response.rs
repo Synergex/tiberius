@@ -7,16 +7,11 @@
 //! every new helper.
 
 use crate::client::Connection;
-use crate::tds::codec::{
-    ColumnData, DoneStatus, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
-    TokenEnvChange, TokenError, TokenInfo, TokenOrder, TokenReturnValue, TokenSessionState,
-    TokenTabName, TypeInfo,
-};
+use crate::tds::codec::{ColumnData, DoneStatus, TokenInfo, TokenReturnValue, TypeInfo};
 use crate::tds::stream::{ReceivedToken, TokenStream};
-use crate::{Column, FromSql, Row, SqlReadBytes, TokenType};
+use crate::{Column, FromSql, Row};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::{Stream, TryStreamExt};
-use std::convert::TryFrom;
 use std::sync::Arc;
 
 /// A single `RETURNVALUE` token surfaced to the client.
@@ -371,144 +366,45 @@ where
 /// [`QueryStream`](crate::QueryStream). The metadata probe requests zero rows,
 /// so this walker returns as soon as it sees the first non-empty COLMETADATA
 /// and then asks the connection to clean the rest of the response.
+///
+/// The token stream reports the response's server error at its end, and keeps
+/// it with a cancellation or a failure that cuts the response short.
 pub(crate) async fn collect_metadata_only_rpc<S>(
     conn: &mut Connection<S>,
 ) -> crate::Result<Vec<Column>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut last_error = None;
-
-    loop {
-        // Race the token-byte read against cancellation. A metadata probe that
-        // stalls (e.g. server lock contention) would otherwise park here with
-        // no way to observe a `cancel()`. On cancellation the attention signal
-        // has been sent; drain to the Done+Attention ack and surface it.
-        let ty_byte = match conn.read_u8_or_cancel().await? {
-            Some(byte) => byte,
-            None => {
-                TokenStream::new_with_attention(conn)
-                    .flush_to_attention()
-                    .await?;
-                return Err(crate::Error::Canceled);
+    let mut tokens = TokenStream::new(conn).try_unfold();
+    let columns = loop {
+        match tokens.try_next().await? {
+            Some(ReceivedToken::NewResultset(meta)) if !meta.columns.is_empty() => {
+                break meta.columns().collect();
             }
-        };
-        conn.decoding_token();
-        let ty = TokenType::try_from(ty_byte).map_err(|_| {
-            crate::Error::Protocol(format!("invalid token type {:x}", ty_byte).into())
-        })?;
-
-        match ty {
-            TokenType::ColMetaData => {
-                let metadata = TokenColMetaData::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-                if !metadata.columns.is_empty() {
-                    let columns = metadata.columns().collect();
-                    conn.context_mut().set_last_meta(Arc::new(metadata));
-                    conn.token_decoded();
-                    conn.flush_stream().await?;
-                    return Ok(columns);
-                }
-            }
-            TokenType::ReturnStatus => {
-                let _ = conn.read_u32_le().await?;
-            }
-            TokenType::ReturnValue => {
-                let _ = TokenReturnValue::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-            }
-            TokenType::DoneInProc => {
-                let _ = TokenDone::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-            }
-            TokenType::DoneProc | TokenType::Done => {
-                let done = TokenDone::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-                if !done.status().contains(DoneStatus::More) {
-                    conn.token_decoded();
-                    break;
-                }
-            }
-            TokenType::Error => {
-                let err = TokenError::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-                conn.note_server_error(&err);
-                last_error =
-                    crate::Error::add_server_error(last_error.take(), crate::Error::Server(err));
-            }
-            TokenType::Info => {
-                let _ = TokenInfo::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-            }
-            TokenType::Order => {
-                let _ = TokenOrder::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-            }
-            TokenType::ColName => {
-                let _ = TokenColName::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-            }
-            TokenType::ColInfo => {
-                let _ = TokenColInfo::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-            }
-            TokenType::TabName => {
-                let _ = TokenTabName::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-            }
-            TokenType::EnvChange => {
-                let change = TokenEnvChange::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-                conn.context_mut().apply_env_change(&change);
-            }
-            TokenType::SessionState => {
-                let _ = TokenSessionState::decode(conn)
-                    .await
-                    .map_err(crate::Error::into_decode_failure)?;
-            }
-            TokenType::Row | TokenType::NbcRow => {
+            Some(ReceivedToken::Row(_)) => {
                 return Err(crate::Error::Protocol(
                     "metadata cursor fetch returned row data before non-empty COLMETADATA".into(),
                 ));
             }
-            other => {
+            Some(_) => {}
+            None => {
                 return Err(crate::Error::Protocol(
-                    format!(
-                        "metadata-only cursor fetch returned unexpected token {:?}",
-                        other
-                    )
-                    .into(),
+                    "metadata cursor fetch returned no non-empty COLMETADATA".into(),
                 ));
             }
         }
-        conn.token_decoded();
-    }
-
-    if let Some(err) = last_error {
-        return Err(err);
-    }
-
-    Err(crate::Error::Protocol(
-        "metadata cursor fetch returned no non-empty COLMETADATA".into(),
-    ))
+    };
+    drop(tokens);
+    conn.flush_stream().await?;
+    Ok(columns)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tds::codec::{
-        BaseMetaDataColumn, FixedLenType, MetaDataColumn, TokenDone, TokenError, TokenRow, TypeInfo,
+        BaseMetaDataColumn, FixedLenType, MetaDataColumn, TokenColMetaData, TokenDone, TokenError,
+        TokenRow, TypeInfo,
     };
     use enumflags2::BitFlags;
     use futures_util::stream::iter;

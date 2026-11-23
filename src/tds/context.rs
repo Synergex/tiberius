@@ -101,8 +101,8 @@ impl Context {
     }
 
     /// How the server last reported a transaction ending, until it reports
-    /// one beginning or a commit or rollback call reads its own response. A
-    /// call dropped before then leaves the end for the next one to report.
+    /// one beginning or a commit or rollback call returns `Ended`. A call
+    /// that fails or is dropped leaves the end for the next one to report.
     pub fn transaction_end(&self) -> Option<TransactionOutcome> {
         self.transaction_end
     }

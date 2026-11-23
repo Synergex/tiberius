@@ -151,7 +151,7 @@ impl TokenRow<'static> {
     where
         R: SqlReadBytes + Unpin + Send,
     {
-        let col_meta = src.context().last_meta().unwrap();
+        let col_meta = src.context().last_meta().ok_or_else(row_before_metadata)?;
 
         let mut row = Self {
             data: Vec::with_capacity(col_meta.columns.len()),
@@ -171,7 +171,7 @@ impl TokenRow<'static> {
     where
         R: SqlReadBytes + Unpin + Send,
     {
-        let col_meta = src.context().last_meta().unwrap();
+        let col_meta = src.context().last_meta().ok_or_else(row_before_metadata)?;
         let row_bitmap = RowBitmap::decode(src, col_meta.columns.len()).await?;
 
         let mut row = Self {
@@ -190,6 +190,12 @@ impl TokenRow<'static> {
 
         Ok(row)
     }
+}
+
+/// A row decodes against the last column metadata, so a server that sends one
+/// first is broken.
+fn row_before_metadata() -> crate::Error {
+    crate::Error::Protocol("row received before any column metadata".into())
 }
 
 /// A bitmap of null values in the row. Sometimes SQL Server decides to pack the

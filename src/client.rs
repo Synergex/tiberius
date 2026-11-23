@@ -51,17 +51,18 @@ use std::{borrow::Cow, fmt::Debug};
 /// did. The `Already` variants report a transaction the server ended before
 /// the call: with a T-SQL `COMMIT` or `ROLLBACK`, by rolling it back itself
 /// after a deadlock or an error under `XACT_ABORT`, or in answer to a commit
-/// or rollback call that was dropped before it read the response. They stay
-/// the answer until the server begins another transaction or a commit or
-/// rollback call reads its own response, so a caller can treat them as
-/// success, as ODBC does, or as an error, as SqlClient does.
+/// or rollback call that was dropped or failed, such as one canceled after
+/// the server ended the transaction. They stay the answer until the server
+/// begins another transaction or a commit or rollback call returns
+/// [`Ended`](Self::Ended), so a caller can treat them as success, as ODBC
+/// does, or as an error, as SqlClient does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionEnd {
     /// The request committed or rolled back the open transaction. A commit
     /// of a nested transaction ends one level, as a T-SQL `COMMIT` does.
     Ended,
     /// No transaction was open, and the server has reported none ending since
-    /// a commit or rollback call last read its own response.
+    /// a commit or rollback call last returned [`Ended`](Self::Ended).
     NoTransaction,
     /// No transaction was open: the server last reported one committed.
     AlreadyCommitted,
@@ -402,8 +403,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .try_unfold()
             .try_for_each(|_| futures_util::future::ready(Ok(())))
             .await;
-        // The end this request reported is its own, not an earlier one.
-        self.connection.context_mut().set_transaction_end(None);
+        // The end this request reported is its own, not an earlier one. A
+        // request that failed, such as one canceled after the server ended
+        // the transaction, leaves the end for the next call to report.
+        if drained.is_ok() {
+            self.connection.context_mut().set_transaction_end(None);
+        }
         drained.map(|()| TransactionEnd::Ended)
     }
 

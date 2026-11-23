@@ -847,12 +847,30 @@ mod tests {
 
     #[tokio::test]
     async fn a_token_that_fails_to_decode_is_a_protocol_error() {
-        // ENVCHANGE database change whose new name is an unpaired surrogate.
-        let mut connection = buffered(&[0xe3, 5, 0, 1, 1, 0x00, 0xd8, 0, 0xfd]);
-        let mut tokens = TokenStream::new(&mut connection).try_unfold();
-        let error = tokens.try_next().await.unwrap_err();
+        let undecodable: [&[u8]; 4] = [
+            // ENVCHANGE database change whose new name is an unpaired surrogate.
+            &[0xe3, 5, 0, 1, 1, 0x00, 0xd8, 0, 0xfd],
+            // ENVCHANGE database change whose payload ends inside the new name.
+            &[0xe3, 2, 0, 1, 5],
+            // ROW and NBCROW with no column metadata to decode them against.
+            &[0xd1],
+            &[0xd2],
+        ];
+        for bytes in undecodable {
+            let mut connection = buffered(bytes);
+            let mut tokens = TokenStream::new(&mut connection).try_unfold();
+            let error = tokens.try_next().await.unwrap_err();
+            assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
+            assert!(!error.leaves_connection_usable());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_metadata_only_fetch_rejects_a_row_before_any_metadata() {
+        let error = crate::client::rpc_response::collect_metadata_only_rpc(&mut buffered(&[0xd1]))
+            .await
+            .unwrap_err();
         assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
-        assert!(!error.leaves_connection_usable());
     }
 
     #[tokio::test]
@@ -1357,6 +1375,119 @@ mod tests {
         let (result, ()) = tokio::join!(connection.flush_stream(), server);
         let error = result.unwrap_err();
         assert!(matches!(error, crate::Error::Io { .. }), "{error:?}");
+    }
+
+    /// Has the server read the client's request, ask the client to cancel,
+    /// then read its attention and send `response`, which the server sent
+    /// before it saw the attention, then the attention's ack.
+    async fn finish_before_the_attention(
+        mut server: Framed<Duplex, PacketCodec>,
+        cancellation: crate::CancellationToken,
+        response: BytesMut,
+    ) {
+        server.next().await.unwrap().unwrap();
+        cancellation.cancel();
+        let attention = server.next().await.unwrap().unwrap();
+        assert!(matches!(
+            attention.header().r#type(),
+            PacketType::AttentionSignal
+        ));
+        respond(&mut server, response, true).await;
+        respond(&mut server, attention_ack(), true).await;
+    }
+
+    #[tokio::test]
+    async fn prep_exec_until_error_returns_a_handle_assigned_before_a_cancellation() {
+        use crate::tds::codec::{BaseMetaDataColumn, TokenReturnValue};
+        let (connection, server) = duplex(true);
+        let mut client = crate::Client { connection };
+        let mut response = BytesMut::new();
+        TokenReturnValue {
+            param_ordinal: 0,
+            param_name: "@handle".into(),
+            udf: false,
+            meta: BaseMetaDataColumn {
+                user_type: 0,
+                flags: enumflags2::BitFlags::empty(),
+                ty: crate::TypeInfo::FixedLen(crate::FixedLenType::Int4),
+                table_name: None,
+            },
+            value: crate::ColumnData::I32(Some(7)),
+        }
+        .encode(&mut response)
+        .unwrap();
+        TokenDone::default().encode(&mut response).unwrap();
+        let server = finish_before_the_attention(server, client.cancellation_token(), response);
+
+        let ((statement, _, error), ()) =
+            tokio::join!(client.prep_exec_until_error("SELECT 1", "", &[]), server);
+        assert_eq!(statement.map(|s| s.handle().as_i32()), Some(7));
+        assert_eq!(error, Some(crate::Error::Canceled));
+    }
+
+    #[tokio::test]
+    async fn a_retry_reports_how_a_canceled_commit_ended() {
+        let (connection, server) = duplex(true);
+        let mut client = crate::Client { connection };
+        client
+            .connection
+            .context_mut()
+            .set_transaction_descriptor(DESC);
+        let mut response = BytesMut::new();
+        TokenEnvChange::CommitTransaction {
+            new: Vec::new(),
+            old: DESC.to_vec(),
+        }
+        .encode(&mut response)
+        .unwrap();
+        TokenDone::default().encode(&mut response).unwrap();
+        let server = finish_before_the_attention(server, client.cancellation_token(), response);
+
+        let (result, ()) = tokio::join!(client.commit_transaction(), server);
+        assert_eq!(result, Err(crate::Error::Canceled));
+        assert_eq!(
+            client.commit_transaction().await.unwrap(),
+            crate::TransactionEnd::AlreadyCommitted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_only_fetch_cut_short_keeps_the_server_error() {
+        use crate::client::rpc_response::collect_metadata_only_rpc;
+        // A token that fails to decode follows the server error: a database
+        // change whose new name is an unpaired surrogate.
+        let mut bytes = duplicate_key_error();
+        bytes.extend_from_slice(&[0xe3, 5, 0, 1, 1, 0x00, 0xd8, 0, 0xfd]);
+        let error = collect_metadata_only_rpc(&mut buffered(&bytes))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, crate::Error::CleanupFailed { cleanup, .. }
+                if matches!(**cleanup, crate::Error::Protocol(_))),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), Some(2627));
+        assert!(!error.leaves_connection_usable());
+
+        // A cancellation follows the server error.
+        let (mut connection, mut server) = duplex(false);
+        let cancellation = connection.cancellation_token();
+        let server = async move {
+            respond(&mut server, duplicate_key_error(), false).await;
+            cancellation.cancel();
+            server.next().await.unwrap().unwrap();
+            respond(&mut server, encoded(TokenDone::default()), true).await;
+            respond(&mut server, attention_ack(), true).await;
+        };
+        let (result, ()) = tokio::join!(collect_metadata_only_rpc(&mut connection), server);
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, crate::Error::CleanupFailed { cleanup, .. }
+                if **cleanup == crate::Error::Canceled),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), Some(2627));
+        assert!(error.leaves_connection_usable());
     }
 
     #[tokio::test]

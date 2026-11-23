@@ -398,8 +398,11 @@ where
             .map_err(Error::into_decode_failure)?;
             self.conn.token_decoded();
 
-            // When draining after attention, skip all tokens until we see
-            // Done+Attention, then terminate the stream.
+            // When draining after attention, skip tokens until we see
+            // Done+Attention, then terminate the stream. Output values still
+            // pass: the server may have finished the request before it saw
+            // the attention, and one such as a prepared statement's handle
+            // names a resource the caller must release.
             if self.attention_sent {
                 match &token {
                     ReceivedToken::Done(done)
@@ -410,6 +413,7 @@ where
                         self.conn.attention_acknowledged();
                         return Ok(None);
                     }
+                    ReceivedToken::ReturnValue(_) => (),
                     _ => continue,
                 }
             }
