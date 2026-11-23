@@ -76,8 +76,15 @@ fn parse_certificate(bytes: &[u8]) -> crate::Result<(Certificate, Vec<u8>)> {
 }
 
 fn load_certificate(path: &Path) -> crate::Result<(Certificate, Vec<u8>)> {
-    let bytes = fs::read(path)
-        .map_err(|_| Error::Tls("Could not read the configured certificate file.".to_owned()))?;
+    // Keep the I/O kind (not found, permission denied, ...) but leave out the
+    // path: the caller already has it, and it can reveal local names in logs.
+    let bytes = fs::read(path).map_err(|e| Error::Io {
+        kind: e.kind(),
+        message: format!(
+            "Could not read the configured certificate file: {}",
+            e.kind()
+        ),
+    })?;
     parse_certificate(&bytes)
 }
 

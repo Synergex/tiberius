@@ -2,7 +2,7 @@
 
 use async_rustls::rustls;
 use std::{io::Read, net::TcpListener, path::PathBuf, sync::Arc, thread, time::Duration};
-use tiberius::error::Error;
+use tiberius::error::{Error, IoErrorKind};
 use tiberius::{AuthMethod, Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -177,7 +177,16 @@ async fn missing_pin_file_has_no_fallback_or_path_disclosure() {
     let missing = fixture("missing-pin-sensitive-path.pem");
     config.server_certificate(&missing);
     let (error, received) = connect_to_peer(config).await;
-    assert!(matches!(error, Error::Tls(_)));
+    assert!(
+        matches!(
+            error,
+            Error::Io {
+                kind: IoErrorKind::NotFound,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
     assert!(!error.to_string().contains(&missing));
     assert!(!error.to_string().contains("missing-pin-sensitive-path"));
     assert!(received.is_empty());
@@ -199,7 +208,20 @@ async fn malformed_or_missing_custom_ca_has_no_fallback() {
         config.certificate_hostname("sql.test");
         config.trust_cert_ca(fixture(file));
         let (error, received) = connect_to_peer(config).await;
-        assert!(matches!(error, Error::Tls(_)));
+        if file == "malformed.pem" {
+            assert!(matches!(error, Error::Tls(_)), "{error:?}");
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    Error::Io {
+                        kind: IoErrorKind::NotFound,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
         assert!(!error.to_string().contains(file));
         assert!(received.is_empty());
     }
