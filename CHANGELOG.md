@@ -67,7 +67,8 @@
 - Add native TLS-first TDS 8.0 via `Config::strict_encryption`, with no fallback and no certificate-validation bypass.
 - Add certificate hostname overrides and exact leaf-certificate file pinning; validate conflicting/unsupported security settings once at connection entry, before protocol I/O.
 - **Breaking (native TLS):** CA and pin files must contain exactly one PEM or DER certificate; bundles and text around the certificate are rejected. Unreadable CA files now return `Error::Tls` instead of `Error::Io`. Adding a custom CA preserves OS roots.
-- Reject required-encryption downgrades and malformed TLS handshake packets with an error instead of panicking; correctly negotiate Optional plaintext and login-only/full-session TLS.
+- Reject required-encryption downgrades and malformed TLS handshake packets with an error instead of panicking.
+- **Breaking (Optional encryption):** `EncryptionLevel::Off` returns `Error::Tls` before sending `LOGIN7` when the server replies `ENCRYPT_NOT_SUP`. This deliberately deviates from MS-TDS, SqlClient, Microsoft's JDBC driver, and go-mssqldb, which allow a plaintext login in this case, and follows ODBC Driver 18's documented guarantee that login credentials are always encrypted. Set `EncryptionLevel::NotSupported` to allow a plaintext login.
 - Expose actual post-login TLS state through `Client::is_encrypted`.
 - Allow `trust_cert()` without a TLS backend when encryption is explicitly `NotSupported`; the bypass is inert, and conflicting security settings remain errors.
 

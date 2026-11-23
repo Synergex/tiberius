@@ -75,8 +75,8 @@ The crate can also be compiled without TLS support, but not with both features e
 | --- | --- |
 | `Required` | Require full-session TLS; reject a server that declines. Default for `Config::new()` with TLS enabled. |
 | `On` | Require full-session TLS, like `Required`. |
-| `Off` | Optional: plaintext if TLS is unavailable, login-only TLS if the server returns OFF, or full-session TLS if the server requires it. |
-| `NotSupported` | No TLS; reject a server that requests TLS. |
+| `Off` | Optional. Uses login-only TLS when the server returns `ENCRYPT_OFF` and full-session TLS when the server selects it. Returns `Error::Tls` before sending the login if the server returns `ENCRYPT_NOT_SUP`. |
+| `NotSupported` | Allows an unencrypted login and session when the server agrees. Rejects a server that requests TLS. |
 
 Native TLS additionally supports `Config::strict_encryption(true)`: TLS-first TDS 8.0 (SQL Server 2022+), TLS 1.2 or later, with no TDS 7 fallback. Set `EncryptionLevel::Required` with Strict. Non-Strict native TLS uses TLS up to 1.2 for TDS 7 compatibility.
 
