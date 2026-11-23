@@ -321,6 +321,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// read has consumed no bytes — a single-byte read parks before touching
     /// the buffer — so nothing is lost.
     pub(crate) async fn read_u8_or_cancel(&mut self) -> crate::Result<Option<u8>> {
+        // A buffered-only read is of a response that has already ended: an
+        // attention would have nothing to cancel, and its acknowledgment could
+        // not be in the buffer. Leave the cancellation for the next request.
+        if self.buffered_only {
+            return Ok(Some(self.read_u8().await?));
+        }
+
         // Check the flag up front. `select` polls the read first and returns
         // immediately if it is ready, so without this a cancellation requested
         // before entry would be ignored whenever the next byte is already
@@ -1180,6 +1187,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), Some(50001), "{error:?}");
         assert!(!error.leaves_connection_usable());
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_during_a_buffered_drain_is_left_for_the_next_request() {
+        let mut connection = buffered(&encoded(TokenDone::default()));
+        // Requested after `flush_stream` cleared the flag, as the drain runs.
+        connection.cancellation_token().cancel();
+        assert!(connection.drain_buffered_tokens().await);
+        assert!(!connection.attention_pending);
+        assert!(connection.is_cancellation_requested());
+        connection.usable().unwrap();
     }
 
     #[tokio::test]
