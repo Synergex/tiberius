@@ -65,6 +65,11 @@ async fn mandatory_refuses_downgrades_before_sending_credentials() {
     .unwrap();
 }
 
+#[cfg(any(
+    feature = "native-tls",
+    feature = "rustls",
+    feature = "vendored-openssl"
+))]
 #[tokio::test]
 async fn optional_refuses_plaintext_login() {
     tokio::time::timeout(Duration::from_secs(10), async {

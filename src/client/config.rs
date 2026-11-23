@@ -126,7 +126,8 @@ impl Config {
     /// Set the preferred encryption level.
     ///
     /// - With `tls` feature, defaults to `Required`.
-    /// - Without `tls` feature, defaults to `NotSupported`.
+    /// - Without `tls` feature, defaults to `NotSupported`, the only level
+    ///   accepted at connection.
     pub fn encryption(&mut self, encryption: EncryptionLevel) {
         self.encryption = encryption;
     }
@@ -218,14 +219,10 @@ impl Config {
             feature = "rustls",
             feature = "vendored-openssl"
         )))]
-        if (bypass && self.encryption != EncryptionLevel::NotSupported)
-            || matches!(
-                self.encryption,
-                EncryptionLevel::On | EncryptionLevel::Required
-            )
-        {
+        // Off still encrypts the login, so every level but NotSupported needs TLS.
+        if self.encryption != EncryptionLevel::NotSupported {
             return Err(invalid(
-                "The requested encryption settings require a TLS backend.",
+                "Encryption levels other than NotSupported require a TLS backend.",
             ));
         }
         Ok(())
@@ -569,21 +566,25 @@ mod security_tests {
         feature = "vendored-openssl"
     )))]
     #[test]
-    fn bypass_without_tls_requires_explicit_plaintext() {
-        for (encryption, accepted) in [
-            (EncryptionLevel::NotSupported, true),
-            (EncryptionLevel::Off, false),
-            (EncryptionLevel::On, false),
-            (EncryptionLevel::Required, false),
-        ] {
-            let mut config = Config::new();
-            config.encryption(encryption);
-            config.trust_cert();
-            assert_eq!(
-                config.validate_security().is_ok(),
-                accepted,
-                "{encryption:?}"
-            );
+    fn without_tls_only_plaintext_is_accepted() {
+        for bypass in [false, true] {
+            for (encryption, accepted) in [
+                (EncryptionLevel::NotSupported, true),
+                (EncryptionLevel::Off, false),
+                (EncryptionLevel::On, false),
+                (EncryptionLevel::Required, false),
+            ] {
+                let mut config = Config::new();
+                config.encryption(encryption);
+                if bypass {
+                    config.trust_cert();
+                }
+                assert_eq!(
+                    config.validate_security().is_ok(),
+                    accepted,
+                    "{encryption:?}, bypass: {bypass}"
+                );
+            }
         }
     }
 
