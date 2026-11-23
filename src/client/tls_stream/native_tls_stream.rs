@@ -17,7 +17,9 @@ fn certificate_error() -> Error {
 // some platforms accept only the first PEM block, so enforce our file contract
 // before calling them.
 fn parse_certificate(bytes: &[u8]) -> crate::Result<(Certificate, Vec<u8>)> {
-    let trimmed = bytes.trim_ascii();
+    // A UTF-8 BOM (Windows PowerShell 5.1 `-Encoding utf8`) is text encoding, not PEM data.
+    let text = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let trimmed = text.trim_ascii();
     let decoded;
     let der = if trimmed.starts_with(b"-----BEGIN CERTIFICATE-----") {
         let body = trimmed
@@ -164,6 +166,13 @@ mod tests {
     fn certificate_files_reject_extra_or_malformed_data() {
         assert_eq!(parse_certificate(CERTIFICATE).unwrap().1, DER);
         assert_eq!(parse_certificate(DER).unwrap().1, DER);
+        let bom = b"\xEF\xBB\xBF".as_slice();
+        assert_eq!(
+            parse_certificate(&[bom, CERTIFICATE].concat()).unwrap().1,
+            DER
+        );
+        let bom_der = [bom, DER].concat();
+        let bom_bundle = [bom, CERTIFICATE, bom, CERTIFICATE].concat();
         let bundle = [CERTIFICATE, CERTIFICATE].concat();
         let pem_suffix = [CERTIFICATE, b"unparsed suffix"].concat();
         let der_suffix = [DER, b"\0"].concat();
@@ -173,6 +182,8 @@ mod tests {
             bundle.as_slice(),
             pem_suffix.as_slice(),
             der_suffix.as_slice(),
+            bom_der.as_slice(),
+            bom_bundle.as_slice(),
             b"\x30\x80\0\0",
         ] {
             assert!(parse_certificate(invalid).is_err());

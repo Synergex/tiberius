@@ -119,6 +119,28 @@ async fn exact_leaf_pem_and_der_pins_replace_chain_and_hostname_checks() {
     }
 }
 
+// Windows PowerShell 5.1 `-Encoding utf8` prefixes text files with a UTF-8 BOM.
+#[tokio::test]
+async fn pem_files_with_a_utf8_byte_order_mark_are_accepted() {
+    let with_bom = |name: &str| {
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("bom-{name}"));
+        let pem = std::fs::read(fixture(name)).unwrap();
+        std::fs::write(&path, [b"\xEF\xBB\xBF".as_slice(), &pem].concat()).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+
+    let mut config = Config::new();
+    config.trust_cert_ca(with_bom("ca.pem"));
+    config.certificate_hostname("sql.test");
+    let (_, received) = connect_to_peer(config).await;
+    assert_eq!(received.first(), Some(&0x12));
+
+    let mut config = Config::new();
+    config.server_certificate(with_bom("server.pem"));
+    let (_, received) = connect_to_peer(config).await;
+    assert_eq!(received.first(), Some(&0x12));
+}
+
 #[tokio::test]
 async fn pinning_the_issuer_instead_of_the_leaf_is_rejected_before_tds() {
     let mut config = Config::new();
