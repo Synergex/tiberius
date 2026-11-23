@@ -156,6 +156,7 @@ pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::tls::session_tests::peer_config;
     use futures_util::io::AsyncWriteExt;
     use std::{io::Read, net::TcpListener, thread, time::Duration};
 
@@ -195,20 +196,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let peer = thread::spawn(move || {
-            let identity = native_tls_crate::Identity::from_pkcs12(
-                include_bytes!("../../../tests/security-fixtures/server.p12"),
-                "",
-            )
-            .unwrap();
-            let acceptor = native_tls_crate::TlsAcceptor::new(identity).unwrap();
-            let (socket, _) = listener.accept().unwrap();
+            let mut connection =
+                async_rustls::rustls::ServerConnection::new(peer_config()).unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             socket
                 .set_write_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
-            let mut tls = acceptor.accept(socket).unwrap();
+            let mut tls = async_rustls::rustls::Stream::new(&mut connection, &mut socket);
             let mut marker = [0; 1];
             tls.read_exact(&mut marker).unwrap();
             marker

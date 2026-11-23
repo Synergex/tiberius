@@ -1,6 +1,7 @@
 #![cfg(feature = "native-tls")]
 
-use std::{io::Read, net::TcpListener, path::PathBuf, thread, time::Duration};
+use async_rustls::rustls;
+use std::{io::Read, net::TcpListener, path::PathBuf, sync::Arc, thread, time::Duration};
 use tiberius::error::Error;
 use tiberius::{AuthMethod, Client, Config};
 use tokio::net::TcpStream;
@@ -15,29 +16,46 @@ fn fixture(name: &str) -> String {
         .to_owned()
 }
 
+// The peer is rustls, not native-tls: on Windows, native-tls leaves every
+// imported key in the user's key store.
+fn peer_config() -> Arc<rustls::ServerConfig> {
+    let chain = [
+        &include_bytes!("security-fixtures/server.pem")[..],
+        include_bytes!("security-fixtures/ca.pem"),
+    ]
+    .into_iter()
+    .flat_map(|mut pem| rustls_pemfile::certs(&mut pem).unwrap())
+    .map(rustls::Certificate)
+    .collect();
+    let key = rustls_pemfile::pkcs8_private_keys(
+        &mut &include_bytes!("security-fixtures/server.key")[..],
+    )
+    .unwrap()
+    .remove(0);
+    let config = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(chain, rustls::PrivateKey(key))
+        .unwrap();
+    Arc::new(config)
+}
+
 // The peer stops after TLS and the first TDS bytes: no SQL Server or credentials
 // are needed. Seeing PRELOGIN proves verification completed before any login.
 async fn connect_to_peer(mut config: Config) -> (Error, Vec<u8>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let peer = thread::spawn(move || {
-        let identity = native_tls_crate::Identity::from_pkcs12(
-            include_bytes!("security-fixtures/server.p12"),
-            "",
-        )
-        .unwrap();
-        let acceptor = native_tls_crate::TlsAcceptor::new(identity).unwrap();
-        let (socket, _) = listener.accept().unwrap();
+        let mut connection = rustls::ServerConnection::new(peer_config()).unwrap();
+        let (mut socket, _) = listener.accept().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         socket
             .set_write_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let mut tls = match acceptor.accept(socket) {
-            Ok(tls) => tls,
-            Err(_) => return Vec::new(),
-        };
+        // The read drives the handshake; a failed one yields nothing.
+        let mut tls = rustls::Stream::new(&mut connection, &mut socket);
         let mut received = [0; 8];
         match tls.read(&mut received) {
             Ok(count) => received[..count].to_vec(),

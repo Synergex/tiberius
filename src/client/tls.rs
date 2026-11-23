@@ -497,12 +497,37 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "native-tls"))]
-mod session_tests {
+pub(crate) mod session_tests {
     use super::TlsPreloginWrapper;
     use crate::{AuthMethod, Client, Config, EncryptionLevel};
-    use futures_util::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Cursor};
-    use std::time::Duration;
+    use async_rustls::rustls;
+    use futures_util::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use std::{sync::Arc, time::Duration};
     use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    /// The test server's TLS setup. It is rustls, not native-tls: on Windows,
+    /// native-tls leaves every imported key in the user's key store.
+    pub(crate) fn peer_config() -> Arc<rustls::ServerConfig> {
+        let chain = [
+            &include_bytes!("../../tests/security-fixtures/server.pem")[..],
+            include_bytes!("../../tests/security-fixtures/ca.pem"),
+        ]
+        .into_iter()
+        .flat_map(|mut pem| rustls_pemfile::certs(&mut pem).unwrap())
+        .map(rustls::Certificate)
+        .collect();
+        let key = rustls_pemfile::pkcs8_private_keys(
+            &mut &include_bytes!("../../tests/security-fixtures/server.key")[..],
+        )
+        .unwrap()
+        .remove(0);
+        let config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(chain, rustls::PrivateKey(key))
+            .unwrap();
+        Arc::new(config)
+    }
 
     async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> (u8, Vec<u8>) {
         let mut header = [0; 8];
@@ -550,6 +575,9 @@ mod session_tests {
         write_packet(stream, &[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).await;
     }
 
+    // async-rustls is deprecated only as renamed to futures-rustls; the
+    // server-rustls feature already depends on it.
+    #[allow(deprecated)]
     #[tokio::test]
     async fn tls_session_lifecycle() {
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -576,14 +604,9 @@ mod session_tests {
                     } else {
                         TlsPreloginWrapper::new(server)
                     };
-                    let acceptor = async_native_tls::TlsAcceptor::new(
-                        Cursor::new(include_bytes!("../../tests/security-fixtures/server.p12")),
-                        "",
-                    )
-                    .await
-                    .unwrap();
+                    let acceptor = async_rustls::TlsAcceptor::from(peer_config());
                     let mut tls = acceptor.accept(wrapper).await.unwrap();
-                    tls.get_mut().handshake_complete();
+                    tls.get_mut().0.handshake_complete();
                     if strict {
                         assert_eq!(read_packet(&mut tls).await.0, 0x12);
                         prelogin_response(&mut tls, offered).await;
@@ -592,7 +615,7 @@ mod session_tests {
                     if !encrypted {
                         // Login-only TLS ends immediately after LOGIN7;
                         // the login response and query must be plaintext.
-                        let mut raw = tls.get_mut().stream.take().unwrap();
+                        let mut raw = tls.get_mut().0.stream.take().unwrap();
                         drop(tls);
                         login_and_query_response(&mut raw).await;
                     } else {
