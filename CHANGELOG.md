@@ -70,6 +70,8 @@
 - Reject required-encryption downgrades and malformed TLS handshake packets with an error instead of panicking.
 - Server: an `EncryptionLevel::Off` policy now answers `ENCRYPT_ON` to clients that request `On`/`Required`, as MS-TDS specifies, instead of `ENCRYPT_OFF`, which those clients reject.
 - **Breaking (Optional encryption):** `EncryptionLevel::Off` returns `Error::Tls` before sending `LOGIN7` when the server replies `ENCRYPT_NOT_SUP`. This deliberately deviates from MS-TDS, SqlClient, Microsoft's JDBC driver, and go-mssqldb, which allow a plaintext login in this case, and follows ODBC Driver 18's documented guarantee that login credentials are always encrypted. Set `EncryptionLevel::NotSupported` to allow a plaintext login.
+- **Breaking (plaintext encryption):** `EncryptionLevel::NotSupported` returns `Error::Tls` before sending `LOGIN7` when the server's PRELOGIN response asks for encryption, instead of switching to TLS. Use `Off`, `On` or `Required` to connect to a server that requires encryption. Builds without a TLS backend reject every level except `NotSupported` before protocol I/O, instead of silently falling back to a plaintext session.
+- **Breaking:** `PreloginMessage::negotiated_encryption` returns `Result<EncryptionLevel>` and reports an unacceptable server response as `Error::Tls` instead of panicking.
 - Expose actual post-login TLS state through `Client::is_encrypted`.
 - Allow `trust_cert()` without a TLS backend when encryption is explicitly `NotSupported`; the bypass is inert, and conflicting security settings remain errors.
 

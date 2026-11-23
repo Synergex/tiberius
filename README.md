@@ -87,7 +87,7 @@ Certificate identity is validated against OS trust and the connection hostname b
 - `server_certificate(path)` pins the exact DER leaf certificate from one PEM or DER file instead of chain/hostname validation. Pinning does not check expiry or hostname; update the pin when the certificate changes.
 - `trust_cert()` explicitly bypasses certificate/hostname checks. It is forbidden in Strict and conflicts with other identity controls.
 
-Pinning requires full-session encryption and conflicts with CA/hostname overrides. With native TLS, unreadable, malformed, bundled, or trailing-data certificate files fail without fallback. Unsupported backend/option combinations and conflicting settings return errors before protocol I/O; hostname/pin/Strict controls require the native TLS backend. `Client::is_encrypted()` reports actual post-login TLS, including Optional's negotiated outcome. These APIs apply to programmatic configuration; RSSQL parses its own connection-string controls.
+Pinning requires full-session encryption and conflicts with CA/hostname overrides. With native TLS, unreadable, malformed, bundled, or trailing-data certificate files fail without fallback. Certificate files are read when the TLS handshake starts, which in TDS 7 mode is after the PRELOGIN exchange but before the login is sent. Unsupported backend/option combinations and conflicting settings return errors before protocol I/O; hostname/pin/Strict controls require the native TLS backend. `Client::is_encrypted()` reports actual post-login TLS, including Optional's negotiated outcome. These APIs apply to programmatic configuration; RSSQL parses its own connection-string controls.
 
 ### Integrated Authentication (TrustedConnection) on \*nix
 
