@@ -64,6 +64,16 @@
   eof". The client sent each TLS record of a handshake step as a PRELOGIN
   message of its own, which SQL Server rejects; each step now goes out as one
   message again.
+- Add native TLS-first TDS 8.0 via `Config::strict_encryption`, with no fallback and no certificate-validation bypass.
+- Add certificate hostname overrides and exact leaf-certificate file pinning; validate conflicting/unsupported security settings once at connection entry, before protocol I/O.
+- **Breaking (native TLS):** CA and pin files must contain exactly one PEM or DER certificate; bundles and text around the certificate are rejected. Unreadable CA files now return `Error::Tls` instead of `Error::Io`. Adding a custom CA preserves OS roots.
+- Reject required-encryption downgrades and malformed TLS handshake packets with an error instead of panicking.
+- Server: an `EncryptionLevel::Off` policy now answers `ENCRYPT_ON` to clients that request `On`/`Required`, as MS-TDS specifies, instead of `ENCRYPT_OFF`, which those clients reject.
+- **Breaking (Optional encryption):** `EncryptionLevel::Off` returns `Error::Tls` before sending `LOGIN7` when the server replies `ENCRYPT_NOT_SUP`. This deliberately deviates from MS-TDS, SqlClient, Microsoft's JDBC driver, and go-mssqldb, which allow a plaintext login in this case, and follows ODBC Driver 18's documented guarantee that login credentials are always encrypted. Set `EncryptionLevel::NotSupported` to allow a plaintext login.
+- **Breaking (plaintext encryption):** `EncryptionLevel::NotSupported` returns `Error::Tls` before sending `LOGIN7` when the server's PRELOGIN response asks for encryption, instead of switching to TLS. Use `Off`, `On` or `Required` to connect to a server that requires encryption. Builds without a TLS backend reject every level except `NotSupported` before protocol I/O, instead of silently falling back to a plaintext session.
+- **Breaking:** `PreloginMessage::negotiated_encryption` returns `Result<EncryptionLevel>` and reports an unacceptable server response as `Error::Tls` instead of panicking.
+- Expose actual post-login TLS state through `Client::is_encrypted`.
+- Allow `trust_cert()` without a TLS backend when encryption is explicitly `NotSupported`; the bypass is inert, and conflicting security settings remain errors.
 
 ## Version 0.12.3
 - feat: improve column type accuracy (#347)
