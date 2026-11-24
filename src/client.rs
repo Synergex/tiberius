@@ -6,6 +6,8 @@ mod cursor;
 mod prepared;
 mod rpc_call;
 mod rpc_response;
+#[cfg(any(test, all(windows, feature = "winauth")))]
+mod sspi;
 
 mod tls;
 #[cfg(any(
