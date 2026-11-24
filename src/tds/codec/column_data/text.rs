@@ -31,10 +31,7 @@ where
                 buf.push(src.read_u8().await?);
             }
 
-            encoder
-                .decode_without_bom_handling_and_without_replacement(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
-                .to_string()
+            super::string::decode_code_page(encoder, buf.as_ref()).into_owned()
         }
         // NTEXT
         None => {
@@ -48,7 +45,7 @@ where
                 buf.push(src.read_u16_le().await?);
             }
 
-            String::from_utf16(&buf[..])?
+            String::from_utf16_lossy(&buf[..])
         }
     };
 

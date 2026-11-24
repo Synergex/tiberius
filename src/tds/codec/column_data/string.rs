@@ -1,8 +1,26 @@
 use std::borrow::Cow;
 
 use byteorder::{ByteOrder, LittleEndian};
+use encoding_rs::Encoding;
+use tracing::{event, Level};
 
 use crate::{error::Error, sql_read_bytes::SqlReadBytes, tds::Collation, VarLenType};
+
+/// Decodes text stored in a code page. SQL Server stores char/varchar bytes as
+/// given, so a value can hold bytes its code page cannot map, such as a
+/// double-byte character cut in half. Those become U+FFFD instead of failing,
+/// which would end the connection.
+pub(crate) fn decode_code_page<'a>(encoding: &'static Encoding, bytes: &'a [u8]) -> Cow<'a, str> {
+    let (text, had_errors) = encoding.decode_without_bom_handling(bytes);
+    if had_errors {
+        event!(
+            Level::WARN,
+            encoding = encoding.name(),
+            "replaced bytes invalid in the column's code page with U+FFFD"
+        );
+    }
+    text
+}
 
 pub(crate) async fn decode<R>(
     src: &mut R,
@@ -23,10 +41,17 @@ where
             let collation = collation.as_ref().unwrap();
             let encoder = collation.encoding()?;
 
-            let s = encoder
-                .decode_without_bom_handling_and_without_replacement(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
-                .to_string();
+            // A borrowed result means the bytes are already the UTF-8 text, so
+            // keep the buffer instead of copying it.
+            let transcoded = match decode_code_page(encoder, buf.as_ref()) {
+                Cow::Owned(text) => Some(text),
+                Cow::Borrowed(_) => None,
+            };
+            let s = match transcoded {
+                Some(text) => text,
+                None => String::from_utf8(buf)
+                    .map_err(|_| Error::Encoding("invalid sequence".into()))?,
+            };
 
             Ok(Some(s.into()))
         }
@@ -37,7 +62,7 @@ where
             }
 
             let buf: Vec<_> = buf.chunks(2).map(LittleEndian::read_u16).collect();
-            Ok(Some(String::from_utf16(&buf)?.into()))
+            Ok(Some(String::from_utf16_lossy(&buf).into()))
         }
         _ => Ok(None),
     }
@@ -72,12 +97,79 @@ where
         VarLenType::Char | VarLenType::VarChar => {
             let collation = collation.ok_or_else(|| Error::Protocol("varchar: missing collation".into()))?;
             let encoder = collation.encoding()?;
-            let s = encoder
-                .decode_without_bom_handling_and_without_replacement(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
-                .to_string();
+            let s = decode_code_page(encoder, buf.as_ref()).into_owned();
             Ok(Some(s.into()))
         }
         _ => Err(Error::Protocol("varchar: unsupported type".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+    use bytes::{BufMut, BytesMut};
+
+    #[tokio::test]
+    async fn code_page_text_keeps_ascii_and_transcodes_other_bytes() {
+        let collation = Some(Collation::new(13632521, 52));
+        for (bytes, expected) in [
+            (&b"plain text"[..], "plain text"),
+            (&b""[..], ""),
+            (&[b'c', b'a', b'f', 0xe9][..], "caf\u{e9}"),
+        ] {
+            let mut wire = BytesMut::new();
+            wire.put_u16_le(bytes.len() as u16);
+            wire.put_slice(bytes);
+            wire.put_u8(0xad);
+            let mut reader = wire.into_sql_read_bytes();
+            let value = decode(&mut reader, VarLenType::BigVarChar, 8000, collation)
+                .await
+                .unwrap();
+            assert_eq!(value.as_deref(), Some(expected));
+            assert_eq!(reader.read_u8().await.unwrap(), 0xad);
+        }
+    }
+
+    #[tokio::test]
+    async fn bytes_invalid_in_the_code_page_decode_as_replacement_characters() {
+        // Shift_JIS: 0x81 is a lead byte, and 0x00 cannot follow it.
+        let shift_jis = Some(Collation::new(0x0411, 0));
+        let bytes = [0x81, 0x00];
+
+        let mut wire = BytesMut::new();
+        wire.put_u16_le(bytes.len() as u16);
+        wire.put_slice(&bytes);
+        wire.put_u8(bytes.len() as u8);
+        wire.put_slice(&bytes);
+        wire.put_u8(0xad);
+        let mut reader = wire.into_sql_read_bytes();
+
+        let value = decode(&mut reader, VarLenType::BigVarChar, 8000, shift_jis)
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some("\u{fffd}\0"));
+        let value = decode_short(&mut reader, VarLenType::VarChar, 255, shift_jis)
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some("\u{fffd}\0"));
+        assert_eq!(reader.read_u8().await.unwrap(), 0xad);
+    }
+
+    #[tokio::test]
+    async fn unpaired_surrogates_decode_as_replacement_characters() {
+        let units = [0x41, 0xd83d, 0x42, 0xdc00];
+        let mut wire = BytesMut::new();
+        wire.put_u16_le((units.len() * 2) as u16);
+        for unit in units {
+            wire.put_u16_le(unit);
+        }
+        wire.put_u8(0xad);
+        let mut reader = wire.into_sql_read_bytes();
+        let value = decode(&mut reader, VarLenType::NVarchar, 8000, None)
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some("A\u{fffd}B\u{fffd}"));
+        assert_eq!(reader.read_u8().await.unwrap(), 0xad);
     }
 }

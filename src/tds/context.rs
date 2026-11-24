@@ -18,6 +18,7 @@ pub(crate) struct Context {
     packet_size: u32,
     packet_id: u8,
     transaction_desc: [u8; 8],
+    transaction_end: Option<TransactionOutcome>,
     last_meta: Option<Arc<TokenColMetaData<'static>>>,
     alt_meta: HashMap<u16, Arc<TokenAltMetaData<'static>>>,
     spn: Option<String>,
@@ -33,6 +34,7 @@ impl Context {
             packet_size: 4096,
             packet_id: 0,
             transaction_desc: [0; 8],
+            transaction_end: None,
             last_meta: None,
             alt_meta: HashMap::new(),
             spn: None,
@@ -98,6 +100,57 @@ impl Context {
         self.transaction_desc = desc;
     }
 
+    /// How the server last reported a transaction ending, until it reports
+    /// one beginning or a commit or rollback call returns `Ended`. A call
+    /// that fails or is dropped leaves the end for the next one to report.
+    pub fn transaction_end(&self) -> Option<TransactionOutcome> {
+        self.transaction_end
+    }
+
+    pub fn set_transaction_end(&mut self, end: Option<TransactionOutcome>) {
+        self.transaction_end = end;
+    }
+
+    /// Records what an ENVCHANGE token changed in the session. Every reader
+    /// of response tokens applies them here, so the transaction descriptor
+    /// later requests carry is the server's current one.
+    pub fn apply_env_change(&mut self, change: &TokenEnvChange) {
+        match change {
+            TokenEnvChange::PacketSize(new_size, _) => {
+                self.set_packet_size(*new_size);
+            }
+            TokenEnvChange::BeginTransaction(desc) | TokenEnvChange::EnlistDtcTransaction(desc) => {
+                self.transaction_desc = *desc;
+                self.transaction_end = None;
+            }
+            TokenEnvChange::CommitTransaction { new, .. } => {
+                self.update_transaction_descriptor(new);
+                self.transaction_end = Some(TransactionOutcome::Commit);
+            }
+            TokenEnvChange::RollbackTransaction { new, .. } => {
+                self.update_transaction_descriptor(new);
+                self.transaction_end = Some(TransactionOutcome::Rollback);
+            }
+            TokenEnvChange::DefectTransaction { new, .. }
+            | TokenEnvChange::PromoteTransaction { dtc: new, .. }
+            | TokenEnvChange::TransactionEnded { new, .. } => {
+                self.update_transaction_descriptor(new);
+            }
+            TokenEnvChange::ResetConnection => {
+                self.transaction_desc = [0; 8];
+                self.transaction_end = None;
+            }
+            TokenEnvChange::Database(new, _) => {
+                self.set_database(new.clone());
+            }
+            _ => (),
+        }
+    }
+
+    fn update_transaction_descriptor(&mut self, bytes: &[u8]) {
+        self.transaction_desc = <[u8; 8]>::try_from(bytes).unwrap_or([0; 8]);
+    }
+
     pub fn version(&self) -> FeatureLevel {
         self.version
     }
@@ -128,10 +181,6 @@ impl Context {
 
     pub fn set_database(&mut self, database: String) {
         self.database = Some(database);
-    }
-
-    pub fn clear_database(&mut self) {
-        self.database = None;
     }
 
     pub fn set_spn(&mut self, host: impl AsRef<str>, port: u16) {
