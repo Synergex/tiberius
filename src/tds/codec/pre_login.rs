@@ -57,13 +57,22 @@ impl PreloginMessage {
         }
     }
 
-    /// Apply the TDS 7 encryption negotiation table. `Off` means login-only
-    /// TLS, `On` full-session TLS, and `NotSupported` an unencrypted session.
+    /// Negotiate TDS 7 encryption. `Off` means login-only TLS, `On` means
+    /// full-session TLS, and `NotSupported` means an unencrypted session.
+    ///
+    /// An `Off` client rejects `ENCRYPT_NOT_SUP` before sending the login.
+    /// MS-TDS, SqlClient, Microsoft's JDBC driver, and go-mssqldb allow a
+    /// plaintext login in that case. This policy follows ODBC Driver 18's
+    /// documented guarantee that login credentials are always encrypted. Use
+    /// `NotSupported` to allow an unencrypted login.
     pub fn negotiated_encryption(&self, expected: EncryptionLevel) -> Result<EncryptionLevel> {
         use EncryptionLevel::{NotSupported, Off, On, Required};
 
         match (expected, self.encryption) {
-            (NotSupported, NotSupported) | (Off, NotSupported) => Ok(NotSupported),
+            (NotSupported, NotSupported) => Ok(NotSupported),
+            (Off, NotSupported) => Err(Error::Tls(
+                "Server does not support encryption; the login was not sent.".into(),
+            )),
             (Off, Off) => Ok(Off),
             (Off | On | Required, On | Required) => Ok(On),
             (On | Required, Off | NotSupported) => Err(Error::Tls(
@@ -218,7 +227,9 @@ impl Decode<BytesMut> for PreloginMessage {
                     } else if length == 4 {
                         cursor.read_u32::<BigEndian>()?
                     } else {
-                        panic!("should never happen")
+                        return Err(Error::Protocol(
+                            format!("invalid prelogin thread id length: {}", length).into(),
+                        ));
                     }
                 }
                 // mars
@@ -299,12 +310,22 @@ mod tests {
     }
 
     #[test]
+    fn prelogin_with_invalid_thread_id_length_is_an_error() {
+        let mut payload = BytesMut::from(&[PRELOGIN_THREADID, 0, 6, 0, 2, 0xff, 0, 0][..]);
+
+        assert!(matches!(
+            PreloginMessage::decode(&mut payload),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
     fn encryption_negotiation_table() {
         use EncryptionLevel::{NotSupported, Off, On, Required};
         let levels = [Off, On, NotSupported, Required];
         // Rows are the client setting, columns the server response.
         let expected = [
-            [Some(Off), Some(On), Some(NotSupported), Some(On)],
+            [Some(Off), Some(On), None, Some(On)],
             [None, Some(On), None, Some(On)],
             [None, None, Some(NotSupported), None],
             [None, Some(On), None, Some(On)],
@@ -317,7 +338,10 @@ mod tests {
                 let actual = response.negotiated_encryption(*client);
                 match expected[row][column] {
                     Some(level) => assert_eq!(actual.unwrap(), level),
-                    None => assert!(actual.is_err(), "{:?} accepted {:?}", client, server),
+                    None => assert!(
+                        matches!(actual, Err(Error::Tls(_))),
+                        "expected a TLS error for {client:?} and {server:?}, got {actual:?}"
+                    ),
                 }
             }
         }

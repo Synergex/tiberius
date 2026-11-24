@@ -181,14 +181,12 @@ fn negotiate_encryption(
     match server_policy {
         EncryptionLevel::NotSupported => EncryptionLevel::NotSupported,
         EncryptionLevel::Required => EncryptionLevel::Required,
-        EncryptionLevel::On => match client_request {
+        // MS-TDS 2.2.6.5: a server set to ENCRYPT_OFF still answers ENCRYPT_ON
+        // to a client that asks for it; replying OFF makes the client abort.
+        EncryptionLevel::Off | EncryptionLevel::On => match client_request {
             EncryptionLevel::Required | EncryptionLevel::On => EncryptionLevel::On,
             EncryptionLevel::Off => EncryptionLevel::Off,
             EncryptionLevel::NotSupported => EncryptionLevel::NotSupported,
-        },
-        EncryptionLevel::Off => match client_request {
-            EncryptionLevel::NotSupported => EncryptionLevel::NotSupported,
-            _ => EncryptionLevel::Off,
         },
     }
 }
@@ -400,5 +398,29 @@ where
             self.handle_sspi_step(client, &login, &info, step)
                 .await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::negotiate_encryption;
+    use crate::EncryptionLevel::{self, NotSupported, Off, On, Required};
+
+    #[test]
+    fn server_off_answers_on_when_client_asks_for_encryption() {
+        // (server policy, client request, expected reply)
+        let cases: [(EncryptionLevel, EncryptionLevel, EncryptionLevel); 4] = [
+            (Off, Off, Off),
+            (Off, On, On),
+            (Off, Required, On),
+            (Off, NotSupported, NotSupported),
+        ];
+        for (server, client, expected) in cases {
+            assert_eq!(
+                negotiate_encryption(server, client),
+                expected,
+                "server {server:?}, client {client:?}"
+            );
+        }
     }
 }

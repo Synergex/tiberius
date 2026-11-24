@@ -191,6 +191,10 @@ version = "1"
 path = "./runtimes-macro"
 
 [dev-dependencies]
+# TLS test peers. Not native-tls: on Windows it writes every imported private
+# key to the user's key store and never removes it.
+async-rustls = "0.4"
+rustls-pemfile = "1"
 names = "0.14"
 anyhow = "1"
 env_logger = "0.9"

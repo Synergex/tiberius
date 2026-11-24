@@ -172,6 +172,17 @@ impl TokenEnvChange {
         let mut bytes = vec![0; len];
         src.read_exact(&mut bytes[0..len]).await?;
 
+        // The payload is already in memory, so a field that runs past its end
+        // is a malformed token, not a transport failure.
+        Self::parse(bytes).map_err(|error| match error {
+            Error::Io { message, .. } => {
+                Error::Protocol(format!("invalid envchange: {message}").into())
+            }
+            error => error,
+        })
+    }
+
+    fn parse(bytes: Vec<u8>) -> crate::Result<Self> {
         let mut buf = Cursor::new(bytes);
         let ty_byte = buf.read_u8()?;
 

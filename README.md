@@ -75,8 +75,8 @@ The crate can also be compiled without TLS support, but not with both features e
 | --- | --- |
 | `Required` | Require full-session TLS; reject a server that declines. Default for `Config::new()` with TLS enabled. |
 | `On` | Require full-session TLS, like `Required`. |
-| `Off` | Optional: plaintext if TLS is unavailable, login-only TLS if the server returns OFF, or full-session TLS if the server requires it. |
-| `NotSupported` | No TLS; reject a server that requests TLS. |
+| `Off` | Optional. Uses login-only TLS when the server returns `ENCRYPT_OFF` and full-session TLS when the server selects it. Returns `Error::Tls` before sending the login if the server returns `ENCRYPT_NOT_SUP`. |
+| `NotSupported` | Allows an unencrypted login and session when the server agrees. Rejects a server that requests TLS. |
 
 Native TLS additionally supports `Config::strict_encryption(true)`: TLS-first TDS 8.0 (SQL Server 2022+), TLS 1.2 or later, with no TDS 7 fallback. Set `EncryptionLevel::Required` with Strict. Non-Strict native TLS uses TLS up to 1.2 for TDS 7 compatibility.
 
@@ -87,7 +87,7 @@ Certificate identity is validated against OS trust and the connection hostname b
 - `server_certificate(path)` pins the exact DER leaf certificate from one PEM or DER file instead of chain/hostname validation. Pinning does not check expiry or hostname; update the pin when the certificate changes.
 - `trust_cert()` explicitly bypasses certificate/hostname checks. It is forbidden in Strict and conflicts with other identity controls.
 
-Pinning requires full-session encryption and conflicts with CA/hostname overrides. With native TLS, unreadable, malformed, bundled, or trailing-data certificate files fail without fallback. Unsupported backend/option combinations and conflicting settings return errors before protocol I/O; hostname/pin/Strict controls require the native TLS backend. `Client::is_encrypted()` reports actual post-login TLS, including Optional's negotiated outcome. These APIs apply to programmatic configuration; RSSQL parses its own connection-string controls.
+Pinning requires full-session encryption and conflicts with CA/hostname overrides. With native TLS, unreadable, malformed, bundled, or trailing-data certificate files fail without fallback. Certificate files are read when the TLS handshake starts, which in TDS 7 mode is after the PRELOGIN exchange but before the login is sent. Unsupported backend/option combinations and conflicting settings return errors before protocol I/O; hostname/pin/Strict controls require the native TLS backend. `Client::is_encrypted()` reports actual post-login TLS, including Optional's negotiated outcome. These APIs apply to programmatic configuration; RSSQL parses its own connection-string controls.
 
 ### Integrated Authentication (TrustedConnection) on \*nix
 
@@ -146,6 +146,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Running the tests
+
+The integration tests need a SQL Server. `scripts/docker-test.sh` builds one from `docker/`, the images CI uses, and runs `cargo test` against it, including the live tests in `tests/rpc_helpers_live.rs` that are otherwise ignored:
+
+```sh
+scripts/docker-test.sh run                                       # SQL Server 2022, default features
+TIBERIUS_TEST_SERVER=2025 scripts/docker-test.sh run --no-default-features --features=rustls
+scripts/docker-test.sh up                                        # keep a server between runs
+scripts/docker-test.sh test --test query
+scripts/docker-test.sh down
+```
+
+The container listens on `127.0.0.1:1434` (set `TIBERIUS_TEST_PORT` to change it), so it can run next to another SQL Server on 1433. The TLS backends exclude each other, so `rustls` and `vendored-openssl` need `--no-default-features`. To use a server of your own instead, set `TIBERIUS_TEST_CONNECTION_STRING` and run `cargo test --tests -- --include-ignored`, then `cargo test --doc`; `--include-ignored` would also try to compile the doc examples marked `ignore`, which are not meant to build. `tests/custom-cert.rs` passes only against the `docker/` images, whose certificate is signed by `docker/certs/customCA.crt`. That certificate lasts 200 days; once it expires, the script stops and prints the command that reissues it.
 
 ## Security
 

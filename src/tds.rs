@@ -19,7 +19,9 @@ uint_enum! {
     /// The configured encryption level specifying if encryption is required
     #[repr(u8)]
     pub enum EncryptionLevel {
-        /// Only use encryption for the login procedure
+        /// Require TLS for the login and use it for the full session if the
+        /// server selects it. A server that declines TLS is rejected before login;
+        /// use `NotSupported` to allow an unencrypted login.
         Off = 0,
         /// Encrypt everything if possible
         On = 1,

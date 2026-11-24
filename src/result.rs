@@ -79,9 +79,10 @@ impl<'a> ExecuteResult {
     /// error, or with the transport, protocol, or cancellation error that
     /// ended the response. A server error does not end the response, so the
     /// rest of it is drained and its counts are dropped. A fatal server error,
-    /// or a transport or protocol failure, met while draining is returned with
-    /// the first error as [`CleanupFailed`](crate::Error::CleanupFailed), which
-    /// keeps the first error's code and reports the connection unusable.
+    /// a cancellation, or a transport or protocol failure met while draining
+    /// is returned with the first error as
+    /// [`CleanupFailed`](crate::Error::CleanupFailed), which keeps the first
+    /// error's code and reports whether the connection is still usable.
     ///
     /// Unlike `new`, it records a count only from a `DONE` variant flagged
     /// `DONE_COUNT`, the only ones whose count the server defines. Others,
@@ -116,21 +117,16 @@ impl<'a> ExecuteResult {
         F: FnMut(ReceivedToken),
     {
         let mut rows_affected = Vec::new();
-        let mut server_error = None;
+        let mut failed = false;
 
         loop {
             match tokens.try_next().await {
-                Ok(Some(ReceivedToken::Error(error))) => {
-                    server_error = crate::Error::add_server_error(
-                        server_error.take(),
-                        crate::Error::Server(error),
-                    );
-                }
+                Ok(Some(ReceivedToken::Error(_))) => failed = true,
                 Ok(Some(
                     ReceivedToken::DoneProc(_)
                     | ReceivedToken::DoneInProc(_)
                     | ReceivedToken::Done(_),
-                )) if server_error.is_some() => (),
+                )) if failed => (),
                 Ok(Some(
                     ReceivedToken::DoneProc(done)
                     | ReceivedToken::DoneInProc(done)
@@ -141,26 +137,13 @@ impl<'a> ExecuteResult {
                     }
                 }
                 Ok(Some(token)) => visit(token),
-                Ok(None) => break,
-                // The token stream raises its first server error again at the end.
-                Err(crate::Error::Server(_) | crate::Error::CleanupFailed { .. })
-                    if server_error.is_some() =>
-                {
-                    break
-                }
-                Err(error) => {
-                    let error = match server_error {
-                        Some(first) if !error.leaves_connection_usable() => {
-                            crate::Error::with_cleanup(Some(first), Err(error))
-                        }
-                        _ => Some(error),
-                    };
-                    return (Self { rows_affected }, error);
-                }
+                Ok(None) => return (Self { rows_affected }, None),
+                // The token stream ends a response that reported a server
+                // error with that error, kept together with whatever cut the
+                // rest of the response short.
+                Err(error) => return (Self { rows_affected }, Some(error)),
             }
         }
-
-        (Self { rows_affected }, server_error)
     }
 
     /// A slice of numbers of rows affected in the same order as the given
@@ -338,44 +321,5 @@ mod tests {
                 Some(crate::Error::Canceled | crate::Error::Protocol(_))
             ));
         }
-    }
-
-    #[tokio::test]
-    async fn a_later_fatal_error_keeps_the_first_code_and_ends_the_connection() {
-        let (_, error) = ExecuteResult::until_error_from_stream(
-            iter(vec![
-                Ok(ReceivedToken::Error(TokenError::new(
-                    50001, 1, 16, "primary", "srv", "", 1,
-                ))),
-                Ok(ReceivedToken::Error(TokenError::new(
-                    50002, 1, 20, "fatal", "srv", "", 2,
-                ))),
-            ]),
-            |_| (),
-        )
-        .await;
-        let error = error.unwrap();
-        assert_eq!(error.code(), Some(50001));
-        assert!(!error.leaves_connection_usable(), "{error:?}");
-    }
-
-    #[tokio::test]
-    async fn a_transport_failure_while_draining_keeps_the_server_error_code() {
-        let (_, error) = ExecuteResult::until_error_from_stream(
-            iter(vec![
-                Ok(ReceivedToken::Error(TokenError::new(
-                    2627, 1, 14, "primary", "srv", "", 1,
-                ))),
-                Err(crate::Error::Io {
-                    kind: std::io::ErrorKind::UnexpectedEof,
-                    message: "drain".into(),
-                }),
-            ]),
-            |_| (),
-        )
-        .await;
-        let error = error.unwrap();
-        assert_eq!(error.code(), Some(2627));
-        assert!(!error.leaves_connection_usable(), "{error:?}");
     }
 }

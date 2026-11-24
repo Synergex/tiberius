@@ -49,6 +49,29 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::TryStreamExt;
 use std::{borrow::Cow, fmt::Debug};
 
+/// What [`Client::commit_transaction`] or [`Client::rollback_transaction`]
+/// did. The `Already` variants report a transaction the server ended before
+/// the call: with a T-SQL `COMMIT` or `ROLLBACK`, by rolling it back itself
+/// after a deadlock or an error under `XACT_ABORT`, or in answer to a commit
+/// or rollback call that was dropped or failed, such as one canceled after
+/// the server ended the transaction. They stay the answer until the server
+/// begins another transaction or a commit or rollback call returns
+/// [`Ended`](Self::Ended), so a caller can treat them as success, as ODBC
+/// does, or as an error, as SqlClient does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionEnd {
+    /// The request committed or rolled back the open transaction. A commit
+    /// of a nested transaction ends one level, as a T-SQL `COMMIT` does.
+    Ended,
+    /// No transaction was open, and the server has reported none ending since
+    /// a commit or rollback call last returned [`Ended`](Self::Ended).
+    NoTransaction,
+    /// No transaction was open: the server last reported one committed.
+    AlreadyCommitted,
+    /// No transaction was open: the server last reported one rolled back.
+    AlreadyRolledBack,
+}
+
 /// `Client` is the main entry point to the SQL Server, providing query
 /// execution capabilities.
 ///
@@ -116,8 +139,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     }
 
     /// The current database, as last reported by the server. `None` until
-    /// the server reports one, and again after unread results were
-    /// discarded, since they may have held a database change.
+    /// the server reports one.
     pub fn database(&self) -> Option<&str> {
         self.connection.context().database()
     }
@@ -344,32 +366,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     }
 
     /// Commits the session's transaction with a transaction manager request,
-    /// which the server runs without compiling a batch. Returns `false`
-    /// without contacting the server when the server has reported no open
-    /// transaction on this connection. Fails with a protocol error, which
-    /// leaves the connection unusable, when an undecodable response was
-    /// discarded or ended with a fatal error, and the transaction state is
-    /// unknown.
-    pub async fn commit_transaction(&mut self) -> crate::Result<bool> {
+    /// which the server runs without compiling a batch, and returns
+    /// [`TransactionEnd::Ended`]. When the server has reported no open
+    /// transaction on this connection, returns without contacting the server
+    /// how the last one ended: see [`TransactionEnd`]. Fails, leaving the
+    /// connection unusable, once a response stopped part-way through a token,
+    /// could not be decoded or ended the session, since the transaction state
+    /// is then unknown. The error is a protocol error, or the server's fatal
+    /// error when this call is the one that reads it from the unread rest of
+    /// an earlier response.
+    pub async fn commit_transaction(&mut self) -> crate::Result<TransactionEnd> {
         self.end_transaction(TransactionOutcome::Commit).await
     }
 
     /// Rolls back the session's transaction as
     /// [`commit_transaction`](Self::commit_transaction) commits it.
-    pub async fn rollback_transaction(&mut self) -> crate::Result<bool> {
+    pub async fn rollback_transaction(&mut self) -> crate::Result<TransactionEnd> {
         self.end_transaction(TransactionOutcome::Rollback).await
     }
 
-    async fn end_transaction(&mut self, outcome: TransactionOutcome) -> crate::Result<bool> {
+    async fn end_transaction(
+        &mut self,
+        outcome: TransactionOutcome,
+    ) -> crate::Result<TransactionEnd> {
         self.connection.flush_stream().await?;
-        if self.connection.context().transaction_uncertain() {
-            return Err(crate::Error::Protocol(
-                "transaction state was lost with an undecodable or fatal response".into(),
-            ));
-        }
-        let descriptor = self.connection.context().transaction_descriptor();
+        let context = self.connection.context();
+        let descriptor = context.transaction_descriptor();
         if descriptor == [0; 8] {
-            return Ok(false);
+            return Ok(match context.transaction_end() {
+                None => TransactionEnd::NoTransaction,
+                Some(TransactionOutcome::Commit) => TransactionEnd::AlreadyCommitted,
+                Some(TransactionOutcome::Rollback) => TransactionEnd::AlreadyRolledBack,
+            });
         }
 
         let id = self.connection.context_mut().next_packet_id();
@@ -381,9 +409,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .await?;
         // The server's ENVCHANGE for the commit or rollback clears the
         // descriptor while the response is read.
-        let mut tokens = TokenStream::new(&mut self.connection).try_unfold();
-        while tokens.try_next().await?.is_some() {}
-        Ok(true)
+        let drained = TokenStream::new(&mut self.connection)
+            .try_unfold()
+            .try_for_each(|_| futures_util::future::ready(Ok(())))
+            .await;
+        // The end this request reported is its own, not an earlier one. A
+        // request that failed, such as one canceled after the server ended
+        // the transaction, leaves the end for the next call to report.
+        if drained.is_ok() {
+            self.connection.context_mut().set_transaction_end(None);
+        }
+        drained.map(|()| TransactionEnd::Ended)
     }
 
     /// Execute a `BULK INSERT` statement, efficiantly storing a large number of
@@ -642,7 +678,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     ///
     /// `param_defs` follows the same format as [`prepare`](Self::prepare)
     /// (`"@P1 int, @P2 nvarchar(50)"` etc.); pass an empty string if the
-    /// statement has no parameters.
+    /// statement has no parameters. Unlike `prepare`, values are passed by
+    /// name as `@P1` onward, so the declarations must use those names.
     ///
     /// Use [`Cursor::fetch`] to page through rows and [`Cursor::close`] when
     /// done.
@@ -668,7 +705,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// round trip using `sp_cursorprepexec`.
     ///
     /// `param_defs` follows the same format as [`prepare`](Self::prepare);
-    /// pass an empty string when the statement has no parameters.
+    /// pass an empty string when the statement has no parameters. Unlike
+    /// `prepare`, values are passed by name as `@P1` onward, so the
+    /// declarations must use those names.
     ///
     /// The return value is a [`CursorPrepExecOutcome`]: usually the server
     /// opens a cursor ([`Cursor`](CursorPrepExecOutcome::Cursor)), but when the
@@ -740,7 +779,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// does.
     ///
     /// The statement is returned whenever the server assigned a handle, even
-    /// when the execution failed, so the caller can still release it.
+    /// when the execution failed, so the caller can still release it. A
+    /// response that reports no error but carries no handle fails with a
+    /// protocol error, as in `prep_exec`.
     pub async fn prep_exec_until_error<'a>(
         &mut self,
         sql: impl Into<Cow<'a, str>>,
@@ -771,10 +812,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             }
         })
         .await;
-        let statement = prepared::extract_handle(&outputs)
-            .ok()
-            .map(|handle| PreparedStatement::new(handle, sql_owned, defs_owned));
-        (statement, result, error)
+        match (prepared::extract_handle(&outputs), error) {
+            (Ok(handle), error) => (
+                Some(PreparedStatement::new(handle, sql_owned, defs_owned)),
+                result,
+                error,
+            ),
+            // A request that failed may never have prepared the statement.
+            (Err(_), Some(error)) => (None, result, Some(error)),
+            (Err(missing), None) => (None, result, Some(missing)),
+        }
     }
 }
 

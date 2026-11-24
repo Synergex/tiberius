@@ -84,7 +84,7 @@ pub enum Error {
 }
 
 /// The lowest severity at which SQL Server ends the connection after an error.
-const FATAL_SEVERITY: u8 = 20;
+pub(crate) const FATAL_SEVERITY: u8 = 20;
 
 impl Error {
     /// True, if the error was caused by a deadlock.
@@ -152,6 +152,23 @@ impl Error {
                 Error::with_cleanup(Some(first), Err(error))
             }
             first => first,
+        }
+    }
+
+    /// Returns `error`, which cut a response short, such as a cancellation
+    /// or a transport failure, together with the server error the response
+    /// reported before it, if any. That server error stays the response's
+    /// error, with `error` kept as [`CleanupFailed`](Self::CleanupFailed).
+    /// After a fatal server error, which ended the session, `error` is
+    /// dropped.
+    pub(crate) fn cut_short(first: Option<Error>, error: Error) -> Error {
+        match first {
+            None => error,
+            Some(first) if !first.leaves_connection_usable() => first,
+            Some(first) => Error::CleanupFailed {
+                error: Box::new(first),
+                cleanup: Box::new(error),
+            },
         }
     }
 

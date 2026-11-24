@@ -91,8 +91,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsPreloginWrapper<
             let header = PacketHeader::decode(&mut BytesMut::from(&inner.header_buf[..]))
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
 
-            // We only get pre-login packets in the handshake process.
-            assert_eq!(header.r#type(), PacketType::PreLogin);
+            // Only non-empty pre-login packets carry the handshake. Reject a
+            // malformed peer with an I/O error, rather than panicking or
+            // underflowing.
+            if header.r#type() != PacketType::PreLogin || header.length() as usize <= HEADER_BYTES {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid TDS TLS handshake packet",
+                )));
+            }
 
             // And we know from this point on how much data we should expect
             inner.read_remaining = header.length() as usize - HEADER_BYTES;
@@ -216,5 +223,43 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream.as_mut().unwrap()).poll_close(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::io::{AsyncReadExt, Cursor};
+
+    async fn read_from(packet: &[u8]) -> io::Result<usize> {
+        let mut wrapper = TlsPreloginWrapper::new(Cursor::new(packet.to_vec()));
+        wrapper.read(&mut [0u8; 64]).await
+    }
+
+    #[tokio::test]
+    async fn a_prelogin_packet_passes_its_payload_through() {
+        let mut wrapper =
+            TlsPreloginWrapper::new(Cursor::new(vec![0x12, 1, 0, 11, 0, 0, 1, 0, 1, 2, 3]));
+        let mut buf = [0u8; 64];
+        let read = wrapper.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..read], &[1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_packet_of_another_type_is_invalid_data() {
+        let err = read_from(&[0x10, 1, 0, 11, 0, 0, 1, 0, 1, 2, 3])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_length_shorter_than_the_header_is_invalid_data() {
+        for length in [0u8, 4, 8] {
+            let err = read_from(&[0x12, 1, 0, length, 0, 0, 1, 0])
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 }

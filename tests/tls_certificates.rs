@@ -1,7 +1,8 @@
 #![cfg(feature = "native-tls")]
 
-use std::{io::Read, net::TcpListener, path::PathBuf, thread, time::Duration};
-use tiberius::error::Error;
+use async_rustls::rustls;
+use std::{io::Read, net::TcpListener, path::PathBuf, sync::Arc, thread, time::Duration};
+use tiberius::error::{Error, IoErrorKind};
 use tiberius::{AuthMethod, Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -15,29 +16,46 @@ fn fixture(name: &str) -> String {
         .to_owned()
 }
 
+// The peer is rustls, not native-tls: on Windows, native-tls leaves every
+// imported key in the user's key store.
+fn peer_config() -> Arc<rustls::ServerConfig> {
+    let chain = [
+        &include_bytes!("security-fixtures/server.pem")[..],
+        include_bytes!("security-fixtures/ca.pem"),
+    ]
+    .into_iter()
+    .flat_map(|mut pem| rustls_pemfile::certs(&mut pem).unwrap())
+    .map(rustls::Certificate)
+    .collect();
+    let key = rustls_pemfile::pkcs8_private_keys(
+        &mut &include_bytes!("security-fixtures/server.key")[..],
+    )
+    .unwrap()
+    .remove(0);
+    let config = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(chain, rustls::PrivateKey(key))
+        .unwrap();
+    Arc::new(config)
+}
+
 // The peer stops after TLS and the first TDS bytes: no SQL Server or credentials
 // are needed. Seeing PRELOGIN proves verification completed before any login.
 async fn connect_to_peer(mut config: Config) -> (Error, Vec<u8>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let peer = thread::spawn(move || {
-        let identity = native_tls_crate::Identity::from_pkcs12(
-            include_bytes!("security-fixtures/server.p12"),
-            "",
-        )
-        .unwrap();
-        let acceptor = native_tls_crate::TlsAcceptor::new(identity).unwrap();
-        let (socket, _) = listener.accept().unwrap();
+        let mut connection = rustls::ServerConnection::new(peer_config()).unwrap();
+        let (mut socket, _) = listener.accept().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         socket
             .set_write_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let mut tls = match acceptor.accept(socket) {
-            Ok(tls) => tls,
-            Err(_) => return Vec::new(),
-        };
+        // The read drives the handshake; a failed one yields nothing.
+        let mut tls = rustls::Stream::new(&mut connection, &mut socket);
         let mut received = [0; 8];
         match tls.read(&mut received) {
             Ok(count) => received[..count].to_vec(),
@@ -119,6 +137,28 @@ async fn exact_leaf_pem_and_der_pins_replace_chain_and_hostname_checks() {
     }
 }
 
+// Windows PowerShell 5.1 `-Encoding utf8` prefixes text files with a UTF-8 BOM.
+#[tokio::test]
+async fn pem_files_with_a_utf8_byte_order_mark_are_accepted() {
+    let with_bom = |name: &str| {
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("bom-{name}"));
+        let pem = std::fs::read(fixture(name)).unwrap();
+        std::fs::write(&path, [b"\xEF\xBB\xBF".as_slice(), &pem].concat()).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+
+    let mut config = Config::new();
+    config.trust_cert_ca(with_bom("ca.pem"));
+    config.certificate_hostname("sql.test");
+    let (_, received) = connect_to_peer(config).await;
+    assert_eq!(received.first(), Some(&0x12));
+
+    let mut config = Config::new();
+    config.server_certificate(with_bom("server.pem"));
+    let (_, received) = connect_to_peer(config).await;
+    assert_eq!(received.first(), Some(&0x12));
+}
+
 #[tokio::test]
 async fn pinning_the_issuer_instead_of_the_leaf_is_rejected_before_tds() {
     let mut config = Config::new();
@@ -137,7 +177,16 @@ async fn missing_pin_file_has_no_fallback_or_path_disclosure() {
     let missing = fixture("missing-pin-sensitive-path.pem");
     config.server_certificate(&missing);
     let (error, received) = connect_to_peer(config).await;
-    assert!(matches!(error, Error::Tls(_)));
+    assert!(
+        matches!(
+            error,
+            Error::Io {
+                kind: IoErrorKind::NotFound,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
     assert!(!error.to_string().contains(&missing));
     assert!(!error.to_string().contains("missing-pin-sensitive-path"));
     assert!(received.is_empty());
@@ -159,7 +208,20 @@ async fn malformed_or_missing_custom_ca_has_no_fallback() {
         config.certificate_hostname("sql.test");
         config.trust_cert_ca(fixture(file));
         let (error, received) = connect_to_peer(config).await;
-        assert!(matches!(error, Error::Tls(_)));
+        if file == "malformed.pem" {
+            assert!(matches!(error, Error::Tls(_)), "{error:?}");
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    Error::Io {
+                        kind: IoErrorKind::NotFound,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
         assert!(!error.to_string().contains(file));
         assert!(received.is_empty());
     }

@@ -1,8 +1,19 @@
-use futures_util::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures_util::io::AsyncReadExt;
+#[cfg(any(
+    feature = "native-tls",
+    feature = "rustls",
+    feature = "vendored-openssl"
+))]
+use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use std::time::Duration;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+#[cfg(any(
+    feature = "native-tls",
+    feature = "rustls",
+    feature = "vendored-openssl"
+))]
 async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> (u8, Vec<u8>) {
     let mut header = [0; 8];
     stream.read_exact(&mut header).await.unwrap();
@@ -13,6 +24,11 @@ async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> (u8, Vec<u8>) {
     (header[0], payload)
 }
 
+#[cfg(any(
+    feature = "native-tls",
+    feature = "rustls",
+    feature = "vendored-openssl"
+))]
 async fn prelogin_response<S: AsyncWrite + Unpin>(stream: &mut S, encryption: u8) {
     // VERSION and ENCRYPTION options, followed by their values.
     stream
@@ -71,43 +87,23 @@ async fn mandatory_refuses_downgrades_before_sending_credentials() {
     feature = "vendored-openssl"
 ))]
 #[tokio::test]
-async fn optional_can_establish_an_unencrypted_session() {
+async fn optional_refuses_plaintext_login() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (client, server) = tokio::io::duplex(65536);
         let peer = tokio::spawn(async move {
             let mut server = server.compat();
             assert_eq!(read_packet(&mut server).await.0, 0x12);
             prelogin_response(&mut server, 2).await;
-            assert_eq!(read_packet(&mut server).await.0, 0x10);
-            // A TDS 7.4 LOGINACK and DONE, without any TLS layer.
-            server
-                .write_all(&[
-                    4, 1, 0, 34, 0, 0, 1, 0, 0xad, 10, 0, 1, 0x74, 0, 0, 4, 0, 16, 0, 0, 0, 0xfd,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                ])
-                .await
-                .unwrap();
-            server.flush().await.unwrap();
-            assert_eq!(read_packet(&mut server).await.0, 1);
-            server
-                .write_all(&[
-                    4, 1, 0, 21, 0, 0, 1, 0, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                ])
-                .await
-                .unwrap();
-            server.flush().await.unwrap();
+            let mut remaining = Vec::new();
+            server.read_to_end(&mut remaining).await.unwrap();
+            assert!(remaining.is_empty(), "sent data after refusing encryption");
         });
-        let mut client = Client::connect(config(EncryptionLevel::Off), client.compat())
-            .await
-            .unwrap();
-        assert!(!client.is_encrypted());
-        client
-            .simple_query("SELECT 1")
-            .await
-            .unwrap()
-            .into_results()
-            .await
-            .unwrap();
+        let result = Client::connect(config(EncryptionLevel::Off), client.compat()).await;
+        assert!(matches!(
+            result,
+            Err(tiberius::error::Error::Tls(message))
+                if message.contains("login was not sent")
+        ));
         peer.await.unwrap();
     })
     .await

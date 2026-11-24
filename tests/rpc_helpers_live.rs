@@ -8,8 +8,8 @@ use std::borrow::Cow;
 use std::env;
 use tiberius::numeric::Numeric;
 use tiberius::{
-    Client, ColumnData, Config, CursorOpenOptions, Fetch, ProcedureParameter, QueryItem, TypeInfo,
-    VarLenContext, VarLenType,
+    Client, ColumnData, Config, CursorOpenOptions, Fetch, ProcedureParameter, QueryItem,
+    TransactionEnd, TypeInfo, VarLenContext, VarLenType,
 };
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -1150,7 +1150,11 @@ async fn live_end_transaction_after_discarded_begin() -> tiberius::Result<()> {
             client.rollback_transaction().await?
         };
 
-        assert!(ended, "commit={commit}: the open transaction was not ended");
+        assert_eq!(
+            ended,
+            TransactionEnd::Ended,
+            "commit={commit}: the open transaction was not ended"
+        );
         let trancount = client
             .simple_query("SELECT @@TRANCOUNT")
             .await?
@@ -1188,13 +1192,83 @@ async fn live_transaction_manager_requests_nest_like_tsql() -> tiberius::Result<
         .await?;
     assert_eq!(trancount(&mut client).await?, Some(2));
 
-    assert!(client.commit_transaction().await?);
+    assert_eq!(client.commit_transaction().await?, TransactionEnd::Ended);
     assert_eq!(trancount(&mut client).await?, Some(1));
     assert!(client.transaction_open());
 
-    assert!(client.rollback_transaction().await?);
+    assert_eq!(client.rollback_transaction().await?, TransactionEnd::Ended);
     assert_eq!(trancount(&mut client).await?, Some(0));
-    assert!(!client.commit_transaction().await?);
+    assert_eq!(
+        client.commit_transaction().await?,
+        TransactionEnd::NoTransaction
+    );
+    Ok(())
+}
+
+async fn end_both_ways(client: &mut LiveClient) -> tiberius::Result<[TransactionEnd; 2]> {
+    Ok([
+        client.commit_transaction().await?,
+        client.rollback_transaction().await?,
+    ])
+}
+
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_end_transaction_with_no_transaction_ever_begun() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    assert_eq!(
+        end_both_ways(&mut client).await?,
+        [TransactionEnd::NoTransaction; 2]
+    );
+    Ok(())
+}
+
+/// A T-SQL `COMMIT` is reported until another transaction begins; ending
+/// that one with a request is not reported afterwards.
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_end_transaction_after_a_tsql_commit() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    client
+        .simple_query("BEGIN TRANSACTION; COMMIT")
+        .await?
+        .into_results()
+        .await?;
+    assert_eq!(
+        end_both_ways(&mut client).await?,
+        [TransactionEnd::AlreadyCommitted; 2]
+    );
+
+    client
+        .simple_query("BEGIN TRANSACTION")
+        .await?
+        .into_results()
+        .await?;
+    assert_eq!(
+        end_both_ways(&mut client).await?,
+        [TransactionEnd::Ended, TransactionEnd::NoTransaction]
+    );
+    Ok(())
+}
+
+/// Under `XACT_ABORT` the server rolls the transaction back itself on a
+/// runtime error, as it does for a deadlock victim.
+#[tokio::test]
+#[ignore = "requires TIBERIUS_TEST_CONNECTION_STRING; run with --ignored"]
+async fn live_end_transaction_after_a_server_rollback() -> tiberius::Result<()> {
+    let mut client = connect().await?;
+    let error = batch_error(
+        &mut client,
+        "SET XACT_ABORT ON; BEGIN TRANSACTION; SELECT 1 / 0".into(),
+    )
+    .await;
+    // 8134: Divide by zero error encountered.
+    assert_eq!(error.and_then(|error| error.code()), Some(8134));
+    assert!(!client.transaction_open());
+    assert_eq!(
+        end_both_ways(&mut client).await?,
+        [TransactionEnd::AlreadyRolledBack; 2]
+    );
     Ok(())
 }
 
@@ -1233,11 +1307,19 @@ async fn live_prepared_cursor_executes_again_with_new_parameters() -> tiberius::
                 .await?;
             assert_eq!(rows.len(), 1, "{scroll:?}");
             assert_eq!(rows[0].get::<i32, _>(0), Some(key), "{scroll:?}");
-            previous.expect("the replaced cursor").close(&mut client).await?;
+            previous
+                .expect("the replaced cursor")
+                .close(&mut client)
+                .await?;
         }
         cursor.close_and_unprepare(&mut client).await?;
     }
-    let row = client.simple_query("SELECT 42").await?.into_row().await?.unwrap();
+    let row = client
+        .simple_query("SELECT 42")
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
     assert_eq!(row.get::<i32, _>(0), Some(42));
     Ok(())
 }
@@ -1297,7 +1379,12 @@ async fn live_prepared_cursor_execute_sees_changed_columns() -> tiberius::Result
         CursorConcurrencyOptions::ReadOnly | CursorConcurrencyOptions::AllowDirect,
     );
     let mut cursor = client
-        .cursor_prep_exec("SELECT * FROM #reshaped WHERE id >= @P1", options, "@P1 int", &[&0i32])
+        .cursor_prep_exec(
+            "SELECT * FROM #reshaped WHERE id >= @P1",
+            options,
+            "@P1 int",
+            &[&0i32],
+        )
         .await?
         .into_cursor()
         .expect("expected a server cursor");
@@ -1321,7 +1408,10 @@ async fn live_prepared_cursor_execute_sees_changed_columns() -> tiberius::Result
         panic!("executed directly");
     };
     assert!(previous.is_none());
-    assert_eq!(names(cursor.fetch_metadata(&mut client).await?), ["id", "extra"]);
+    assert_eq!(
+        names(cursor.fetch_metadata(&mut client).await?),
+        ["id", "extra"]
+    );
     let rows = cursor
         .fetch(&mut client, Fetch::Next { count: 10 })
         .await?

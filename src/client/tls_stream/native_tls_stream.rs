@@ -17,7 +17,9 @@ fn certificate_error() -> Error {
 // some platforms accept only the first PEM block, so enforce our file contract
 // before calling them.
 fn parse_certificate(bytes: &[u8]) -> crate::Result<(Certificate, Vec<u8>)> {
-    let trimmed = bytes.trim_ascii();
+    // A UTF-8 BOM (Windows PowerShell 5.1 `-Encoding utf8`) is text encoding, not PEM data.
+    let text = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let trimmed = text.trim_ascii();
     let decoded;
     let der = if trimmed.starts_with(b"-----BEGIN CERTIFICATE-----") {
         let body = trimmed
@@ -74,8 +76,15 @@ fn parse_certificate(bytes: &[u8]) -> crate::Result<(Certificate, Vec<u8>)> {
 }
 
 fn load_certificate(path: &Path) -> crate::Result<(Certificate, Vec<u8>)> {
-    let bytes = fs::read(path)
-        .map_err(|_| Error::Tls("Could not read the configured certificate file.".to_owned()))?;
+    // Keep the I/O kind (not found, permission denied, ...) but leave out the
+    // path: the caller already has it, and it can reveal local names in logs.
+    let bytes = fs::read(path).map_err(|e| Error::Io {
+        kind: e.kind(),
+        message: format!(
+            "Could not read the configured certificate file: {}",
+            e.kind()
+        ),
+    })?;
     parse_certificate(&bytes)
 }
 
@@ -154,6 +163,7 @@ pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::tls::session_tests::peer_config;
     use futures_util::io::AsyncWriteExt;
     use std::{io::Read, net::TcpListener, thread, time::Duration};
 
@@ -164,6 +174,13 @@ mod tests {
     fn certificate_files_reject_extra_or_malformed_data() {
         assert_eq!(parse_certificate(CERTIFICATE).unwrap().1, DER);
         assert_eq!(parse_certificate(DER).unwrap().1, DER);
+        let bom = b"\xEF\xBB\xBF".as_slice();
+        assert_eq!(
+            parse_certificate(&[bom, CERTIFICATE].concat()).unwrap().1,
+            DER
+        );
+        let bom_der = [bom, DER].concat();
+        let bom_bundle = [bom, CERTIFICATE, bom, CERTIFICATE].concat();
         let bundle = [CERTIFICATE, CERTIFICATE].concat();
         let pem_suffix = [CERTIFICATE, b"unparsed suffix"].concat();
         let der_suffix = [DER, b"\0"].concat();
@@ -173,6 +190,8 @@ mod tests {
             bundle.as_slice(),
             pem_suffix.as_slice(),
             der_suffix.as_slice(),
+            bom_der.as_slice(),
+            bom_bundle.as_slice(),
             b"\x30\x80\0\0",
         ] {
             assert!(parse_certificate(invalid).is_err());
@@ -184,20 +203,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let peer = thread::spawn(move || {
-            let identity = native_tls_crate::Identity::from_pkcs12(
-                include_bytes!("../../../tests/security-fixtures/server.p12"),
-                "",
-            )
-            .unwrap();
-            let acceptor = native_tls_crate::TlsAcceptor::new(identity).unwrap();
-            let (socket, _) = listener.accept().unwrap();
+            let mut connection =
+                async_rustls::rustls::ServerConnection::new(peer_config()).unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             socket
                 .set_write_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
-            let mut tls = acceptor.accept(socket).unwrap();
+            let mut tls = async_rustls::rustls::Stream::new(&mut connection, &mut socket);
             let mut marker = [0; 1];
             tls.read_exact(&mut marker).unwrap();
             marker
